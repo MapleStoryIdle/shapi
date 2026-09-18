@@ -1,4 +1,4 @@
-import '@assistant-ui/react-markdown/styles/dot.css'
+import { useChatPreview, previewableWebUrl } from '@/components/ChatPreviewContext'
 
 import type { ComponentPropsWithoutRef, MouseEvent } from 'react'
 import { useState, useCallback, useEffect, useMemo, createContext, useContext, type ReactNode } from 'react'
@@ -13,7 +13,7 @@ import remarkBreaks from 'remark-breaks'
 import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
 import { Check as CheckIconNode, Copy as CopyIconNode } from 'lucide'
-import { FileText, Link2 } from 'lucide-react'
+import { MESSAGE_LINK_CLASS, MessageLinkIcon } from '@/components/MessageLink'
 import remarkDisableIndentedCode from '@/lib/remark-disable-indented-code'
 import remarkRepairTables from '@/lib/remark-repair-tables'
 import { useNavigate } from '@tanstack/react-router'
@@ -27,9 +27,10 @@ import { parseGitCodeBlock } from '@/components/assistant-ui/git-codeblock'
 import { useCopyToClipboard } from '@/hooks/useCopyToClipboard'
 import { MotionIcon, toMotionIcon } from '@/components/MotionIcon'
 import { useOptionalHappyChatContext, type HappyChatFileLinkTarget } from '@/components/AssistantChat/context'
-import { decodeFilePathLinkHref, isProjectFilePathTarget, isWindowsDriveRootPath, parseAbsoluteFilePathHref, parseProjectFilePathHref, remarkFilePathLinks, type FilePathLinkTarget } from '@/lib/remark-file-path-links'
+import { decodeFilePathLinkHref, isProjectFilePathTarget, isWindowsDriveRootPath, parseAbsoluteFilePathHref, parseProjectFilePathHref, parseSameOriginProjectFileUrl, remarkFilePathLinks, type FilePathLinkTarget } from '@/lib/remark-file-path-links'
 import { UriConfirmDialog } from '@/components/UriConfirmDialog'
 import { useTranslation } from '@/lib/use-translation'
+import { useLocalServiceLink } from '@/lib/local-service-links'
 
 import type { MarkdownTextPrimitiveProps } from '@assistant-ui/react-markdown'
 
@@ -350,13 +351,16 @@ const UriConfirmContext = createContext<UriConfirmContextValue | null>(null)
  */
 export function UriConfirmProvider({ children }: { children: ReactNode }) {
     const [dialog, setDialog] = useState<DialogState>(null)
+    const [dialogOpen, setDialogOpen] = useState(false)
     const { allow, isAllowed } = useAllowedSchemes()
 
     const openUri = useCallback((url: string, scheme: string) => {
         setDialog({ url, scheme })
+        setDialogOpen(true)
     }, [])
 
-    const closeDialog = () => setDialog(null)
+    // Retain content during the shared sheet exit animation.
+    const closeDialog = () => setDialogOpen(false)
 
     const handleOpen = () => {
         if (!dialog) return
@@ -379,7 +383,7 @@ export function UriConfirmProvider({ children }: { children: ReactNode }) {
             {children}
             {dialog !== null && (
                 <UriConfirmDialog
-                    open={true}
+                    open={dialogOpen}
                     url={dialog.url}
                     scheme={dialog.scheme}
                     onCancel={closeDialog}
@@ -469,10 +473,30 @@ function formatFileTargetTitle(fileTarget: FilePathLinkTarget): string {
         return fileTarget.path
     }
 
-    return `${fileTarget.path}:${fileTarget.line}${fileTarget.column !== undefined ? `:${fileTarget.column}` : ''}`
+    const range = fileTarget.lineEnd !== undefined ? `-${fileTarget.lineEnd}` : ''
+    return `${fileTarget.path}:${fileTarget.line}${range}${fileTarget.column !== undefined ? `:${fileTarget.column}` : ''}`
 }
 
-const FILE_PATH_CHIP_CLASS = 'aui-md-a aui-md-file-link min-w-0 max-w-full truncate rounded-md border border-[var(--app-inline-code-border)] bg-[var(--app-inline-code-bg)] px-[0.42em] py-[0.13em] font-mono text-[0.86em] font-medium leading-[1.35] text-[var(--app-inline-code-fg)] no-underline decoration-transparent'
+function compactFileTargetLabel(fileTarget: FilePathLinkTarget): string {
+    const filename = fileTarget.path.split(/[\\/]/).at(-1) ?? fileTarget.path
+    if (fileTarget.line === undefined) return filename
+    const range = fileTarget.lineEnd !== undefined ? `-${fileTarget.lineEnd}` : ''
+    return `${filename}:${fileTarget.line}${range}`
+}
+
+function shouldCompactFileLinkLabel(children: ReactNode, href: string, fileTarget: FilePathLinkTarget): boolean {
+    if (typeof children !== 'string') return false
+    const label = children.trim()
+    if (!label) return false
+    if (label === href || label === fileTarget.path || label.includes(fileTarget.path)) return true
+    try {
+        return decodeURIComponent(label) === fileTarget.path
+    } catch {
+        return false
+    }
+}
+
+const FILE_PATH_LINK_CLASS = `${MESSAGE_LINK_CLASS} aui-md-file-link`
 
 function FilePathCopyButton(props: { path: string }) {
     const { copied, copy } = useCopyToClipboard()
@@ -504,12 +528,13 @@ function FilePathCopyButton(props: { path: string }) {
 function UnavailableFilePathChip(props: ComponentPropsWithoutRef<'a'> & {
     fileTarget: FilePathLinkTarget
 }) {
+    const { t } = useTranslation()
     const { children, className, fileTarget, title } = props
     const linkTitle = title ?? formatFileTargetTitle(fileTarget)
-    const unavailableLabel = `${linkTitle} — unavailable in this session`
+    const unavailableLabel = `${linkTitle} — ${t('file.link.unavailable')}`
 
     return (
-        <span className="aui-md-file-link-group inline-flex max-w-full items-center align-bottom">
+        <span className="aui-md-file-link-group">
             <span
                 role="link"
                 aria-disabled="true"
@@ -517,12 +542,12 @@ function UnavailableFilePathChip(props: ComponentPropsWithoutRef<'a'> & {
                 tabIndex={-1}
                 title={unavailableLabel}
                 className={cn(
-                    FILE_PATH_CHIP_CLASS,
-                    'cursor-not-allowed opacity-60',
+                    FILE_PATH_LINK_CLASS,
                     className
                 )}
             >
-                {children}
+                <MessageLinkIcon filePath={fileTarget.path} disabled />
+                <span className="message-content-link-label">{children}</span>
             </span>
             <FilePathCopyButton path={fileTarget.path} />
         </span>
@@ -535,6 +560,8 @@ function FilePathAnchor(props: ComponentPropsWithoutRef<'a'> & {
     fileLinkTarget?: HappyChatFileLinkTarget
 }) {
     const navigate = useNavigate()
+    const preview = useChatPreview()
+    const chat = useOptionalHappyChatContext()
     const { fileTarget, sessionId, fileLinkTarget, className, title, onClick, target, rel: propRel, children, ...anchorProps } = props
     const rel = target === '_blank' ? (propRel ?? 'noreferrer') : propRel
     const linkTitle = title ?? formatFileTargetTitle(fileTarget)
@@ -569,6 +596,7 @@ function FilePathAnchor(props: ComponentPropsWithoutRef<'a'> & {
         if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return
 
         event.preventDefault()
+        if (chat && preview?.({ type: 'file', api: chat.api, source: fileLinkTarget ?? { type: 'session', sessionId }, workspacePath: chat.metadata?.path, ...fileTarget })) return
         if (fileLinkTarget?.type === 'native-codex') {
             void navigate({
                 to: '/sessions/codex/$codexSessionId/file',
@@ -595,7 +623,7 @@ function FilePathAnchor(props: ComponentPropsWithoutRef<'a'> & {
     }
 
     return (
-        <span className="aui-md-file-link-group inline-flex max-w-full items-center align-bottom">
+        <span className="aui-md-file-link-group">
             <a
                 {...anchorProps}
                 href={href}
@@ -605,17 +633,12 @@ function FilePathAnchor(props: ComponentPropsWithoutRef<'a'> & {
                 onClick={handleClick}
                 data-hapi-file-link="true"
                 className={cn(
-                    FILE_PATH_CHIP_CLASS,
-                    'inline-flex items-center gap-1 text-[var(--app-markdown-link)] transition-colors hover:border-[var(--app-markdown-link-muted)] hover:bg-[var(--app-code-copy-hover-bg)] hover:text-[var(--app-markdown-link-hover)]',
+                    FILE_PATH_LINK_CLASS,
                     className
                 )}
             >
-                <FileText
-                    className="h-[0.95em] w-[0.95em] shrink-0"
-                    data-markdown-link-icon="file"
-                    aria-hidden="true"
-                />
-                <span className="min-w-0 truncate">{children}</span>
+                <MessageLinkIcon filePath={fileTarget.path} />
+                <span className="message-content-link-label">{children}</span>
             </a>
         </span>
     )
@@ -640,7 +663,9 @@ function FilePathAnchor(props: ComponentPropsWithoutRef<'a'> & {
  *   never web links.
  */
 function A(props: ComponentPropsWithoutRef<'a'>) {
+    const preview = useChatPreview()
     const chat = useOptionalHappyChatContext()
+    const localServiceLink = useLocalServiceLink(props.href)
     // useContext must be called unconditionally before any early return so that
     // the Rules of Hooks are satisfied regardless of whether `filePath` is set.
     // isAllowed comes exclusively from the shared context. Every call site
@@ -660,20 +685,32 @@ function A(props: ComponentPropsWithoutRef<'a'>) {
     const projectFileTarget = markdownHref && chat
         ? parseProjectFilePathHref(markdownHref, { workspacePath: chat.metadata?.path })
         : null
+    const sameOriginFileTarget = markdownHref && chat
+        ? parseSameOriginProjectFileUrl(markdownHref, {
+            workspacePath: chat.metadata?.path,
+            origin: typeof window === 'undefined' ? null : window.location.origin
+        })
+        : null
     const unavailableFileTarget = chat && decodedFileTarget && !decodedFileTargetAllowed
         ? decodedFileTarget
         : markdownHref && chat && !decodedFileTarget && !projectFileTarget
             ? parseAbsoluteFilePathHref(markdownHref)
             : null
-    const fileTarget = decodedFileTarget && decodedFileTargetAllowed ? decodedFileTarget : projectFileTarget
+    const fileTarget = decodedFileTarget && decodedFileTargetAllowed
+        ? decodedFileTarget
+        : projectFileTarget ?? sameOriginFileTarget
     const rel = props.target === '_blank' ? (props.rel ?? 'noreferrer') : props.rel
 
     if (fileTarget) {
         if (!chat) {
             return <>{props.children}</>
         }
+        const children = markdownHref && shouldCompactFileLinkLabel(props.children, markdownHref, fileTarget)
+            ? compactFileTargetLabel(fileTarget)
+            : props.children
         return <FilePathAnchor
             {...props}
+            children={children}
             fileTarget={fileTarget}
             sessionId={chat.sessionId}
             fileLinkTarget={chat.fileLinkTarget}
@@ -725,6 +762,11 @@ function A(props: ComponentPropsWithoutRef<'a'>) {
 
         if (classification === 'iana') {
             onClick?.(e)
+            if (!e.defaultPrevented && !localServiceLink && props.download === undefined && e.button === 0 && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey) {
+                const destination = previewableWebUrl(url)
+                if (destination && preview?.({ type: 'url', url: destination })) e.preventDefault()
+            }
+            localServiceLink?.onClick(e)
             return
         }
 
@@ -741,20 +783,17 @@ function A(props: ComponentPropsWithoutRef<'a'>) {
     return (
         <a
             {...rest}
-            href={domHref}
-            rel={rel}
+            href={localServiceLink?.href ?? domHref}
+            target={localServiceLink ? '_blank' : props.target}
+            rel={localServiceLink ? 'noopener noreferrer' : rel}
             onClick={handleClick}
             data-hapi-external-link={isExternalLink ? 'true' : undefined}
-            className={cn('aui-md-a font-medium text-[var(--app-markdown-link)] underline decoration-[color:var(--app-markdown-link-muted)] underline-offset-3 transition-colors hover:text-[var(--app-markdown-link-hover)] hover:decoration-[color:var(--app-markdown-link-hover)]', props.className)}
+            data-local-service-link={localServiceLink ? 'true' : undefined}
+            aria-disabled={classification === 'deny' || !href ? true : undefined}
+            className={cn(MESSAGE_LINK_CLASS, props.className)}
         >
-            {isExternalLink ? (
-                <Link2
-                    className="mr-[0.3em] inline h-[0.9em] w-[0.9em] align-[-0.08em]"
-                    data-markdown-link-icon="external"
-                    aria-hidden="true"
-                />
-            ) : null}
-            {children}
+            <MessageLinkIcon href={href} external={isExternalLink} disabled={classification === 'deny' || !href} />
+            <span className="message-content-link-label">{children}</span>
         </a>
     )
 }

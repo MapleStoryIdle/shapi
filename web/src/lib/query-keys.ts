@@ -4,6 +4,8 @@ export const queryKeys = {
     messages: (sessionId: string) => ['messages', sessionId] as const,
     machines: ['machines'] as const,
     shares: (baseUrl: string, namespace: string) => ['shares', baseUrl, namespace] as const,
+    monitors: ['monitors'] as const,
+    monitor: (monitorId: string) => ['monitor', monitorId] as const,
     machineCodexModels: (machineId: string) => ['machine-codex-models', machineId] as const,
     machineCodexSubscriptionLimits: (machineId: string, model: string | null) => [
         'machine-codex-subscription-limits',
@@ -13,6 +15,7 @@ export const queryKeys = {
     gitStatus: (sessionId: string) => ['git-status', sessionId] as const,
     gitBranch: (sessionId: string) => ['git-branch', sessionId] as const,
     machineGitBranch: (machineId: string, cwd: string) => ['machine-git-branch', machineId, cwd] as const,
+    machineGitBranches: (machineId: string, cwd: string) => ['machine-git-branches', machineId, cwd] as const,
     sessionFiles: (sessionId: string, query: string) => ['session-files', sessionId, query] as const,
     sessionDirectory: (sessionId: string, path: string) => ['session-directory', sessionId, path] as const,
     sessionFile: (sessionId: string, path: string) => ['session-file', sessionId, path] as const,

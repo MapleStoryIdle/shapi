@@ -4,24 +4,26 @@ import { dirname } from 'node:path'
 
 import { MachineStore } from './machineStore'
 import { MessageStore } from './messageStore'
-import { PushStore } from './pushStore'
+import { PushStore, BARK_SCHEMA } from './pushStore'
 import { SessionStore } from './sessionStore'
 import { UserStore } from './userStore'
 import { ArtifactStore } from './artifacts'
 import { KanbanTaskStore } from './kanbanTasks'
+import { MonitorStore, MONITOR_SCHEMA } from './monitors'
+import { SessionGroupStore, SESSION_GROUP_SCHEMA } from './sessionGroups'
+import { SessionPinStore, SESSION_PIN_SCHEMA } from './sessionPins'
+import { KanbanOrderStore, KANBAN_ORDER_SCHEMA } from './kanbanOrder'
+import { SessionLabelStore, SESSION_LABEL_SCHEMA } from './sessionLabels'
+import {
+    LEGACY_IMPLICITLY_ENABLED_PLUGIN_IDS,
+    PluginSettingsStore,
+    PLUGIN_SETTINGS_SCHEMA,
+} from './pluginSettings'
+import { WorkspaceStore, WORKSPACE_SCHEMA } from './workspaces'
+import { ManagedSkillPackageStore, MANAGED_SKILL_PACKAGES_SCHEMA } from './managedSkillPackages'
+import { MANAGED_SKILL_LIBRARY } from '../managedSkillCatalog.generated'
 
-export type {
-    FeedbackMetadata,
-    KanbanTaskStatus,
-    StoredArtifact,
-    StoredKanbanTask,
-    StoredMachine,
-    StoredMessage,
-    StoredPushSubscription,
-    StoredSession,
-    StoredUser,
-    VersionedUpdateResult
-} from './types'
+export type { FeedbackMetadata, KanbanTaskStatus, StoredArtifact, StoredKanbanTask, StoredMachine, StoredMessage, StoredPushSubscription, StoredSession, StoredUser, VersionedUpdateResult } from './types'
 export type { CancelQueuedMessageResult, LookupQueuedMessageResult } from './messages'
 export { MachineStore } from './machineStore'
 export { MessageStore } from './messageStore'
@@ -31,16 +33,8 @@ export { UserStore } from './userStore'
 export { ArtifactStore } from './artifacts'
 export { KanbanTaskStore } from './kanbanTasks'
 
-const SCHEMA_VERSION: number = 18
-const REQUIRED_TABLES = [
-    'sessions',
-    'machines',
-    'messages',
-    'users',
-    'push_subscriptions',
-    'artifacts',
-    'kanban_tasks'
-] as const
+const SCHEMA_VERSION: number = 33
+const REQUIRED_TABLES = ['sessions', 'machines', 'messages', 'users', 'push_subscriptions', 'artifacts', 'kanban_tasks', 'session_groups', 'session_group_assignments', 'session_labels', 'session_pins', 'kanban_order', 'monitors', 'monitor_buckets', 'monitor_incidents', 'monitor_receipts', 'monitor_events', 'bark_settings', 'plugin_settings', 'managed_skill_packages', 'workspaces', 'workspace_access_keys', 'web_sessions', 'runner_pairings'] as const
 
 export class Store {
     private db: Database
@@ -54,6 +48,14 @@ export class Store {
     readonly push: PushStore
     readonly artifacts: ArtifactStore
     readonly kanbanTasks: KanbanTaskStore
+    readonly monitors: MonitorStore
+    readonly sessionGroups: SessionGroupStore
+    readonly sessionPins: SessionPinStore
+    readonly kanbanOrder: KanbanOrderStore
+    readonly sessionLabels: SessionLabelStore
+    readonly pluginSettings: PluginSettingsStore
+    readonly managedSkillPackages: ManagedSkillPackageStore
+    readonly workspaces: WorkspaceStore
 
     /**
      * Filesystem path of the underlying SQLite database, or ':memory:' for
@@ -71,31 +73,32 @@ export class Store {
             mkdirSync(dir, { recursive: true, mode: 0o700 })
             try {
                 chmodSync(dir, 0o700)
-            } catch {
-            }
+            } catch {}
 
             if (!existsSync(dbPath)) {
                 try {
                     const fd = openSync(dbPath, 'a', 0o600)
                     closeSync(fd)
-                } catch {
-                }
+                } catch {}
             }
         }
 
-        this.db = new Database(dbPath, { create: true, readwrite: true, strict: true })
+        this.db = new Database(dbPath, {
+            create: true,
+            readwrite: true,
+            strict: true
+        })
         this.db.exec('PRAGMA journal_mode = WAL')
         this.db.exec('PRAGMA synchronous = NORMAL')
         this.db.exec('PRAGMA foreign_keys = ON')
         this.db.exec('PRAGMA busy_timeout = 5000')
-        this.initSchema()
+        const bootstrappingLegacyWorkspaces = this.initSchema()
 
         if (dbPath !== ':memory:' && !dbPath.startsWith('file::memory:')) {
             for (const path of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
                 try {
                     chmodSync(path, 0o600)
-                } catch {
-                }
+                } catch {}
             }
         }
 
@@ -106,6 +109,16 @@ export class Store {
         this.push = new PushStore(this.db)
         this.artifacts = new ArtifactStore(this.db)
         this.kanbanTasks = new KanbanTaskStore(this.db)
+        this.monitors = new MonitorStore(this.db, dbPath)
+        this.sessionGroups = new SessionGroupStore(this.db)
+        this.sessionPins = new SessionPinStore(this.db)
+        this.kanbanOrder = new KanbanOrderStore(this.db)
+        this.sessionLabels = new SessionLabelStore(this.db)
+        this.pluginSettings = new PluginSettingsStore(this.db)
+        this.managedSkillPackages = new ManagedSkillPackageStore(this.db)
+        this.managedSkillPackages.seedBundled(MANAGED_SKILL_LIBRARY)
+        this.workspaces = new WorkspaceStore(this.db)
+        this.workspaces.bootstrapExistingNamespaces(bootstrappingLegacyWorkspaces)
     }
 
     close(): void {
@@ -122,13 +135,28 @@ export class Store {
         }
     }
 
-    private initSchema(): void {
+    private initSchema(): boolean {
         const currentVersion = this.getUserVersion()
         // V1/V2/V3 entries cover legacy DBs that pre-date our migration ladder.
         // Each step is idempotent (column-existence guards inside) so we can
         // safely run the full V1→V8 chain in the legacy branch where the DB
         // shape is unknown.
         const buildStepMigrations = (legacy: boolean): Record<number, () => void> => ({
+            22: () => this.db.exec(SESSION_GROUP_SCHEMA),
+            23: () => this.db.exec(SESSION_PIN_SCHEMA),
+            24: () => this.db.exec(KANBAN_ORDER_SCHEMA),
+            25: () => this.db.exec(MONITOR_SCHEMA),
+            26: () => this.db.exec(SESSION_LABEL_SCHEMA),
+            27: () => this.db.exec(PLUGIN_SETTINGS_SCHEMA),
+            28: () => this.db.exec(WORKSPACE_SCHEMA),
+            30: () => this.migrateFromV30ToV31(),
+            31: () => this.migrateFromV31ToV32(),
+            32: () => this.db.exec(MANAGED_SKILL_PACKAGES_SCHEMA),
+            29: () => {
+                const columns = this.db.query('PRAGMA table_info(monitor_events)').all() as { name: string }[]
+                if (!columns.some((column) => column.name === 'incident_id')) this.db.exec('ALTER TABLE monitor_events ADD COLUMN incident_id TEXT REFERENCES monitor_incidents(id) ON DELETE SET NULL')
+                this.db.exec('CREATE INDEX IF NOT EXISTS idx_monitor_events_incident ON monitor_events(incident_id)')
+            },
             1: () => this.migrateFromV1ToV2(legacy),
             2: () => this.migrateFromV2ToV3(),
             3: () => this.migrateFromV3ToV4(),
@@ -146,6 +174,13 @@ export class Store {
             15: () => this.migrateFromV15ToV16(),
             16: () => this.migrateFromV16ToV17(),
             17: () => this.migrateFromV17ToV18(),
+            18: () => this.db.exec(MONITOR_SCHEMA),
+            19: () => this.db.exec(BARK_SCHEMA),
+            20: () => this.db.exec(MONITOR_SCHEMA),
+            21: () => {
+                const columns = this.db.query('PRAGMA table_info(bark_settings)').all() as { name: string }[]
+                if (!columns.some((column) => column.name === 'enabled')) this.db.exec('ALTER TABLE bark_settings ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1')
+            }
         })
 
         if (currentVersion === 0) {
@@ -165,12 +200,12 @@ export class Store {
                 // a partially-built legacy DB may not have yet.
                 this.createSchema()
                 this.setUserVersion(SCHEMA_VERSION)
-                return
+                return true
             }
 
             this.createSchema()
             this.setUserVersion(SCHEMA_VERSION)
-            return
+            return false
         }
 
         const stepMigrations = buildStepMigrations(false)
@@ -181,7 +216,7 @@ export class Store {
                 step()
             }
             this.setUserVersion(SCHEMA_VERSION)
-            return
+            return true
         }
 
         if (currentVersion !== SCHEMA_VERSION) {
@@ -189,9 +224,19 @@ export class Store {
         }
 
         this.assertRequiredTablesPresent()
+        return false
     }
 
     private createSchema(): void {
+        this.db.exec(SESSION_GROUP_SCHEMA)
+        this.db.exec(SESSION_PIN_SCHEMA)
+        this.db.exec(KANBAN_ORDER_SCHEMA)
+        this.db.exec(SESSION_LABEL_SCHEMA)
+        this.db.exec(BARK_SCHEMA)
+        this.db.exec(PLUGIN_SETTINGS_SCHEMA)
+        this.db.exec(MANAGED_SKILL_PACKAGES_SCHEMA)
+        this.db.exec(WORKSPACE_SCHEMA)
+        this.db.exec(MONITOR_SCHEMA)
         this.db.exec(`
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
@@ -502,22 +547,30 @@ export class Store {
     private migrateFromV12ToV13(): void {}
 
     private getSessionColumnNames(): Set<string> {
-        const rows = this.db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>
+        const rows = this.db.prepare('PRAGMA table_info(sessions)').all() as Array<{
+            name: string
+        }>
         return new Set(rows.map((row) => row.name))
     }
 
     private getMachineColumnNames(): Set<string> {
-        const rows = this.db.prepare('PRAGMA table_info(machines)').all() as Array<{ name: string }>
+        const rows = this.db.prepare('PRAGMA table_info(machines)').all() as Array<{
+            name: string
+        }>
         return new Set(rows.map((row) => row.name))
     }
 
     private getMessageColumnNames(): Set<string> {
-        const rows = this.db.prepare('PRAGMA table_info(messages)').all() as Array<{ name: string }>
+        const rows = this.db.prepare('PRAGMA table_info(messages)').all() as Array<{
+            name: string
+        }>
         return new Set(rows.map((row) => row.name))
     }
 
     private getColumnNames(table: string): Set<string> {
-        const rows = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
+        const rows = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+            name: string
+        }>
         return new Set(rows.map((row) => row.name))
     }
 
@@ -580,6 +633,43 @@ export class Store {
         if (!columns.has('source_git_branch')) this.db.exec('ALTER TABLE kanban_tasks ADD COLUMN source_git_branch TEXT')
     }
 
+    private migrateFromV30ToV31(): void {
+        this.db.transaction(() => {
+            const workspaceColumns = this.getColumnNames('workspaces')
+            if (workspaceColumns.size !== 0 && !workspaceColumns.has('legacy_eligible')) {
+                this.db.exec('ALTER TABLE workspaces ADD COLUMN legacy_eligible INTEGER NOT NULL DEFAULT 0')
+            }
+            // v30 rows are the explicit migration boundary. Fresh v31 rows stay ineligible.
+            this.db.exec('UPDATE workspaces SET legacy_eligible=1')
+            const accessKeyColumns = this.getColumnNames('workspace_access_keys')
+            if (accessKeyColumns.size !== 0) {
+                if (!accessKeyColumns.has('bound_machine_id')) this.db.exec('ALTER TABLE workspace_access_keys ADD COLUMN bound_machine_id TEXT')
+                if (!accessKeyColumns.has('public_jwk')) this.db.exec('ALTER TABLE workspace_access_keys ADD COLUMN public_jwk TEXT')
+                if (!accessKeyColumns.has('public_key_thumbprint')) this.db.exec('ALTER TABLE workspace_access_keys ADD COLUMN public_key_thumbprint TEXT')
+            }
+            this.db.exec(WORKSPACE_SCHEMA)
+        })()
+    }
+
+    private migrateFromV31ToV32(): void {
+        this.db.exec(PLUGIN_SETTINGS_SCHEMA)
+        const namespaces = this.db
+            .query('SELECT data_namespace FROM workspaces')
+            .all() as Array<{ data_namespace: string }>
+        const insert = this.db.query(`
+            INSERT OR IGNORE INTO plugin_settings(namespace, plugin_id, enabled, updated_at)
+            VALUES(?,?,1,?)
+        `)
+        const now = Date.now()
+        this.db.transaction(() => {
+            for (const { data_namespace: namespace } of namespaces) {
+                for (const pluginId of LEGACY_IMPLICITLY_ENABLED_PLUGIN_IDS) {
+                    insert.run(namespace, pluginId, now)
+                }
+            }
+        })()
+    }
+
     private getUserVersion(): number {
         const row = this.db.prepare('PRAGMA user_version').get() as { user_version: number } | undefined
         return row?.user_version ?? 0
@@ -590,37 +680,23 @@ export class Store {
     }
 
     private hasAnyUserTables(): boolean {
-        const row = this.db.prepare(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' LIMIT 1"
-        ).get() as { name?: string } | undefined
+        const row = this.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' LIMIT 1").get() as { name?: string } | undefined
         return Boolean(row?.name)
     }
 
     private assertRequiredTablesPresent(): void {
         const placeholders = REQUIRED_TABLES.map(() => '?').join(', ')
-        const rows = this.db.prepare(
-            `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (${placeholders})`
-        ).all(...REQUIRED_TABLES) as Array<{ name: string }>
+        const rows = this.db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (${placeholders})`).all(...REQUIRED_TABLES) as Array<{ name: string }>
         const existing = new Set(rows.map((row) => row.name))
         const missing = REQUIRED_TABLES.filter((table) => !existing.has(table))
 
         if (missing.length > 0) {
-            throw new Error(
-                `SQLite schema is missing required tables (${missing.join(', ')}). ` +
-                'Back up and rebuild the database, or run an offline migration to the expected schema version.'
-            )
+            throw new Error(`SQLite schema is missing required tables (${missing.join(', ')}). ` + 'Back up and rebuild the database, or run an offline migration to the expected schema version.')
         }
     }
 
     private buildSchemaMismatchError(currentVersion: number): Error {
-        const location = (this._dbPath === ':memory:' || this._dbPath.startsWith('file::memory:'))
-            ? 'in-memory database'
-            : this._dbPath
-        return new Error(
-            `SQLite schema version mismatch for ${location}. ` +
-            `Expected ${SCHEMA_VERSION}, found ${currentVersion}. ` +
-            'This build does not run compatibility migrations. ' +
-            'Back up and rebuild the database, or run an offline migration to the expected schema version.'
-        )
+        const location = this._dbPath === ':memory:' || this._dbPath.startsWith('file::memory:') ? 'in-memory database' : this._dbPath
+        return new Error(`SQLite schema version mismatch for ${location}. ` + `Expected ${SCHEMA_VERSION}, found ${currentVersion}. ` + 'This build does not run compatibility migrations. ' + 'Back up and rebuild the database, or run an offline migration to the expected schema version.')
     }
 }

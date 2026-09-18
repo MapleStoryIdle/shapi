@@ -1,4 +1,4 @@
-import type { Session, SideSessionMetadata, WorktreeMetadata } from './schemas'
+import type { MonitorSessionMetadata, Session, SideSessionMetadata, WorktreeMetadata } from './schemas'
 
 export type PendingRequestKind = 'permission' | 'input'
 
@@ -37,14 +37,18 @@ export type SessionSummaryMetadata = {
     flavor?: string | null
     worktree?: WorktreeMetadata
     agentSessionId?: string
+    controlOwner?: 'shapi' | 'external'
     lifecycleState?: string
     sideSession?: SideSessionMetadata
+    monitorSession?: MonitorSessionMetadata
 }
 
 export type SessionSummary = {
     id: string
     active: boolean
     thinking: boolean
+    /** Start of the current thinking turn; omitted while idle or for older runners. */
+    thinkingStartedAt?: number
     activeAt: number
     updatedAt: number
     metadata: SessionSummaryMetadata | null
@@ -123,8 +127,10 @@ export function toSessionSummary(session: Session): SessionSummary {
             ?? session.metadata.cursorSessionId
             ?? session.metadata.kimiSessionId
             ?? undefined,
+        controlOwner: session.metadata.controlOwner,
         lifecycleState: session.metadata.lifecycleState,
-        sideSession: session.metadata.sideSession
+        sideSession: session.metadata.sideSession,
+        monitorSession: session.metadata.monitorSession
     } : null
 
     const todoProgress = session.todos?.length ? {
@@ -136,6 +142,7 @@ export function toSessionSummary(session: Session): SessionSummary {
         id: session.id,
         active: session.active,
         thinking: session.thinking,
+        ...(session.thinking && session.thinkingAt > 0 ? { thinkingStartedAt: session.thinkingAt } : {}),
         activeAt: session.activeAt,
         updatedAt: session.updatedAt,
         metadata,

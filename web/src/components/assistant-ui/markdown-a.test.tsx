@@ -1,3 +1,4 @@
+import * as chatPreview from '@/components/ChatPreviewContext'
 /**
  * Tests for the custom <A> anchor component and the inlined URL policy helpers
  * in markdown-text.tsx.
@@ -9,13 +10,15 @@
  *   - <A> component click behaviour: deny, IANA, custom (dialog opened via context)
  *   - intra-tab cross-provider sync via module-level schemeListeners emitter
  */
-import { describe, expect, it, vi, beforeEach } from 'vitest'
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup, act, waitFor } from '@testing-library/react'
 import React from 'react'
 import { defaultComponents, classifyScheme, denyOnlyTransform, UriConfirmProvider } from '@/components/assistant-ui/markdown-text'
 import { I18nProvider } from '@/lib/i18n-context'
 import { HappyChatProvider, type HappyChatFileLinkTarget } from '@/components/AssistantChat/context'
 import { encodeBase64 } from '@/lib/utils'
+import { parseLocalServiceLaunchHash } from '@/lib/local-service-links'
+import * as localServiceNavigation from '@/lib/open-local-service'
 
 const routerMocks = vi.hoisted(() => ({
     navigate: vi.fn(),
@@ -72,12 +75,50 @@ function renderAInChat(
 
 const STORAGE_KEY = 'hapi-allowed-schemes'
 
+describe('automatic local service links', () => {
+    it('hands a normal tap to the authenticated chat without opening the login route', () => {
+        const open = vi.spyOn(localServiceNavigation, 'openLocalServiceInTab').mockReturnValue(true)
+        renderAInChat({ href: 'http://localhost:8317/settings', children: 'Open service' })
+        expect(open).not.toHaveBeenCalled()
+        const dispatched = fireEvent.click(screen.getByRole('link', { name: 'Open service' }))
+        expect(dispatched).toBe(false)
+        expect(open).toHaveBeenCalledWith(expect.anything(), {
+            source: { type: 'session', sessionId: 'session-1' }, url: 'http://localhost:8317/settings'
+        }, expect.objectContaining({ opening: expect.any(String) }))
+    })
+
+    it('does not override an explicitly cancelled click', () => {
+        const open = vi.spyOn(localServiceNavigation, 'openLocalServiceInTab').mockReturnValue(true)
+        renderAInChat({ href: 'http://localhost:8317/', children: 'Open service', onClick: (event) => event.preventDefault() })
+        fireEvent.click(screen.getByRole('link', { name: 'Open service' }))
+        expect(open).not.toHaveBeenCalled()
+    })
+
+    it.each(['http://localhost:8317/settings?a=1#tab', 'http://127.0.0.1:3000', 'https://[::1]:4443/'])('opens %s through its managed session without calling an API while rendering', (href) => {
+        renderAInChat({ href, children: 'Open service' })
+        const link = screen.getByRole('link', { name: 'Open service' }) as HTMLAnchorElement
+        expect(link).toHaveAttribute('target', '_blank')
+        expect(link).toHaveAttribute('rel', 'noopener noreferrer')
+        expect(parseLocalServiceLaunchHash(new URL(link.href).hash)).toEqual({ source: { type: 'session', sessionId: 'session-1' }, url: href })
+        expect(screen.queryByRole('dialog')).toBeNull()
+        expect(routerMocks.navigate).not.toHaveBeenCalled()
+    })
+
+    it('uses the native source machine rather than the viewing phone', () => {
+        const source = { type: 'native-codex' as const, sessionId: 'native-2', machineId: 'machine-2' }
+        renderAInChat({ href: 'http://localhost:9000/', children: 'Native service' }, { fileLinkTarget: source })
+        const link = screen.getByRole('link', { name: 'Native service' }) as HTMLAnchorElement
+        expect(parseLocalServiceLaunchHash(new URL(link.href).hash)?.source).toEqual(source)
+    })
+})
+
 beforeEach(() => {
     localStorage.clear()
     cleanup()
     routerMocks.navigate.mockClear()
     vi.clearAllMocks()
 })
+afterEach(() => vi.restoreAllMocks())
 
 // ── classifyScheme ────────────────────────────────────────────────────────────
 
@@ -360,6 +401,8 @@ describe('markdown <A> component — file path links', () => {
         const link = screen.getByRole('link')
         expect(link).toHaveClass('aui-md-file-link')
         expect(link).toHaveClass('text-[var(--app-markdown-link)]')
+        expect(link).toHaveClass('bg-transparent', '[&_code]:bg-transparent')
+        expect(link).not.toHaveClass('bg-[var(--app-inline-code-bg)]', 'hover:bg-[var(--app-code-copy-hover-bg)]')
         expect(link).toHaveAttribute('title', 'docs/guide.md:42')
         expect(link.querySelector('[data-markdown-link-icon="file"]')).not.toBeNull()
 
@@ -380,9 +423,11 @@ describe('markdown <A> component — file path links', () => {
 
         renderAInChat({ href, children: 'web/src/router.tsx:42:7' })
 
-        // File path links should look like inline code chips, not generic web links.
+        // File paths use the same inline text treatment as all message links.
         const link = screen.getByRole('link')
-        expect(link).toHaveClass('aui-md-file-link', 'truncate', 'font-mono', 'no-underline')
+        expect(link).toHaveClass('aui-md-file-link', 'message-content-link', 'no-underline')
+        expect(link).not.toHaveClass('truncate', 'font-mono', 'border')
+        expect(link.querySelector('[data-file-type="tsx"]')).not.toBeNull()
         expect(link).toHaveAttribute('title', 'web/src/router.tsx:42:7')
 
         const target = new URL(link.getAttribute('href')!, 'http://127.0.0.1')
@@ -531,6 +576,8 @@ describe('markdown <A> component — file path links', () => {
             let link = screen.getByRole('link')
             expect(link).toHaveClass('aui-md-file-link')
             expect(link).toHaveAttribute('aria-disabled', 'true')
+            expect(link).toHaveClass('message-content-link', 'bg-transparent', 'no-underline')
+            expect(link.querySelector('[data-markdown-link-icon="disabled"]')).not.toBeNull()
             expect(link).not.toHaveAttribute('href')
             expect(link).not.toHaveAttribute('data-hapi-file-link')
 
@@ -691,6 +738,8 @@ describe('markdown <A> component — file path links', () => {
         const link = screen.getByRole('link')
         const target = new URL(link.getAttribute('href')!, 'http://127.0.0.1')
         expect(target.pathname).toBe('/sessions/codex/codex-thread-1/file')
+        expect(link).toHaveClass('bg-transparent', '[&_code]:bg-transparent')
+        expect(link).not.toHaveClass('bg-[var(--app-inline-code-bg)]', 'hover:bg-[var(--app-code-copy-hover-bg)]')
         expect(target.searchParams.get('machineId')).toBe('machine-1')
         expect(target.searchParams.get('path')).toBe(encodeBase64('web/src/router.tsx'))
         expect(target.searchParams.get('line')).toBe('42')
@@ -770,5 +819,88 @@ describe('intra-tab cross-provider sync (schemeListeners emitter)', () => {
         })
 
         openSpy.mockRestore()
+    })
+})
+
+describe('mobile chat preview routing', () => {
+    it('opens external content links in the sheet without navigation', () => {
+        const open = vi.fn(() => true)
+        vi.spyOn(chatPreview, 'useChatPreview').mockReturnValue(open)
+        renderAInChat({ href: 'https://example.com/article', children: 'Article' })
+        expect(fireEvent.click(screen.getByRole('link', { name: 'Article' }))).toBe(false)
+        expect(open).toHaveBeenCalledWith({ type: 'url', url: 'https://example.com/article' })
+    })
+    it('keeps modified clicks and downloads outside the sheet', () => {
+        const open = vi.fn(() => true)
+        vi.spyOn(chatPreview, 'useChatPreview').mockReturnValue(open)
+        renderAInChat({ href: 'https://example.com/report', children: 'Report', download: 'report' })
+        fireEvent.click(screen.getByRole('link', { name: 'Report' }))
+        expect(open).not.toHaveBeenCalled()
+        cleanup()
+        renderAInChat({ href: 'https://example.com/article', children: 'Article' })
+        fireEvent.click(screen.getByRole('link', { name: 'Article' }), { ctrlKey: true })
+        expect(open).not.toHaveBeenCalled()
+    })
+    it('keeps native file identity and line in the preview', () => {
+        const open = vi.fn(() => true)
+        vi.spyOn(chatPreview, 'useChatPreview').mockReturnValue(open)
+        const source = { type: 'native-codex' as const, sessionId: 'native', machineId: 'machine' }
+        renderAInChat({ href: './src/index.ts:12', children: 'Source' }, { fileLinkTarget: source })
+        fireEvent.click(screen.getByRole('link', { name: 'Source' }))
+        expect(open).toHaveBeenCalledWith(expect.objectContaining({ type: 'file', source, path: './src/index.ts', line: 12 }))
+        expect(routerMocks.navigate).not.toHaveBeenCalled()
+    })
+    it('previews a copied same-origin workspace file URL in the file drawer', () => {
+        const open = vi.fn(() => true)
+        vi.spyOn(chatPreview, 'useChatPreview').mockReturnValue(open)
+        const workspacePath = '/Users/dev/.codex/worktrees/jikeyun/homebar-cloud'
+        const filePath = `${workspacePath}/src/main/java/CabinetThirdAccountHelp.java`
+        const href = `${window.location.origin}${filePath}#L85-L117`
+
+        renderAInChat({ href, children: 'CabinetThirdAccountHelp.java' }, { workspacePath })
+        const link = screen.getByRole('link', { name: 'CabinetThirdAccountHelp.java' })
+        expect(link).toHaveAttribute('data-hapi-file-link', 'true')
+        fireEvent.click(link)
+
+        expect(open).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'file',
+            path: filePath,
+            line: 85
+        }))
+        expect(routerMocks.navigate).not.toHaveBeenCalled()
+    })
+    it('compacts a visible same-origin workspace URL without losing its line range', () => {
+        const workspacePath = '/Users/dev/.codex/worktrees/jikeyun/homebar-cloud'
+        const filePath = `${workspacePath}/src/main/java/CabinetThirdAccountHelp.java`
+        const href = `${window.location.origin}${filePath}#L85-L117`
+
+        renderAInChat({ href, children: href }, { workspacePath })
+
+        const link = screen.getByRole('link', { name: 'CabinetThirdAccountHelp.java:85-117' })
+        expect(link).toHaveAttribute('title', `${filePath}:85-117`)
+        expect(link).not.toHaveTextContent(window.location.origin)
+        expect(link).not.toHaveTextContent(workspacePath)
+    })
+    it('previews local services with an authenticated request, not the phone localhost', () => {
+        const open = vi.fn(() => true)
+        vi.spyOn(chatPreview, 'useChatPreview').mockReturnValue(open)
+        const tab = vi.spyOn(localServiceNavigation, 'openLocalServiceInTab').mockReturnValue(true)
+        renderAInChat({ href: 'http://localhost:3000/', children: 'Local app' })
+        fireEvent.click(screen.getByRole('link', { name: 'Local app' }))
+        expect(open).toHaveBeenCalledWith(expect.objectContaining({ type: 'url', localService: { api: expect.anything(), request: { source: { type: 'session', sessionId: 'session-1' }, url: 'http://localhost:3000/' } } }))
+        expect(tab).not.toHaveBeenCalled()
+    })
+    it('does not preview app navigation or unsafe schemes', () => {
+        for (const href of ['/sessions/123', '#section', 'mailto:a@b.com', 'javascript:alert(1)', 'data:text/html,hi', 'https://user:password@example.com']) {
+            expect(chatPreview.previewableWebUrl(href, 'https://hapi.test')).toBeNull()
+        }
+        expect(chatPreview.previewableWebUrl('https://hapi.test/sessions/123', 'https://hapi.test')).toBeNull()
+    })
+    it('previews same-origin content without swallowing real HAPI navigation', () => {
+        expect(chatPreview.previewableWebUrl('/docs/article', 'https://hapi.test')).toBe('https://hapi.test/docs/article')
+        expect(chatPreview.previewableWebUrl('./article', 'https://hapi.test')).toBe('https://hapi.test/article')
+        for (const href of ['/', '/sessions', '/browse/repo', '/memory', '/settings', '/shares/abc']) {
+            expect(chatPreview.previewableWebUrl(href, 'https://hapi.test')).toBeNull()
+        }
     })
 })

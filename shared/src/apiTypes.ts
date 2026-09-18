@@ -80,6 +80,12 @@ export type MessagesResponse = {
         nextBeforeSeq: number | null
         nextBeforeAt: number | null
         hasMore: boolean
+        /** Present for an `afterAt`/`afterSeq` request. */
+        nextAfterSeq?: number | null
+        /** Present for an `afterAt`/`afterSeq` request. */
+        nextAfterAt?: number | null
+        /** Present for an `afterAt`/`afterSeq` request. */
+        hasMoreAfter?: boolean
     }
 }
 
@@ -232,6 +238,14 @@ export const RenameSessionRequestSchema = z.object({
 
 export type RenameSessionRequest = z.infer<typeof RenameSessionRequestSchema>
 
+export const RenameNativeCodexSessionRequestSchema = z.object({
+    name: z.string().trim().min(1).max(255)
+})
+
+export type RenameNativeCodexSessionResponse =
+    | { success: true; name: string }
+    | { success: false; code: 'invalid_request' | 'session_not_found' | 'not_native_session' | 'rename_unsupported' | 'rename_failed'; error: string }
+
 export type CreateSideSessionResponse =
     | { type: 'success'; sessionId: string; session?: Session }
     | { type: 'error'; message: string; code?: string }
@@ -321,9 +335,35 @@ export const MessagesQuerySchema = z.object({
     limit: z.coerce.number().int().min(1).max(200).optional(),
     beforeSeq: z.coerce.number().int().min(1).optional(),
     beforeAt: z.coerce.number().int().min(0).optional(),
-}).refine((data) => (data.beforeAt === undefined) === (data.beforeSeq === undefined), {
-    message: 'beforeAt and beforeSeq must be provided together',
-    path: ['beforeAt'],
+    afterSeq: z.coerce.number().int().min(1).optional(),
+    afterAt: z.coerce.number().int().min(0).optional(),
+}).superRefine((data, ctx) => {
+    const hasBeforeAt = data.beforeAt !== undefined
+    const hasBeforeSeq = data.beforeSeq !== undefined
+    const hasAfterAt = data.afterAt !== undefined
+    const hasAfterSeq = data.afterSeq !== undefined
+
+    if (hasBeforeAt !== hasBeforeSeq) {
+        ctx.addIssue({
+            code: 'custom',
+            message: 'beforeAt and beforeSeq must be provided together',
+            path: ['beforeAt'],
+        })
+    }
+    if (hasAfterAt !== hasAfterSeq) {
+        ctx.addIssue({
+            code: 'custom',
+            message: 'afterAt and afterSeq must be provided together',
+            path: ['afterAt'],
+        })
+    }
+    if (hasBeforeAt && hasAfterAt) {
+        ctx.addIssue({
+            code: 'custom',
+            message: 'before and after cursors are mutually exclusive',
+            path: ['afterAt'],
+        })
+    }
 })
 
 export type MessagesQuery = z.infer<typeof MessagesQuerySchema>
@@ -347,6 +387,7 @@ export const SendMessageRequestSchema = z.object({
 export type SendMessageRequest = z.infer<typeof SendMessageRequestSchema>
 
 export const SpawnSessionRequestSchema = z.object({
+    requestId: z.string().uuid(),
     directory: z.string().min(1),
     agent: AgentFlavorSchema.optional(),
     model: z.string().optional(),
@@ -370,6 +411,53 @@ export const MachinePathsExistsRequestSchema = z.object({
 })
 
 export type MachinePathsExistsRequest = z.infer<typeof MachinePathsExistsRequestSchema>
+
+/** A read-only Git branch inventory for a directory owned by a runner. */
+export const MachineGitBranchesRequestSchema = z.object({
+    cwd: z.string().trim().min(1).max(4096)
+})
+
+export type MachineGitBranchesRequest = z.infer<typeof MachineGitBranchesRequestSchema>
+
+export const MachineGitBranchSwitchRequestSchema = MachineGitBranchesRequestSchema.extend({
+    target: z.object({
+        kind: z.enum(['local', 'remote']),
+        /** Local branch name or a short remote ref such as `origin/feature/x`. */
+        ref: z.string().trim().min(1).max(512)
+    }).strict(),
+    /** Required when the runner observes uncommitted work before switching. */
+    confirmDirty: z.boolean().optional()
+}).strict()
+
+export type MachineGitBranchSwitchRequest = z.infer<typeof MachineGitBranchSwitchRequestSchema>
+
+export const MachineGitBranchCreateRequestSchema = MachineGitBranchesRequestSchema.extend({
+    name: z.string().trim().min(1).max(512)
+}).strict()
+
+export type MachineGitBranchCreateRequest = z.infer<typeof MachineGitBranchCreateRequestSchema>
+
+/** Stage every local change and create one normal Git commit. */
+export const MachineGitBranchCommitRequestSchema = MachineGitBranchesRequestSchema.extend({
+    message: z.string().trim().min(1).max(4096)
+}).strict()
+
+export type MachineGitBranchCommitRequest = z.infer<typeof MachineGitBranchCommitRequestSchema>
+
+/** Push the current branch through its configured upstream or default remote. */
+export const MachineGitBranchPushRequestSchema = MachineGitBranchesRequestSchema.strict()
+
+export type MachineGitBranchPushRequest = z.infer<typeof MachineGitBranchPushRequestSchema>
+
+/** Refresh remote refs without changing the checked-out worktree. */
+export const MachineGitBranchFetchRequestSchema = MachineGitBranchesRequestSchema.strict()
+
+export type MachineGitBranchFetchRequest = z.infer<typeof MachineGitBranchFetchRequestSchema>
+
+/** Safely fast-forward the current branch through its configured upstream. */
+export const MachineGitBranchUpdateRequestSchema = MachineGitBranchesRequestSchema.strict()
+
+export type MachineGitBranchUpdateRequest = z.infer<typeof MachineGitBranchUpdateRequestSchema>
 
 export const LocalPreviewProtocolSchema = z.enum(['http', 'https'])
 export type LocalPreviewProtocol = z.infer<typeof LocalPreviewProtocolSchema>
@@ -497,9 +585,69 @@ export type OpenVikingStatusResponse = {
     error?: string
 }
 
+export const OpenVikingSearchRequestSchema = z.object({
+    query: z.string().trim().min(1).max(2000),
+    limit: z.number().int().min(1).max(20).default(8)
+})
+
+export type OpenVikingSearchRequest = z.infer<typeof OpenVikingSearchRequestSchema>
+
+export type OpenVikingSearchHit = {
+    uri: string
+    contextType: 'memory' | 'resource' | 'skill' | 'unknown'
+    level?: number
+    score?: number
+    abstract?: string
+    matchReason?: string
+}
+
+export type OpenVikingSearchResponse = {
+    ok: boolean
+    durationMs?: number
+    total?: number
+    hits?: OpenVikingSearchHit[]
+    error?: string
+}
+
+export type OpenVikingMetricsResponse = {
+    ok: boolean
+    retrievalRequests?: number
+    retrievalResults?: number
+    zeroResults?: number
+    zeroResultRate?: number
+    averageLatencyMs?: number
+    p95LatencyMs?: number
+    rerankUses?: number
+    rerankFallbacks?: number
+    queuePending?: number
+    queueInProgress?: number
+    error?: string
+}
+
+export type OpenVikingQualityIssue = {
+    kind: 'duplicate' | 'conflict'
+    uris: string[]
+    summary: string
+}
+
+export type OpenVikingQualityResponse = {
+    ok: boolean
+    scannedMemories?: number
+    scanLimited?: boolean
+    totalMemories?: number
+    stale7d?: number
+    stale30d?: number
+    oldestMemoryAgeDays?: number
+    duplicateGroups?: number
+    conflictGroups?: number
+    issues?: OpenVikingQualityIssue[]
+    checkedAt?: number
+    error?: string
+}
+
 export const AuthRequestSchema = z.union([
-    z.object({ initData: z.string() }),
-    z.object({ accessToken: z.string() })
+    z.object({ initData: z.string().max(16_384) }),
+    z.object({ accessToken: z.string().min(1).max(512) })
 ])
 
 export type AuthRequest = z.infer<typeof AuthRequestSchema>
@@ -516,10 +664,51 @@ export type GitCommandResponse = CommandResponse
 
 /** Branch probe metadata for a directory on a runner. */
 export type GitBranchResponse = GitCommandResponse & {
+    /** Only confirmed Git not-a-repository responses produce non-git. */
+    repositoryState?: 'git' | 'non-git' | 'error'
+    childRepositories?: Array<{ name: string; cwd: string }>
+    childRepositoriesTruncated?: boolean
+    childRepositoriesError?: string
     /** True only for a linked Git worktree, not the primary checkout. */
     isWorktree?: boolean
     /** True when tracked, staged, or untracked worktree changes exist. */
     isDirty?: boolean
+}
+
+/** A branch name is deliberately separated from its Git ref. The web displays
+ * `name`, while `ref` remains available for a safe, unambiguous RPC action. */
+export type GitBranchOption = {
+    ref: string
+    name: string
+}
+
+export type GitBranchesResponse = {
+    success: boolean
+    error?: string
+    code?:
+        | 'dirty_confirmation_required'
+        | 'branch_not_found'
+        | 'branch_exists'
+        | 'not_git_repository'
+        | 'nothing_to_commit'
+        | 'detached_head'
+        | 'push_remote_unavailable'
+        | 'fetch_remote_unavailable'
+        | 'upstream_unavailable'
+        | 'dirty_update_blocked'
+    currentBranch?: string | null
+    /** The runner-selected remote used when the current branch has no upstream. */
+    pushRemote?: string | null
+    /** Short upstream ref such as `origin/main`, when the current branch tracks one. */
+    upstream?: string | null
+    /** True only when a safe fast-forward update can be attempted. */
+    canUpdate?: boolean
+    isDirty?: boolean
+    changedFileCount?: number
+    additions?: number
+    deletions?: number
+    localBranches?: GitBranchOption[]
+    remoteBranches?: GitBranchOption[]
 }
 
 export type FileReadResponse = {
@@ -561,6 +750,21 @@ export type ListDirectoryResponse = {
 }
 
 export type RpcListDirectoryResponse = ListDirectoryResponse
+
+export const SessionFileBrowserRequestSchema = z.object({
+    action: z.enum(['directory', 'changes', 'diff']),
+    path: z.string().max(4096).default(''),
+    staged: z.boolean().optional()
+}).strict()
+export type SessionFileBrowserRequest = z.infer<typeof SessionFileBrowserRequestSchema>
+export type SessionFileBrowserResponse = ListDirectoryResponse & {
+    isGitRepository?: boolean
+    status?: string
+    unstaged?: string
+    staged?: string
+    stdout?: string
+    truncated?: boolean
+}
 
 export type MachineDirectoryEntry = DirectoryEntry & {
     isGitRepo?: boolean
@@ -614,11 +818,14 @@ export type CodexSubscriptionLimits = {
 export type CodexSubscriptionLimitsResponse = {
     success: boolean
     limits?: CodexSubscriptionLimits
+    account?: import('./codexUsage').CodexUsageAccount
     error?: string
 }
 
 export type GetCodexSubscriptionLimitsRequest = {
     model?: string | null
+    cwd?: string | null
+    provider?: string | null
 }
 
 export type GetCodexSubscriptionLimitsResponse = CodexSubscriptionLimitsResponse

@@ -1,3 +1,9 @@
+import { ChatPreviewProvider, useChatPreview } from '@/components/ChatPreviewContext'
+import { useDrawerExitPresence } from '@/hooks/useDrawerExitPresence'
+import { ThreadThinkingMessage } from '@/components/ThreadThinkingMessage'
+import { SessionFilesDrawer } from '@/components/SessionFiles/SessionFilesDrawer'
+import { SessionMonitorControl, useRelatedSessionMonitors } from '@/components/SessionMonitorControl'
+import { getThinkingStartedAt } from '@/lib/thinking-started-at'
 import { lazy, Suspense, useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from '@tanstack/react-router'
 import { useQueryClient } from '@tanstack/react-query'
@@ -26,6 +32,7 @@ import { buildConversationOutline } from '@/chat/outline'
 import { isToolGroupBlock, type ToolGroupBlock } from '@/chat/toolGroups'
 import {
     buildIncrementalSessionDetailTimeline,
+    hasCurrentTurnProcess,
     type SessionDetailTimelineCache
 } from '@/chat/sessionDetailTimeline'
 import { isQueuedForInvocation, mergeMessages } from '@/lib/messages'
@@ -51,6 +58,7 @@ import { createAttachmentAdapter } from '@/lib/attachmentAdapter'
 import { consumeSharePendingTransfer } from '@/lib/sharePendingState'
 import { deleteShareTransfer, getShareTransfer } from '@/lib/shareTransfer'
 import { getDraft } from '@/lib/composer-drafts'
+import { enqueueQueuedMessageEdit } from '@/lib/queued-message-edits'
 import { useTranslation } from '@/lib/use-translation'
 import {
     SessionConnectionRecoveryControl,
@@ -65,6 +73,7 @@ import {
 } from '@/components/CursorMigrationBanner'
 import { TeamPanel } from '@/components/TeamPanel'
 import { usePlatform } from '@/hooks/usePlatform'
+import { getSessionDisplayTitle } from '@/lib/session-title'
 import { useSessionActions } from '@/hooks/mutations/useSessionActions'
 import { useCodexModels } from '@/hooks/queries/useCodexModels'
 import { useCursorModels } from '@/hooks/queries/useCursorModels'
@@ -89,6 +98,7 @@ import { useOpencodeReasoningEffortOptions } from '@/hooks/queries/useOpencodeRe
 import { useGitStatusFiles } from '@/hooks/queries/useGitStatusFiles'
 import { useSessions } from '@/hooks/queries/useSessions'
 import { useTerminalToolDisplayMode } from '@/hooks/useTerminalToolDisplayMode'
+import { useLocalPluginEnabled } from '@/hooks/useLocalPluginEnabled'
 import { useVoiceOptional } from '@/lib/voice-context'
 import { registerSessionStore } from '@/realtime/realtimeClientTools'
 import { registerVoiceHooksStore, voiceHooks } from '@/realtime/hooks/voiceHooks'
@@ -527,16 +537,7 @@ export function canReuseTimelineMessagesForGoalState(
 }
 
 function getOutlineTitle(session: Session): string {
-    if (session.metadata?.name) {
-        return session.metadata.name
-    }
-    if (session.metadata?.summary?.text) {
-        return session.metadata.summary.text
-    }
-    if (session.metadata?.path) {
-        return session.metadata.path
-    }
-    return session.id.slice(0, 8)
+    return getSessionDisplayTitle(session)
 }
 
 function isBlockInTurnScope(block: ChatBlock, minCreatedAt: number | null): boolean {
@@ -690,14 +691,17 @@ type SessionChatProps = {
     pendingMessages?: DecryptedMessage[]
     messagesWarning: string | null
     hasMoreMessages: boolean
+    hasNewerMessages: boolean
     isLoadingMessages: boolean
     isLoadingMoreMessages: boolean
+    isLoadingNewerMessages: boolean
     isSending: boolean
     pendingCount: number
     messagesVersion: number
     onBack: () => void
     onRefresh: () => void
     onLoadMore: () => Promise<unknown>
+    onLoadNewer: () => Promise<unknown>
     // Resolves true when the send was accepted by the underlying mutation, false when
     // pre-mutation guards (no-api / no-session / pending) rejected the call OR async
     // inactive-session resume failed. Composer state that should only be cleared on
@@ -809,13 +813,15 @@ function useDeferredThreadSnapshot(
  * SessionChatInner.
  */
 export function SessionChat(props: SessionChatProps) {
-    return <SessionChatInner key={props.session.id} {...props} />
+    return <ChatPreviewProvider key={props.session.id}><SessionChatInner key={props.session.id} {...props} /></ChatPreviewProvider>
 }
 
 function SessionChatInner(props: SessionChatProps) {
     const { haptic } = usePlatform()
     const { t } = useTranslation()
     const { terminalToolDisplayMode } = useTerminalToolDisplayMode()
+    const { enabled: terminalPluginEnabled } = useLocalPluginEnabled('terminal')
+    const { enabled: voicePluginEnabled } = useLocalPluginEnabled('voice')
     const navigate = useNavigate()
     const queryClient = useQueryClient()
     const { sessions: sessionSummaries } = useSessions(props.api, { live: false })
@@ -843,6 +849,7 @@ function SessionChatInner(props: SessionChatProps) {
     const [dismissedCodexQuickReplyPromptId, setDismissedCodexQuickReplyPromptId] = useState<string | null>(null)
     const [codexQuickReplySending, setCodexQuickReplySending] = useState(false)
     const [outlineOpen, setOutlineOpen] = useState(props.initialOutlineOpen ?? false)
+    const [filesOpen, setFilesOpen] = useState(false)
     const bottomOverlayRef = useRef<HTMLDivElement | null>(null)
     const composerOverlayRef = useRef<HTMLDivElement | null>(null)
     const bottomAccessoryRef = useRef<HTMLDivElement | null>(null)
@@ -1453,11 +1460,16 @@ function SessionChatInner(props: SessionChatProps) {
         () => getLatestUserTurnCreatedAt(normalizedMessages),
         [normalizedMessages]
     )
+    const thinkingStartedAt = useMemo(() => getThinkingStartedAt(normalizedMessages), [normalizedMessages])
     const turnCompletionKey = useMemo(
         () => getLatestTurnCompletionKey(normalizedMessages),
         [normalizedMessages]
     )
     const hasRunningChildAgent = useMemo(
+        () => turnCompletionKey === null && hasAbortableAgentRun(reduced.blocks, latestUserTurnCreatedAt),
+        [latestUserTurnCreatedAt, reduced.blocks, turnCompletionKey]
+    )
+    const hasThinkingChildAgent = useMemo(
         () => turnCompletionKey === null && hasAbortableAgentRun(reduced.blocks, latestUserTurnCreatedAt),
         [latestUserTurnCreatedAt, reduced.blocks, turnCompletionKey]
     )
@@ -1482,8 +1494,22 @@ function SessionChatInner(props: SessionChatProps) {
     })
     const planStatusVisible = activePlanStatus !== null
     const gitDiffAccessoryVisible = !runActive && gitDiffSummaryVisible
-    const queueAccessoryVisible = queuedMessages.length > 0
-    const bottomAccessoryVisible = queueAccessoryVisible || planStatusVisible || gitDiffAccessoryVisible
+    const queueAccessoryVisible = useDrawerExitPresence(queuedMessages.length > 0)
+    const monitorTargets = useMemo(() => [
+        { type: 'managed' as const, sessionId: props.session.id },
+        ...(props.session.metadata?.codexSessionId && props.session.metadata.machineId ? [{
+            type: 'native-codex' as const,
+            sessionId: props.session.metadata.codexSessionId,
+            machineId: props.session.metadata.machineId
+        }] : [])
+    ], [props.session.id, props.session.metadata?.codexSessionId, props.session.metadata?.machineId])
+    const monitorIds = useMemo(
+        () => props.session.metadata?.monitorSession?.monitorId ? [props.session.metadata.monitorSession.monitorId] : [],
+        [props.session.metadata?.monitorSession?.monitorId]
+    )
+    const { relatedMonitors, refetch: refetchRelatedMonitors } = useRelatedSessionMonitors(props.api, monitorTargets, monitorIds)
+    const monitorAccessoryVisible = relatedMonitors.length > 0
+    const bottomAccessoryVisible = queueAccessoryVisible || planStatusVisible || gitDiffAccessoryVisible || monitorAccessoryVisible
     const bottomAccessoryExpanded = statusAccessoryExpanded || queueAccessoryExpanded
     const threadBottomInset = getBottomOverlayThreadInset(
         bottomOverlayHeight,
@@ -1538,6 +1564,10 @@ function SessionChatInner(props: SessionChatProps) {
     const timeline = timelineResult.timeline
     const groupedVisibleBlocks = timeline.grouped
     const visibleBlocks = timeline.visible
+    const currentTurnProcessVisible = useMemo(
+        () => hasCurrentTurnProcess(groupedVisibleBlocks, { minCreatedAt: latestUserTurnCreatedAt }),
+        [groupedVisibleBlocks, latestUserTurnCreatedAt]
+    )
     useEffect(() => {
         timelineCacheRef.current = timelineResult.cache
     }, [timelineResult.cache])
@@ -1680,23 +1710,18 @@ function SessionChatInner(props: SessionChatProps) {
 
     const handleToggleFiles = useCallback(() => {
         setOutlineOpen(false)
-        navigate({
-            to: '/sessions/$sessionId/files',
-            params: { sessionId: props.session.id }
-        })
-    }, [navigate, props.session.id])
+        setFilesOpen(true)
+    }, [])
 
     const handleViewDiff = useCallback(() => {
         setOutlineOpen(false)
-        navigate({
-            to: '/sessions/$sessionId/files',
-            params: { sessionId: props.session.id },
-            search: { tab: 'changes' }
-        })
-    }, [navigate, props.session.id])
+        setFilesOpen(true)
+    }, [])
 
-    const handleViewFileDiff = useCallback((file: { path: string; staged: boolean; unstaged: boolean }) => {
+    const openPreview = useChatPreview()
+    const handleViewFileDiff = useCallback((file: { path: string; staged: boolean; unstaged: boolean; status?: string }) => {
         setOutlineOpen(false)
+        if (openPreview?.({ type: 'file', api: props.api, source: { type: 'session', sessionId: props.session.id }, workspacePath: props.session.metadata?.path, path: file.path, staged: file.staged && !file.unstaged, diff: file.status !== 'untracked' })) return
         navigate({
             to: '/sessions/$sessionId/file',
             params: { sessionId: props.session.id },
@@ -1706,7 +1731,7 @@ function SessionChatInner(props: SessionChatProps) {
                 from: 'session'
             }
         })
-    }, [navigate, props.session.id])
+    }, [navigate, props.session.id, props.session.metadata?.path, props.api, openPreview])
 
     const handleToggleOutline = useCallback(() => {
         setOutlineOpen((open) => !open)
@@ -1894,7 +1919,7 @@ function SessionChatInner(props: SessionChatProps) {
         onSendMessage: handleSend,
         onAbort: handleAbort,
         attachmentAdapter,
-        allowSendWhenInactive: true,
+        allowSendWhenInactive: inactiveCanResume,
         pendingScheduleRef
     })
 
@@ -1907,17 +1932,20 @@ function SessionChatInner(props: SessionChatProps) {
         thinking: props.session.thinking,
         agentState: props.session.agentState,
         backgroundTaskCount: props.session.backgroundTaskCount,
-        voiceStatus: voice?.status
+        voiceStatus: voicePluginEnabled ? voice?.status : undefined
     }), [
         props.session.active,
         props.session.agentState,
         props.session.backgroundTaskCount,
         props.session.thinking,
-        voice?.status
+        voice?.status,
+        voicePluginEnabled
     ])
-
     return (
         <SessionDetailSurface source="hapi" testId="session-chat-surface">
+            {props.session.metadata?.path ? <SessionFilesDrawer key={props.session.id} api={props.api}
+                source={{ type: 'session', sessionId: props.session.id }} cwd={props.session.metadata.path}
+                open={filesOpen} onOpenChange={setFilesOpen} /> : null}
             <SessionHeader
                 session={props.session}
                 onBack={props.onBack}
@@ -1940,6 +1968,10 @@ function SessionChatInner(props: SessionChatProps) {
                         : undefined
                 }
                 sideSessionPending={sideSessionPending}
+                onCreateMonitor={() => navigate({
+                    to: '/monitors/new',
+                    search: { type: 'managed', sessionId: props.session.id }
+                })}
                 status={sessionHeaderStatus}
                 floating
             />
@@ -1999,12 +2031,16 @@ function SessionChatInner(props: SessionChatProps) {
                         isLoadingMessages={props.isLoadingMessages}
                         messagesWarning={props.messagesWarning}
                         hasMoreMessages={props.hasMoreMessages}
+                        hasNewerMessages={props.hasNewerMessages}
                         isLoadingMoreMessages={props.isLoadingMoreMessages}
+                        isLoadingNewerMessages={props.isLoadingNewerMessages}
                         onLoadMore={props.onLoadMore}
+                        onLoadNewer={props.onLoadNewer}
                         pendingCount={props.pendingCount}
                         rawMessagesCount={visibleMessages.length}
                         normalizedMessagesCount={normalizedMessages.length}
                         messagesVersion={threadSnapshot.messagesVersion}
+                        sourceMessagesVersion={props.messagesVersion}
                         toolGroupRunActive={runActive}
                         toolGroupCompletionKey={turnCompletionKey}
                         forceScrollToken={forceScrollToken}
@@ -2025,6 +2061,14 @@ function SessionChatInner(props: SessionChatProps) {
                         bottomAccessoryExpanded={bottomAccessoryExpanded}
                         scrollButtonPositionReady={scrollButtonPositionReady}
                         onOutlineOpenChange={setOutlineOpen}
+                        trailingMessage={
+                            <ThreadThinkingMessage
+                                startedAt={thinkingStartedAt}
+                                running={props.session.active && (props.session.thinking || hasThinkingChildAgent || props.isSending)}
+                                waitingForUser={Object.keys(props.session.agentState?.requests ?? {}).length > 0 || voice?.status === 'connecting'}
+                                hasProcess={currentTurnProcessVisible}
+                            />
+                        }
                     />
 
                     {showCodexQuickReply ? (
@@ -2071,8 +2115,7 @@ function SessionChatInner(props: SessionChatProps) {
                             ref={composerOverlayRef}
                             testId="session-chat-composer-overlay"
                         >
-                            <div className="relative">
-                                <HappyComposer
+                            <HappyComposer
                                 key={`composer-${props.session.id}`}
                                 sessionId={props.session.id}
                                 projectPath={props.session.metadata?.path}
@@ -2119,7 +2162,7 @@ function SessionChatInner(props: SessionChatProps) {
                                             : undefined
                                 }
                                 active={props.session.active}
-                                allowSendWhenInactive
+                                allowSendWhenInactive={inactiveCanResume}
                                 inactiveNotice={sessionInactive
                                     ? inactiveCanResume
                                         ? t('session.inactive.composerAutoResume')
@@ -2202,16 +2245,16 @@ function SessionChatInner(props: SessionChatProps) {
                                         : undefined
                                 }
                                 onSwitchToRemote={handleSwitchToRemote}
-                                onTerminal={props.session.active && terminalSupported ? handleViewTerminal : undefined}
-                                terminalUnsupported={props.session.active && !terminalSupported}
+                                onTerminal={terminalPluginEnabled && props.session.active && terminalSupported ? handleViewTerminal : undefined}
+                                terminalUnsupported={terminalPluginEnabled && props.session.active && !terminalSupported}
                                 autocompleteSuggestions={props.autocompleteSuggestions}
                                 skills={props.skills}
                                 skillsLoading={props.skillsLoading}
                                 skillsError={props.skillsError}
-                                voiceStatus={voice?.status}
-                                voiceMicMuted={voice?.micMuted}
-                                onVoiceToggle={voice ? handleVoiceToggle : undefined}
-                                onVoiceMicToggle={voice && voiceBackendReady ? handleVoiceMicToggle : undefined}
+                                voiceStatus={voicePluginEnabled ? voice?.status : undefined}
+                                voiceMicMuted={voicePluginEnabled ? voice?.micMuted : undefined}
+                                onVoiceToggle={voicePluginEnabled && voice ? handleVoiceToggle : undefined}
+                                onVoiceMicToggle={voicePluginEnabled && voice && voiceBackendReady ? handleVoiceMicToggle : undefined}
                                 scratchlistMode={scratchlistMode}
                                 scratchlistCount={scratchlist.entries.length}
                                 onScratchlistToggle={handleScratchlistToggle}
@@ -2220,7 +2263,6 @@ function SessionChatInner(props: SessionChatProps) {
                                 sendError={props.sendError ?? null}
                                 onClearSendError={props.onClearSendError}
                             />
-                            </div>
                         </SessionDetailBottomDockComposer>
 
                         {bottomAccessoryVisible ? (
@@ -2232,6 +2274,13 @@ function SessionChatInner(props: SessionChatProps) {
                                 data-mobile-layout-contract={MOBILE_LAYOUT_CONTRACT.bottomAccessory.state}
                             >
                                 <div className="mx-auto flex w-full max-w-content flex-col items-center gap-2">
+                                    {monitorAccessoryVisible ? (
+                                        <SessionMonitorControl
+                                            api={props.api}
+                                            monitors={relatedMonitors}
+                                            refetch={refetchRelatedMonitors}
+                                        />
+                                    ) : null}
                                     {planStatusVisible ? (
                                         <PlanStatusSummary
                                             plan={activePlanStatus}
@@ -2252,10 +2301,7 @@ function SessionChatInner(props: SessionChatProps) {
                                             api={props.api}
                                             queuedMessages={queuedMessages}
                                             onExpandedChange={handleQueueAccessoryExpandedChange}
-                                            onEdit={({ pendingSchedule: restored }) => {
-                                                // Restore the schedule so the clock button re-activates.
-                                                setPendingSchedule(restored)
-                                            }}
+                                            onEdit={(edit) => enqueueQueuedMessageEdit(props.session.id, edit)}
                                         />
                                     ) : null}
                                 </div>
@@ -2267,7 +2313,7 @@ function SessionChatInner(props: SessionChatProps) {
             </SessionDetailContent>
 
             {/* Voice backend is loaded only after the user asks to start voice. */}
-            {voice && voiceBackendRequested ? (
+            {voicePluginEnabled && voice && voiceBackendRequested ? (
                 <Suspense fallback={null}>
                     <LazyVoiceBackendSession
                         api={props.api}

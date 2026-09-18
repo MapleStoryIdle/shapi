@@ -36,6 +36,19 @@ describe('getToolPresentation — MCP invocation titles', () => {
 })
 
 describe('getToolPresentation — file access semantics', () => {
+    it('labels native Grep operations as grep', () => {
+        const presentation = getToolPresentation({
+            toolName: 'Grep',
+            input: { pattern: 'TODO', path: 'web/src' },
+            result: null,
+            childrenCount: 0,
+            description: null,
+            metadata: null,
+        })
+
+        expect(presentation).toMatchObject({ title: 'grep', subtitle: null, minimal: true })
+    })
+
     it('shows native Read path and actual line range directly', () => {
         const presentation = getToolPresentation({
             toolName: 'Read',
@@ -73,8 +86,8 @@ describe('getToolPresentation — file access semantics', () => {
             metadata: null,
         })
 
-        expect(presentation.title).toBe('Read file')
-        expect(presentation.subtitle).toBe('App.tsx · L12–80')
+        expect(presentation.title).toBe('Read App.tsx · L12–80')
+        expect(presentation.subtitle).toBeNull()
     })
 
     it('reduces compound Codex terminal commands to their key command', () => {
@@ -91,7 +104,7 @@ describe('getToolPresentation — file access semantics', () => {
         expect(presentation.subtitle).toBeNull()
     })
 
-    it('lists explicit read targets from a sequential Codex shell request', () => {
+    it('counts explicit read targets from a sequential Codex shell request', () => {
         const presentation = getToolPresentation({
             toolName: 'CodexBash',
             input: {
@@ -103,15 +116,15 @@ describe('getToolPresentation — file access semantics', () => {
             metadata: null,
         })
 
-        expect(presentation.title).toBe('Read file')
-        expect(presentation.subtitle).toBe('AGENT.md · App.tsx · L12–80')
+        expect(presentation.title).toBe('Read 2 files')
+        expect(presentation.subtitle).toBeNull()
     })
 
     it('shows safe remote, SQL, request, and file targets without raw arguments', () => {
         const cases = [
             {
                 command: 'ssh deploy@192.0.2.18 systemctl status hapi-hub.service',
-                title: 'Inspect hapi-hub service',
+                title: 'ssh',
                 subtitle: '192.0.2.18'
             },
             {
@@ -121,7 +134,7 @@ describe('getToolPresentation — file access semantics', () => {
             },
             {
                 command: `curl -X POST 'https://user:password@example.com/api/status?token=secret'`,
-                title: 'Request URL · POST',
+                title: 'POST',
                 subtitle: 'example.com/api/status'
             },
             {
@@ -175,7 +188,7 @@ describe('getToolPresentation — file access semantics', () => {
         })
 
         expect(presentation).toMatchObject({
-            title: 'bun run typecheck · bun run test',
+            title: 'bun run typecheck; bun run test',
             subtitle: null
         })
     })

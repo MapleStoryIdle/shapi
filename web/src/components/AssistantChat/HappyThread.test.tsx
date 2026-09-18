@@ -4,26 +4,21 @@ import type { ComponentProps } from 'react'
 import { I18nProvider } from '@/lib/i18n-context'
 import {
     ConversationOutlinePanel,
-    ReturnToUserMessageButton,
     ScrollToBottomButton,
     captureScrollAnchor,
-    findNearestUserMessageAnchorAbove,
-    findVisibleUserMessageAnchor,
     getThreadContentPadding,
     getPullToLoadOlderIndicator,
+    shouldShowHistoryLoadingNotice,
     getScrollIntent,
-    hasUserMessageAnchor,
-    locateNearestUserMessageAbove,
     locateOutlineTargetMessage,
     restoreScrollAnchor,
-    scrollElementToViewportTop,
     shouldCancelInitialScrollSettling,
     shouldCancelLatestMessageFollow,
     shouldEnableTopSentinelAutoLoad,
     shouldFollowBottomInsetChange,
+    shouldWaitForDeferredHistoryRender,
     shouldHideScrollToBottomButton,
     shouldLoadOlderFromTopWheel,
-    shouldShowReturnToUserMessageButton,
 } from '@/components/AssistantChat/HappyThread'
 import type { ConversationOutlineItem } from '@/chat/outline'
 
@@ -74,29 +69,6 @@ function renderPanel(props: Partial<ComponentProps<typeof ConversationOutlinePan
     )
 }
 
-function createUserMessageViewport() {
-    const viewport = document.createElement('div')
-    const messages = document.createElement('div')
-    messages.className = 'happy-thread-messages'
-    viewport.append(messages)
-    document.body.append(viewport)
-
-    return {
-        viewport,
-        messages,
-        addMessage(id: string, bounds: Pick<DOMRect, 'top' | 'bottom'> & Partial<DOMRect>) {
-            const message = document.createElement('div')
-            message.id = id
-            messages.append(message)
-            vi.spyOn(message, 'getBoundingClientRect').mockReturnValue(rect(bounds))
-            return message
-        },
-        cleanup() {
-            viewport.remove()
-        }
-    }
-}
-
 describe('ConversationOutlinePanel', () => {
     it('renders outline items and selects an item', () => {
         const onSelect = vi.fn()
@@ -120,43 +92,6 @@ describe('ConversationOutlinePanel', () => {
         renderPanel({ items: [] })
 
         expect(screen.getByText('No outline items in loaded messages')).toBeInTheDocument()
-    })
-})
-
-describe('ReturnToUserMessageButton', () => {
-    it('renders a left-floating control for returning to the previous user message', () => {
-        const { container } = render(
-            <I18nProvider>
-                <ReturnToUserMessageButton visible={true} bottomInset={120} onClick={vi.fn()} />
-            </I18nProvider>
-        )
-
-        const button = screen.getByRole('button', { name: /Back to your previous message/ })
-        expect(button.style.bottom).toBe('120px')
-        expect(button.style.left).toContain('var(--content-max-w')
-        expect(container.querySelector('button span')?.className).toContain('animate-bounce-in')
-    })
-
-    it('stays hidden when no return target is available', () => {
-        const { container } = render(
-            <I18nProvider>
-                <ReturnToUserMessageButton visible={false} onClick={vi.fn()} />
-            </I18nProvider>
-        )
-
-        expect(container.textContent).toBe('')
-    })
-
-    it('keeps the control above the mobile bottom safe area', () => {
-        const { container } = render(
-            <I18nProvider>
-                <ReturnToUserMessageButton visible={true} bottomInset={120} bottomSafeAreaInset onClick={vi.fn()} />
-            </I18nProvider>
-        )
-
-        expect(container.querySelector('button')?.style.bottom).toBe(
-            'calc(120px + var(--app-safe-area-bottom))'
-        )
     })
 })
 
@@ -299,6 +234,31 @@ describe('latest-message follow behavior', () => {
 })
 
 describe('pull-to-load-older helpers', () => {
+    it('keeps the scroll anchor until deferred history reaches the DOM', () => {
+        expect(shouldWaitForDeferredHistoryRender({
+            hasPendingRestore: true,
+            baselineSourceMessagesVersion: 8,
+            sourceMessagesVersion: 9,
+            renderedMessagesVersion: 8,
+        })).toBe(true)
+
+        expect(shouldWaitForDeferredHistoryRender({
+            hasPendingRestore: true,
+            baselineSourceMessagesVersion: 8,
+            sourceMessagesVersion: 9,
+            renderedMessagesVersion: 9,
+        })).toBe(false)
+    })
+
+    it('releases the scroll anchor when pagination returns no new rows', () => {
+        expect(shouldWaitForDeferredHistoryRender({
+            hasPendingRestore: true,
+            baselineSourceMessagesVersion: 8,
+            sourceMessagesVersion: 8,
+            renderedMessagesVersion: 8,
+        })).toBe(false)
+    })
+
     it('loads older messages when wheel-up hits the top edge', () => {
         expect(shouldLoadOlderFromTopWheel({
             scrollTop: 0,
@@ -392,80 +352,29 @@ describe('pull-to-load-older helpers', () => {
             progress: 1
         })
     })
-})
 
-describe('return-to-user-message helpers', () => {
-    it('detects a currently visible user message and suppresses the button', () => {
-        const { viewport, addMessage, cleanup } = createUserMessageViewport()
-        vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(rect({ top: 100, bottom: 500 }))
-        const visible = addMessage('hapi-message-user-text:visible', { top: 160, bottom: 220 })
-        addMessage('hapi-message-assistant-text:ignored', { top: 20, bottom: 80 })
-
-        expect(findVisibleUserMessageAnchor(viewport)).toBe(visible)
-        expect(shouldShowReturnToUserMessageButton({
-            viewport,
-            hasMoreMessages: true
+    it('shows only the pull indicator while pull-to-load is fetching older messages', () => {
+        expect(shouldShowHistoryLoadingNotice({
+            isLoadingOlder: true,
+            isLoadingNewer: false,
+            loadLocked: true,
+            showRestoredNotice: false,
+            pullToLoadLoading: true
         })).toBe(false)
-
-        cleanup()
-    })
-
-    it('treats a selected question answer as a user message', () => {
-        const { viewport, addMessage, cleanup } = createUserMessageViewport()
-        vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(rect({ top: 100, bottom: 500 }))
-        const visible = addMessage('hapi-message-question-answer:choice-1', { top: 160, bottom: 220 })
-
-        expect(findVisibleUserMessageAnchor(viewport)).toBe(visible)
-        expect(hasUserMessageAnchor(viewport)).toBe(true)
-
-        cleanup()
-    })
-
-    it('chooses the nearest user message above the current viewport', () => {
-        const { viewport, addMessage, cleanup } = createUserMessageViewport()
-        vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(rect({ top: 100, bottom: 500 }))
-        addMessage('hapi-message-user-text:older', { top: -120, bottom: -40 })
-        const nearest = addMessage('hapi-message-user-text:nearest', { top: 20, bottom: 80 })
-        addMessage('hapi-message-user-text:below', { top: 560, bottom: 620 })
-
-        expect(findNearestUserMessageAnchorAbove(viewport)).toBe(nearest)
-        expect(shouldShowReturnToUserMessageButton({
-            viewport,
-            hasMoreMessages: false
+        expect(shouldShowHistoryLoadingNotice({
+            isLoadingOlder: true,
+            isLoadingNewer: false,
+            loadLocked: true,
+            showRestoredNotice: false,
+            pullToLoadLoading: false
         })).toBe(true)
-
-        cleanup()
-    })
-
-    it('does not show the button when no visible or previous user message exists', () => {
-        const { viewport, addMessage, cleanup } = createUserMessageViewport()
-        vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(rect({ top: 100, bottom: 500 }))
-        addMessage('hapi-message-assistant-text:ignored', { top: 20, bottom: 80 })
-        addMessage('hapi-message-user-text:below', { top: 560, bottom: 620 })
-
-        expect(findVisibleUserMessageAnchor(viewport)).toBeNull()
-        expect(findNearestUserMessageAnchorAbove(viewport)).toBeNull()
-        expect(hasUserMessageAnchor(viewport)).toBe(true)
-        expect(shouldShowReturnToUserMessageButton({
-            viewport,
-            hasMoreMessages: true
-        })).toBe(false)
-
-        cleanup()
-    })
-
-    it('shows the button when no user message is loaded yet but older history may contain one', () => {
-        const { viewport, addMessage, cleanup } = createUserMessageViewport()
-        vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(rect({ top: 100, bottom: 500 }))
-        addMessage('hapi-message-assistant-text:ignored', { top: 20, bottom: 80 })
-
-        expect(hasUserMessageAnchor(viewport)).toBe(false)
-        expect(shouldShowReturnToUserMessageButton({
-            viewport,
-            hasMoreMessages: true
+        expect(shouldShowHistoryLoadingNotice({
+            isLoadingOlder: false,
+            isLoadingNewer: true,
+            loadLocked: false,
+            showRestoredNotice: false,
+            pullToLoadLoading: true
         })).toBe(true)
-
-        cleanup()
     })
 })
 
@@ -513,7 +422,33 @@ describe('scroll anchor helpers', () => {
 
         expect(captureScrollAnchor(viewport)).toEqual({
             id: 'second-message',
-            topOffset: 20
+            topOffset: 20,
+            element: second,
+        })
+
+        viewport.remove()
+    })
+
+    it('captures the last visible message bottom for older-page restoration', () => {
+        const viewport = document.createElement('div')
+        const first = document.createElement('div')
+        const second = document.createElement('div')
+        first.id = 'first-message'
+        second.id = 'second-message'
+        const messages = document.createElement('div')
+        messages.className = 'happy-thread-messages'
+        messages.append(first, second)
+        viewport.append(messages)
+        document.body.append(viewport)
+
+        vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(rect({ top: 100, bottom: 500 }))
+        vi.spyOn(first, 'getBoundingClientRect').mockReturnValue(rect({ top: 80, bottom: 180 }))
+        vi.spyOn(second, 'getBoundingClientRect').mockReturnValue(rect({ top: 180, bottom: 540 }))
+
+        expect(captureScrollAnchor(viewport, 'bottom')).toEqual({
+            id: 'second-message',
+            bottomOffset: 40,
+            element: second,
         })
 
         viewport.remove()
@@ -592,35 +527,23 @@ describe('scroll anchor helpers', () => {
         viewport.remove()
     })
 
-    it('scrolls the viewport directly to a target message top', () => {
+    it('restores a bottom anchor when older content expands a joined message', () => {
         const viewport = document.createElement('div')
         const message = document.createElement('div')
+        message.id = 'anchored-message'
         viewport.append(message)
         document.body.append(viewport)
-        viewport.scrollTop = 240
-        const scrollTo = vi.fn((options?: ScrollToOptions | number) => {
-            if (typeof options === 'object' && typeof options.top === 'number') {
-                viewport.scrollTop = options.top
-            }
-        })
-        Object.defineProperty(viewport, 'scrollTo', {
-            configurable: true,
-            value: scrollTo
-        })
+        viewport.scrollTop = 200
 
         vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(rect({ top: 100, bottom: 500 }))
-        vi.spyOn(message, 'getBoundingClientRect').mockReturnValue(rect({ top: 180, bottom: 260 }))
+        vi.spyOn(message, 'getBoundingClientRect').mockReturnValue(rect({ top: 40, bottom: 700 }))
 
-        scrollElementToViewportTop(viewport, message, { behavior: 'instant' })
-
-        expect(scrollTo).toHaveBeenCalledWith({
-            top: 320,
-            behavior: 'instant'
-        })
-        expect(viewport.scrollTop).toBe(320)
+        expect(restoreScrollAnchor(viewport, { id: 'anchored-message', bottomOffset: 40 })).toBe(true)
+        expect(viewport.scrollTop).toBe(360)
 
         viewport.remove()
     })
+
 })
 
 describe('outline target loading', () => {
@@ -663,49 +586,5 @@ describe('outline target loading', () => {
 
         expect(target).toBeNull()
         expect(loadOlderPreservingScroll).toHaveBeenCalledTimes(1)
-    })
-})
-
-describe('return-to-user-message loading', () => {
-    it('loads older messages until the nearest previous user message enters the DOM', async () => {
-        const { viewport, addMessage, cleanup } = createUserMessageViewport()
-        vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(rect({ top: 100, bottom: 500 }))
-        let loadCount = 0
-        let target: HTMLElement | null = null
-        const loadOlderPreservingScroll = vi.fn(async () => {
-            loadCount += 1
-            if (loadCount === 2) {
-                target = addMessage('hapi-message-user-text:loaded', { top: 20, bottom: 80 })
-            }
-            return true
-        })
-
-        const located = await locateNearestUserMessageAbove({
-            viewport,
-            hasMoreMessages: () => loadCount < 2,
-            loadOlderPreservingScroll
-        })
-
-        expect(located).toBe(target)
-        expect(loadOlderPreservingScroll).toHaveBeenCalledTimes(2)
-
-        cleanup()
-    })
-
-    it('stops when older history cannot be loaded', async () => {
-        const { viewport, cleanup } = createUserMessageViewport()
-        vi.spyOn(viewport, 'getBoundingClientRect').mockReturnValue(rect({ top: 100, bottom: 500 }))
-        const loadOlderPreservingScroll = vi.fn(async () => false)
-
-        const located = await locateNearestUserMessageAbove({
-            viewport,
-            hasMoreMessages: () => true,
-            loadOlderPreservingScroll
-        })
-
-        expect(located).toBeNull()
-        expect(loadOlderPreservingScroll).toHaveBeenCalledTimes(1)
-
-        cleanup()
     })
 })

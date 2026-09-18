@@ -3,8 +3,10 @@ import { MessagesQuerySchema, SendMessageRequestSchema } from '@hapi/protocol'
 import type { SyncEngine } from '../../sync/syncEngine'
 import type { WebAppEnv } from '../middleware/auth'
 import { requireSessionFromParam, requireSyncEngine } from './guards'
+import { ensureManagedSkillForSession } from '../../managedSkills'
+import type { Store } from '../../store'
 
-export function createMessagesRoutes(getSyncEngine: () => SyncEngine | null): Hono<WebAppEnv> {
+export function createMessagesRoutes(getSyncEngine: () => SyncEngine | null, store?: Store): Hono<WebAppEnv> {
     const app = new Hono<WebAppEnv>()
 
     app.get('/sessions/:id/messages', async (c) => {
@@ -28,11 +30,14 @@ export function createMessagesRoutes(getSyncEngine: () => SyncEngine | null): Ho
         const before = parsed.data.beforeAt !== undefined && parsed.data.beforeSeq !== undefined
             ? { at: parsed.data.beforeAt, seq: parsed.data.beforeSeq }
             : null
+        const after = parsed.data.afterAt !== undefined && parsed.data.afterSeq !== undefined
+            ? { at: parsed.data.afterAt, seq: parsed.data.afterSeq }
+            : null
         // The web client uses this endpoint to repair SSE gaps. Prevent an
         // intermediary or service worker from returning an older snapshot.
         c.header('Cache-Control', 'no-store, no-cache, must-revalidate')
         c.header('Pragma', 'no-cache')
-        return c.json(engine.getMessagesPage(sessionId, { limit, before }))
+        return c.json(engine.getMessagesPage(sessionId, { limit, before, after }))
     })
 
     app.delete('/sessions/:id/messages/:messageId', async (c) => {
@@ -76,6 +81,12 @@ export function createMessagesRoutes(getSyncEngine: () => SyncEngine | null): Ho
         }
 
         try {
+            await ensureManagedSkillForSession(
+                engine,
+                sessionId,
+                parsed.data.text,
+                store ? { store, namespace: c.get('namespace') } : undefined
+            )
             await engine.sendMessage(sessionId, {
                 text: parsed.data.text,
                 localId: parsed.data.localId,

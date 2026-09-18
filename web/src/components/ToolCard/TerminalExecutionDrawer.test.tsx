@@ -63,142 +63,87 @@ describe('TerminalExecutionDrawer', () => {
         )
 
         const drawer = screen.getByTestId('terminal-execution-drawer')
-        expect(drawer).toHaveClass(
-            'inset-x-0',
-            'bottom-0',
-            'h-[60dvh]',
-            'w-full',
-            'rounded-t-[28px]',
-            'sm:left-1/2',
-            'sm:top-1/2',
-            'sm:bottom-auto',
-            'sm:h-[min(75dvh,50rem)]',
-            'sm:max-h-[calc(100dvh-2rem)]',
-            'sm:w-[min(75vw,60rem)]',
-            'sm:-translate-x-1/2',
-            'sm:-translate-y-1/2',
-            'sm:rounded-2xl',
-            'isolate',
-            'overflow-hidden'
-        )
+        expect(drawer).toHaveClass('question-drawer', 'inset-x-0', 'w-full', 'rounded-t-[28px]', 'overflow-hidden')
+        expect(drawer).toHaveAttribute('data-chat-detail-drawer', 'true')
         expect(drawer).not.toHaveClass('pt-[var(--app-safe-area-top)]')
         expect(drawer.className).not.toContain('backdrop-blur')
         expect(drawer).toHaveTextContent('bun run test:web')
-        expect(drawer).toHaveTextContent('Completed')
+        expect(screen.getByRole('img', { name: 'Completed' })).toBeInTheDocument()
         expect(drawer).toHaveTextContent('2.3s')
         expect(drawer).toHaveTextContent('/bin/zsh -lc "bun run test:web"')
         expect(drawer).toHaveTextContent('1418 tests passed')
         expect(drawer).toHaveTextContent('one warning emitted')
         expect(drawer.querySelector('[data-terminal-execution-overview]')).not.toBeInTheDocument()
-        expect(drawer.querySelector('header')).toHaveClass('relative', 'z-10', 'bg-[var(--app-dialog-bg)]')
-        expect(drawer.querySelector('[data-terminal-execution-drag-handle]')).toHaveClass('sm:hidden')
-        expect(drawer.querySelector('[data-terminal-execution-drag-handle]')).toHaveAttribute('aria-hidden', 'true')
-        expect(drawer.querySelector('[data-terminal-execution-command-strip]')).toHaveTextContent('/bin/zsh -lc "bun run test:web"')
-        const outputPanel = drawer.querySelector<HTMLElement>('[data-terminal-execution-panel="output"]')
+        expect(drawer.querySelector('[data-question-drawer-handle]')).toHaveClass('touch-none')
+        expect(drawer.querySelector('[data-chat-drawer-body]')).toHaveClass('overflow-y-auto')
+        const outputPanel = drawer.querySelector<HTMLElement>('[data-terminal-execution-panel="transcript"]')
         if (!outputPanel) throw new Error('expected output panel')
 
-        expect(outputPanel).toHaveClass(
-            'relative',
-            'isolate',
-            'flex-1',
-            'overflow-y-auto',
-            'overscroll-contain',
-            'pb-[max(var(--app-safe-area-bottom),1.25rem)]'
-        )
+        expect(outputPanel).toHaveClass('relative', 'isolate')
         expect(outputPanel).not.toHaveAttribute('hidden')
-        expect((`${drawer.className} ${outputPanel.className}`).match(/--app-safe-area-bottom/g)).toHaveLength(1)
-        expect(drawer.querySelectorAll('[role="tabpanel"]')).toHaveLength(3)
-        expect(drawer.querySelector('[data-terminal-execution-panel="input"]')).toHaveAttribute('hidden')
-        expect(drawer.querySelector('[data-terminal-execution-panel="environment"]')).toHaveAttribute('hidden')
+        expect(outputPanel.className).not.toContain('--app-safe-area-bottom')
+        expect(drawer.querySelector('[data-chat-drawer-body]')).toHaveClass('overflow-y-auto', 'overscroll-contain')
+        expect(drawer.querySelectorAll('[role="tabpanel"], [role="tab"]')).toHaveLength(0)
         expect(drawer.querySelector('[data-terminal-execution-input]')).toBeInTheDocument()
         expect(drawer.querySelector('[data-terminal-execution-output]')).toBeInTheDocument()
         expect(screen.getByTestId('terminal-execution-close')).toHaveClass('h-11', 'w-11')
-        expect(screen.getByTestId('terminal-execution-close')).toHaveTextContent('Close')
+        expect(screen.getByTestId('terminal-execution-close')).toHaveAccessibleName('Close')
     })
 
-    it('defaults to output and switches accessible tab panels by click and keyboard', () => {
-        render(
-            <I18nProvider>
-                <DrawerHarness />
-            </I18nProvider>
-        )
+    it('shows three header rows, no tabs, and the exit code under output', () => {
+        const view = render(<I18nProvider><DrawerHarness /></I18nProvider>)
+        expect(screen.queryByRole('tab')).toBeNull()
+        const header = view.baseElement.querySelector('.terminal-drawer-heading')!
+        expect(header.querySelector('[data-terminal-directory]')).toHaveTextContent('/workspace/hapi')
+        const status = header.querySelector('[data-terminal-status]')!
+        expect(status.textContent).toBe('2.3s')
+        expect(status).not.toHaveTextContent(';')
+        expect(screen.queryByText('Completed')).toBeNull()
+        expect(screen.getByRole('img', { name: 'Completed' })).toHaveClass('text-[var(--app-badge-success-text)]')
+        const output = view.baseElement.querySelector('[data-terminal-execution-output]')!
+        expect(output.lastElementChild).toHaveAttribute('data-terminal-execution-exit-code')
+        expect(output.lastElementChild).toHaveTextContent('Exit code0')
+        expect(view.baseElement).not.toHaveTextContent('SECRET_TOKEN')
+    })
 
-        const outputTab = screen.getByRole('tab', { name: 'Output' })
-        const inputTab = screen.getByRole('tab', { name: 'Input' })
-        const environmentTab = screen.getByRole('tab', { name: 'Environment' })
-        const tabs = [outputTab, inputTab, environmentTab]
-        const drawer = screen.getByTestId('terminal-execution-drawer')
+    it.each([
+        ['error', 'Failed', 'failed', 'lucide-x'],
+        ['running', 'Running', 'running', 'lucide-loader-circle'],
+        ['pending', 'Pending', 'pending', 'lucide-clock3'],
+    ] as const)('shows the %s icon with no visible state label', (state, label, status, icon) => {
+        const block = makeBlock()
+        block.tool.state = state
+        render(<I18nProvider><TerminalExecutionDrawer block={block} open onOpenChange={() => undefined} /></I18nProvider>)
+        const indicator = document.querySelector(`[data-terminal-status="${status}"]`)!
+        expect(indicator.querySelector('svg')).toHaveClass(icon)
+        expect(indicator).not.toHaveTextContent(label)
+        expect(indicator.querySelector('[role="img"]')).toHaveAttribute('aria-label')
+        if (state === 'error') expect(indicator.querySelector('[role="img"]')).toHaveClass('text-[var(--app-badge-error-text)]')
+        if (state === 'running') expect(indicator.querySelector('svg')).toHaveClass('animate-spin', 'motion-reduce:animate-none')
+    })
 
-        expect(screen.getByRole('tablist', { name: 'bun run test:web' })).toBeInTheDocument()
-        expect(outputTab).toHaveAttribute('aria-selected', 'true')
-        expect(outputTab).toHaveAttribute('tabindex', '0')
-        expect(outputTab).toHaveClass('min-h-11')
-        expect(inputTab).toHaveAttribute('aria-selected', 'false')
-        expect(inputTab).toHaveAttribute('tabindex', '-1')
+    it('expands a long directory without exposing other metadata', () => {
+        const block = makeBlock()
+        const cwd = '/workspace/' + 'long-project-directory/'.repeat(4) + 'shapi'
+        block.tool.input = { command: 'git status', cwd }
+        render(<I18nProvider><TerminalExecutionDrawer block={block} open onOpenChange={() => undefined} /></I18nProvider>)
+        const path = screen.getByRole('button', { name: `Working directory: ${cwd}` })
+        expect(path.textContent).toContain('…')
+        fireEvent.click(path)
+        expect(path.textContent).toBe(cwd)
+        expect(path).toHaveAttribute('aria-expanded', 'true')
+        expect(screen.getByRole('button', { name: 'Copy directory' })).toBeInTheDocument()
+    })
 
-        const outputPanel = screen.getByRole('tabpanel')
-        expect(outputPanel).toHaveAttribute('id', outputTab.getAttribute('aria-controls'))
-        expect(outputPanel).toHaveAttribute('aria-labelledby', outputTab.id)
-        expect(outputPanel).toHaveTextContent('1418 tests passed')
-        expect(outputPanel).toHaveTextContent('one warning emitted')
-        expect(outputPanel).toHaveTextContent('Stdout')
-        expect(outputPanel).toHaveTextContent('Stderr')
-
-        for (const tab of tabs) {
-            const panelId = tab.getAttribute('aria-controls')
-            if (!panelId) throw new Error('expected a tab panel id')
-
-            const panel = document.getElementById(panelId)
-            if (!panel) throw new Error('expected tab panel')
-
-            expect(panel).toHaveAttribute('role', 'tabpanel')
-            expect(panel).toHaveAttribute('aria-labelledby', tab.id)
-        }
-
-        outputPanel.scrollTop = 120
-
-        fireEvent.click(inputTab)
-
-        const inputPanel = screen.getByRole('tabpanel')
-        expect(inputTab).toHaveAttribute('aria-selected', 'true')
-        expect(inputPanel).toHaveAttribute('id', inputTab.getAttribute('aria-controls'))
-        expect(inputPanel).toHaveAttribute('aria-labelledby', inputTab.id)
-        expect(inputPanel).toHaveTextContent('/bin/zsh -lc "bun run test:web"')
-        expect(inputPanel).not.toHaveTextContent('1418 tests passed')
-        expect(inputPanel.scrollTop).toBe(0)
-        expect(outputPanel.scrollTop).toBe(120)
-        expect(drawer).toContainElement(outputPanel)
-        expect(outputPanel).toHaveAttribute('hidden')
-        expect(inputPanel).not.toHaveAttribute('hidden')
-
-        fireEvent.keyDown(inputTab, { key: 'ArrowRight' })
-
-        const environmentPanel = screen.getByRole('tabpanel')
-        expect(environmentTab).toHaveFocus()
-        expect(environmentTab).toHaveAttribute('aria-selected', 'true')
-        expect(environmentPanel).toHaveAttribute('id', environmentTab.getAttribute('aria-controls'))
-        expect(environmentPanel).toHaveAttribute('aria-labelledby', environmentTab.id)
-        expect(environmentPanel).toHaveTextContent('Status')
-        expect(environmentPanel).toHaveTextContent('Working directory')
-        expect(environmentPanel).toHaveTextContent('/workspace/hapi')
-        expect(environmentPanel).toHaveTextContent('Duration')
-        expect(environmentPanel).toHaveTextContent('2.3s')
-        expect(environmentPanel).toHaveTextContent('Exit code')
-        expect(environmentPanel).toHaveTextContent('exit 0')
-        expect(environmentPanel).not.toHaveTextContent('SECRET_TOKEN=must-not-render')
-        expect(environmentPanel).not.toHaveTextContent('1418 tests passed')
-
-        fireEvent.keyDown(environmentTab, { key: 'Home' })
-        expect(outputTab).toHaveFocus()
-        expect(outputTab).toHaveAttribute('aria-selected', 'true')
-
-        fireEvent.keyDown(outputTab, { key: 'End' })
-        expect(environmentTab).toHaveFocus()
-        expect(environmentTab).toHaveAttribute('aria-selected', 'true')
-
-        fireEvent.keyDown(environmentTab, { key: 'ArrowLeft' })
-        expect(inputTab).toHaveFocus()
-        expect(inputTab).toHaveAttribute('aria-selected', 'true')
+    it('hides unavailable directory, exit code and duration', () => {
+        const block = makeBlock()
+        block.tool.input = { command: 'git status' }
+        block.tool.result = {}
+        block.tool.completedAt = null
+        render(<I18nProvider><TerminalExecutionDrawer block={block} open onOpenChange={() => undefined} /></I18nProvider>)
+        expect(document.querySelector('[data-terminal-directory]')).toBeNull()
+        expect(document.querySelector('[data-terminal-execution-exit-code]')).toBeNull()
+        expect(document.querySelector('[data-terminal-status]')?.textContent).toBe('')
     })
 
     it('uses the remote action and host instead of the generic execution title', () => {
@@ -213,51 +158,18 @@ describe('TerminalExecutionDrawer', () => {
             </I18nProvider>
         )
 
-        expect(screen.getByText('Inspect hapi-hub service · 192.0.2.18')).toBeInTheDocument()
+        expect(screen.getByText('ssh · 192.0.2.18')).toBeInTheDocument()
         expect(screen.queryByText('Terminal execution')).not.toBeInTheDocument()
         expect(screen.queryByText('Run remotely')).not.toBeInTheDocument()
     })
 
-    it('resets to output after closing and reopening', async () => {
-        render(
-            <I18nProvider>
-                <ResetDrawerHarness />
-            </I18nProvider>
-        )
-
-        fireEvent.click(screen.getByRole('tab', { name: 'Environment' }))
-        expect(screen.getByRole('tab', { name: 'Environment' })).toHaveAttribute('aria-selected', 'true')
-
+    it('reopens command and output directly', async () => {
+        render(<I18nProvider><ResetDrawerHarness /></I18nProvider>)
         fireEvent.click(screen.getByRole('button', { name: 'Close' }))
-        await waitFor(() => {
-            expect(screen.queryByTestId('terminal-execution-drawer')).not.toBeInTheDocument()
-        })
-
+        await waitFor(() => expect(screen.queryByTestId('terminal-execution-drawer')).not.toBeInTheDocument())
         fireEvent.click(screen.getByRole('button', { name: 'Reopen drawer' }))
-        await waitFor(() => {
-            expect(screen.getByRole('tab', { name: 'Output' })).toHaveAttribute('aria-selected', 'true')
-        })
-    })
-
-    it('resets to output when the tool block changes', async () => {
-        const view = render(
-            <I18nProvider>
-                <TerminalExecutionDrawer block={makeBlock()} open onOpenChange={() => undefined} />
-            </I18nProvider>
-        )
-
-        fireEvent.click(screen.getByRole('tab', { name: 'Environment' }))
-        expect(screen.getByRole('tab', { name: 'Environment' })).toHaveAttribute('aria-selected', 'true')
-
-        view.rerender(
-            <I18nProvider>
-                <TerminalExecutionDrawer block={makeBlock('terminal-drawer-next')} open onOpenChange={() => undefined} />
-            </I18nProvider>
-        )
-
-        await waitFor(() => {
-            expect(screen.getByRole('tab', { name: 'Output' })).toHaveAttribute('aria-selected', 'true')
-        })
+        expect(await screen.findByText('1418 tests passed')).toBeVisible()
+        expect(screen.queryByRole('tab')).toBeNull()
     })
 
     it('closes through the modal close control', async () => {
@@ -281,7 +193,11 @@ describe('TerminalExecutionDrawer', () => {
             </I18nProvider>
         )
 
-        fireEvent.click(screen.getByTestId('terminal-execution-overlay'))
+        // Radix attaches its outside-pointer listener after mount.
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        const overlay = screen.getByTestId('terminal-execution-overlay')
+        fireEvent.pointerDown(overlay, { button: 0, pointerType: 'mouse' })
+        fireEvent.click(overlay)
 
         await waitFor(() => {
             expect(screen.queryByTestId('terminal-execution-drawer')).not.toBeInTheDocument()

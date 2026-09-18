@@ -1,4 +1,4 @@
-import { AgentStateSchema, MetadataSchema, TeamStateSchema, type SideSessionMetadata } from '@hapi/protocol/schemas'
+import { AgentStateSchema, MetadataSchema, TeamStateSchema, type MonitorSessionMetadata, type SideSessionMetadata } from '@hapi/protocol/schemas'
 import type { CodexCollaborationMode, PermissionMode, Session, SessionPatch } from '@hapi/protocol/types'
 import type { Store } from '../store'
 import { clampAliveTime } from './aliveTime'
@@ -204,7 +204,7 @@ export class SessionCache {
         session.active = true
         session.activeAt = Math.max(session.activeAt, t)
         session.thinking = requestedThinking || preserveQueuedThinking
-        session.thinkingAt = t
+        if (session.thinking !== wasThinking) session.thinkingAt = t
         if (requestedThinking || pendingThinkingUntil <= hubNow) {
             this.pendingThinkingUntilBySessionId.delete(session.id)
         }
@@ -270,6 +270,7 @@ export class SessionCache {
                     active: true,
                     activeAt: session.activeAt,
                     thinking: session.thinking,
+                    thinkingAt: session.thinkingAt,
                     permissionMode: session.permissionMode,
                     model: session.model,
                     modelReasoningEffort: session.modelReasoningEffort,
@@ -318,6 +319,7 @@ export class SessionCache {
                 sessionId: session.id,
                 data: {
                     thinking: true,
+                    thinkingAt: session.thinkingAt,
                     updatedAt: session.updatedAt
                 } satisfies SessionPatch
             })
@@ -393,7 +395,7 @@ export class SessionCache {
         this.publisher.emit({
             type: 'session-updated',
             sessionId: session.id,
-            data: { active: false, thinking: false, backgroundTaskCount: 0 } satisfies SessionPatch
+            data: { active: false, thinking: false, thinkingAt: session.thinkingAt, backgroundTaskCount: 0 } satisfies SessionPatch
         })
     }
 
@@ -590,6 +592,62 @@ export class SessionCache {
         throw new Error('Session was modified concurrently while archiving from hub')
     }
 
+    /** Persist an explicit control owner before a lifecycle-affecting RPC.
+     * Retry on metadata-version contention so a concurrent rename cannot
+     * erase the ownership marker. */
+    async setSessionControlOwner(sessionId: string, owner: 'shapi' | 'external'): Promise<void> {
+        for (let attempt = 0; attempt < METADATA_RETRY_ATTEMPTS; attempt += 1) {
+            const session = this.sessions.get(sessionId) ?? this.refreshSession(sessionId)
+            if (!session) throw new Error('Session not found')
+            if (!session.metadata) throw new Error('Session metadata missing')
+            if (session.metadata.controlOwner === owner) return
+
+            const result = this.store.sessions.updateSessionMetadata(
+                sessionId,
+                { ...session.metadata, controlOwner: owner },
+                session.metadataVersion,
+                session.namespace,
+                { touchUpdatedAt: false }
+            )
+            if (result.result === 'error') {
+                throw new Error('Failed to update session control owner')
+            }
+            if (result.result === 'success') {
+                this.refreshSession(sessionId)
+                return
+            }
+            this.refreshSession(sessionId)
+        }
+        throw new Error('Session was modified concurrently while changing control owner')
+    }
+
+    /** Roll back a pre-RPC external-control claim only if nobody changed it since. */
+    async clearSessionControlOwner(sessionId: string, expectedOwner: 'shapi' | 'external'): Promise<void> {
+        for (let attempt = 0; attempt < METADATA_RETRY_ATTEMPTS; attempt += 1) {
+            const session = this.sessions.get(sessionId) ?? this.refreshSession(sessionId)
+            if (!session?.metadata || session.metadata.controlOwner !== expectedOwner) return
+
+            const next: Record<string, unknown> = { ...session.metadata }
+            delete next.controlOwner
+            const result = this.store.sessions.updateSessionMetadata(
+                sessionId,
+                next,
+                session.metadataVersion,
+                session.namespace,
+                { touchUpdatedAt: false }
+            )
+            if (result.result === 'error') {
+                throw new Error('Failed to clear session control owner')
+            }
+            if (result.result === 'success') {
+                this.refreshSession(sessionId)
+                return
+            }
+            this.refreshSession(sessionId)
+        }
+        throw new Error('Session was modified concurrently while clearing control owner')
+    }
+
     async renameSession(sessionId: string, name: string): Promise<void> {
         // tiann/hapi#919: retry-with-refresh on version-mismatch instead of
         // throwing on the first contention. Mirrors the good pattern in
@@ -672,6 +730,32 @@ export class SessionCache {
             this.refreshSession(sessionId)
         }
 
+        throw new Error('Session was modified concurrently. Please try again.')
+    }
+
+    async setMonitorSessionMetadata(
+        sessionId: string,
+        monitorSession: MonitorSessionMetadata
+    ): Promise<Session> {
+        for (let attempt = 0; attempt < METADATA_RETRY_ATTEMPTS; attempt += 1) {
+            const session = this.sessions.get(sessionId) ?? this.refreshSession(sessionId)
+            if (!session?.metadata) throw new Error('Session metadata missing')
+
+            const result = this.store.sessions.updateSessionMetadata(
+                sessionId,
+                { ...session.metadata, monitorSession },
+                session.metadataVersion,
+                session.namespace,
+                { touchUpdatedAt: false }
+            )
+            if (result.result === 'error') throw new Error('Failed to update monitor session metadata')
+            if (result.result === 'success') {
+                const refreshed = this.refreshSession(sessionId)
+                if (!refreshed) throw new Error('Session not found after metadata update')
+                return refreshed
+            }
+            this.refreshSession(sessionId)
+        }
         throw new Error('Session was modified concurrently. Please try again.')
     }
 
@@ -1029,6 +1113,11 @@ export class SessionCache {
 
         if (oldObj.worktree && !newObj.worktree) {
             merged.worktree = oldObj.worktree
+            changed = true
+        }
+
+        if (oldObj.monitorSession && !newObj.monitorSession) {
+            merged.monitorSession = oldObj.monitorSession
             changed = true
         }
 

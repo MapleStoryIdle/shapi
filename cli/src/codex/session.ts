@@ -20,9 +20,12 @@ export class CodexSession extends AgentSessionBase<EnhancedMode> {
     readonly replayTranscriptHistoryOnStart: boolean;
     /** Source thread used once to create a native Codex history fork. */
     readonly forkSessionId: string | null;
+    /** Internal no-message native-control recovery request. */
+    readonly recoveryRequestId: string | null;
     localLaunchFailure: LocalLaunchFailure | null = null;
 
     private transcriptPathCallbacks: Array<(path: string) => void> = [];
+    private activeTransportCleanup: (() => Promise<void>) | null = null;
 
     constructor(opts: {
         api: ApiClient;
@@ -43,6 +46,7 @@ export class CodexSession extends AgentSessionBase<EnhancedMode> {
         collaborationMode?: EnhancedMode['collaborationMode'];
         replayTranscriptHistoryOnStart?: boolean;
         forkSessionId?: string | null;
+        recoveryRequestId?: string;
     }) {
         super({
             api: opts.api,
@@ -57,6 +61,7 @@ export class CodexSession extends AgentSessionBase<EnhancedMode> {
             sessionIdLabel: 'Codex',
             applySessionIdToMetadata: (metadata, sessionId) => ({
                 ...metadata,
+                codexTokenUsage: metadata.codexSessionId === sessionId ? metadata.codexTokenUsage : null,
                 codexSessionId: sessionId
             }),
             permissionMode: opts.permissionMode,
@@ -71,6 +76,7 @@ export class CodexSession extends AgentSessionBase<EnhancedMode> {
         this.startingMode = opts.startingMode;
         this.replayTranscriptHistoryOnStart = opts.replayTranscriptHistoryOnStart ?? false;
         this.forkSessionId = opts.forkSessionId ?? null;
+        this.recoveryRequestId = opts.recoveryRequestId ?? null;
         this.permissionMode = opts.permissionMode;
         this.model = opts.model;
         this.modelReasoningEffort = opts.modelReasoningEffort;
@@ -98,6 +104,25 @@ export class CodexSession extends AgentSessionBase<EnhancedMode> {
         }
     }
 
+    setActiveTransportCleanup(cleanup: () => Promise<void>): void {
+        this.activeTransportCleanup = cleanup;
+    }
+
+    clearActiveTransportCleanup(cleanup: () => Promise<void>): void {
+        if (this.activeTransportCleanup === cleanup) {
+            this.activeTransportCleanup = null;
+        }
+    }
+
+    async cleanupActiveTransport(): Promise<void> {
+        const cleanup = this.activeTransportCleanup;
+        if (!cleanup) return;
+        await cleanup();
+        if (this.activeTransportCleanup === cleanup) {
+            this.activeTransportCleanup = null;
+        }
+    }
+
     resetTranscriptPath(): void {
         this.transcriptPath = null;
     }
@@ -114,7 +139,7 @@ export class CodexSession extends AgentSessionBase<EnhancedMode> {
             // mergeSessionMetadata. The value is `null` on the wire only;
             // MetadataSchema parses `string().optional()`, so the
             // post-merge persisted blob carries no key.
-            const updated: Record<string, unknown> = { ...metadata, codexSessionId: null };
+            const updated: Record<string, unknown> = { ...metadata, codexSessionId: null, codexTokenUsage: null };
             return updated as unknown as Metadata;
         });
     }

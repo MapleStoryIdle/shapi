@@ -36,10 +36,10 @@ function compareMessages(a: DecryptedMessage, b: DecryptedMessage): number {
 
     const aSeq = typeof a.seq === 'number' ? a.seq : null
     const bSeq = typeof b.seq === 'number' ? b.seq : null
-
     if (aSeq !== null && bSeq !== null && aSeq !== bSeq) {
         return aSeq - bSeq
     }
+
     return a.id.localeCompare(b.id)
 }
 

@@ -1,7 +1,13 @@
 import { describe, expect, it } from 'vitest'
-import { getTerminalCommandDisplayTitle, getTerminalCommandIntent, getTerminalCommandIntentDetail, getTerminalCommandIntentLabel, getTerminalCommandIntentTitle, getTerminalCommandSummary, usesTerminalCommandAsLabel } from '@/components/ToolCard/terminalCommandIntent'
+import { getTerminalCommandDisplayTitle, getTerminalCommandIntent, getTerminalCommandIntentDetail, getTerminalCommandIntentLabel, getTerminalCommandIntentTitle, getTerminalCommandSummary, getTerminalReadRequestLabel, usesTerminalCommandAsLabel, joinTerminalSummaryParts } from '@/components/ToolCard/terminalCommandIntent'
 
 describe('terminal command intent', () => {
+    it('joins summary fragments once, without dangling or duplicate separators', () => {
+        expect(joinTerminalSummaryParts(['git status;', '; git diff; ', '3s'])).toBe('git status; git diff; 3s')
+        expect(joinTerminalSummaryParts(['git status', '', null, undefined])).toBe('git status')
+        expect(joinTerminalSummaryParts(['GET · example.com/api', '2s'])).toBe('GET · example.com/api; 2s')
+        expect(joinTerminalSummaryParts(['', ';', null])).toBe('')
+    })
     it('keeps shell file reads as requests and includes their explicit targets', () => {
         expect(getTerminalCommandIntent({
             command: `/bin/zsh -lc "cat package.json; find src -type f | sort; sed -n '1,220p' README.md"`
@@ -42,6 +48,7 @@ describe('terminal command intent', () => {
         })
         expect(getTerminalCommandIntent({ command: 'ssh server-alias systemctl status app' })).toEqual({
             kind: 'remote-command',
+            executable: 'ssh',
             host: 'server-alias',
             mode: 'execute',
             action: { kind: 'manage-service', operation: 'inspect', service: 'app' },
@@ -99,17 +106,21 @@ describe('terminal command intent', () => {
         const remote = getTerminalCommandIntent({
             command: 'ssh deploy@192.0.2.18 systemctl restart hapi-hub.service'
         })
-        expect(remote && getTerminalCommandIntentTitle(remote)).toBe('Restart hapi-hub service')
+        expect(remote && getTerminalCommandIntentTitle(remote)).toBe('ssh')
         expect(remote && getTerminalCommandIntentDetail(remote)).toBe('192.0.2.18')
         expect(getTerminalCommandDisplayTitle({
             command: 'ssh deploy@192.0.2.18 systemctl restart hapi-hub.service'
-        })).toBe('Restart hapi-hub service · 192.0.2.18')
+        })).toBe('ssh · 192.0.2.18')
         expect(getTerminalCommandDisplayTitle({
             command: 'ssh 192.0.2.18 echo must-not-render'
-        })).toBe('Run shell · 192.0.2.18')
+        })).toBe('ssh · 192.0.2.18')
         expect(getTerminalCommandDisplayTitle({
             command: 'scp -i /credentials/private-key /build/hapi deploy@192.0.2.18:/tmp/hapi'
-        })).toBe('Transfer files · hapi · 192.0.2.18')
+        })).toBe('scp · 192.0.2.18 · hapi')
+
+        expect(getTerminalCommandDisplayTitle({
+            command: 'curl https://example.com/api'
+        })).toBe('GET · example.com/api')
 
         const database = getTerminalCommandIntent({
             command: `mysql --database lingda_dev -e "SELECT password FROM sys_user WHERE token = 'must-not-render'"`
@@ -127,9 +138,30 @@ describe('terminal command intent', () => {
 
         const moved = getTerminalCommandIntent({ command: 'mv web/src/old.ts web/src/new.ts' })
         expect(moved && getTerminalCommandIntentDetail(moved)).toBe('old.ts → new.ts')
-        const searched = getTerminalCommandIntent({ command: 'rg -n ToolCard web/src/components/ToolCard/knownTools.tsx' })
+        const searchedInput = { command: 'rg -n ToolCard web/src/components/ToolCard/knownTools.tsx' }
+        const searched = getTerminalCommandIntent(searchedInput)
         expect(searched && getTerminalCommandIntentTitle(searched)).toBe('Search files')
         expect(searched && getTerminalCommandIntentDetail(searched)).toBe('knownTools.tsx')
+        expect(searched && getTerminalCommandIntentLabel(searchedInput, searched)).toBe('rg')
+        expect(getTerminalCommandDisplayTitle(searchedInput)).toBe('rg · knownTools.tsx')
+
+        const searchedMany = getTerminalCommandIntent({
+            command: 'rg -n ToolCard web/src/a.ts web/src/b.ts web/src/c.ts web/src/d.ts web/src/e.ts'
+        })
+        expect(searchedMany && getTerminalCommandIntentDetail(searchedMany)).toBe('a.ts · … and 5 source files')
+
+        const readMany = getTerminalCommandIntent({
+            command: "cat web/src/a.ts; sed -n '1,20p' web/src/b.ts"
+        })
+        expect(readMany && getTerminalCommandIntentDetail(readMany)).toBe('2 files')
+        expect(readMany && getTerminalCommandIntentDetail(readMany, (key, params) => (
+            key === 'toolGroup.compact.fileCount' ? `${params?.n} 个文件` : key
+        ))).toBe('2 个文件')
+
+        const grepInput = { command: 'grep -n ToolCard web/src/components/ToolCard/knownTools.tsx' }
+        const grep = getTerminalCommandIntent(grepInput)
+        expect(grep && getTerminalCommandIntentLabel(grepInput, grep)).toBe('grep')
+        expect(getTerminalCommandDisplayTitle(grepInput)).toBe('grep · knownTools.tsx')
 
         const rendered = [
             request && getTerminalCommandDisplayTitle({ command: `curl -X POST 'https://user:password@192.0.2.18:8080/api/order/status?token=secret'` }),
@@ -162,13 +194,13 @@ describe('terminal command intent', () => {
         const intent = getTerminalCommandIntent(input)
 
         expect(intent && usesTerminalCommandAsLabel(intent)).toBe(true)
-        expect(intent && getTerminalCommandIntentLabel(input, intent)).toBe('bun run typecheck · bun run test')
+        expect(intent && getTerminalCommandIntentLabel(input, intent)).toBe('bun run typecheck; bun run test')
     })
 
     it('keeps one or two recognized commands instead of the full shell script', () => {
         expect(getTerminalCommandSummary({
             command: 'git -C /workspace/hapi status --short; rg -n "ToolGroupCard" web/src; echo done'
-        })).toBe('git status · rg')
+        })).toBe('git status; rg')
         expect(getTerminalCommandSummary({
             command: 'node scripts/rewrite.mjs --verbose --all'
         })).toBeNull()
@@ -178,5 +210,81 @@ describe('terminal command intent', () => {
         expect(getTerminalCommandSummary({
             command: '/bin/zsh -lc "sed -n \'1,20p\' src/App.tsx; for f in src/a.ts; do echo $f; done\''
         })).toBe('sed -n')
+    })
+
+    it('extracts key commands from a Codex Desktop orchestration wrapper', () => {
+        const input = {
+            command: `const results = await Promise.all([
+                tools.exec_command({ cmd: "git status --short; git diff --stat", workdir: "/repo" }),
+                tools.exec_command({ cmd: "bun run test", workdir: "/repo" })
+            ]); text(results.length);`
+        }
+
+        expect(getTerminalCommandSummary(input)).toBe('git status; git diff; +1')
+        expect(getTerminalCommandDisplayTitle(input)).toBe('git status; git diff; +1')
+    })
+
+    it('recognizes Skill reads inside a Codex Desktop orchestration wrapper', () => {
+        const input = {
+            command: `const r = await tools.exec_command({
+                cmd: "sed -n '1,240p' /Users/dev/.codex/skills/agent-team/SKILL.md\\nsed -n '1,220p' /Users/dev/.codex/skills/karpathy-guidelines/SKILL.md\\nsed -n '1,220p' /Users/dev/.codex/skills/agent-team/references/team-profiles.md",
+                workdir: "/workspace"
+            }); text(r.output);`
+        }
+        const intent = getTerminalCommandIntent(input)
+
+        expect(intent).toMatchObject({ kind: 'read-request' })
+        expect(intent?.kind === 'read-request' && intent.targets).toHaveLength(3)
+        expect(intent?.kind === 'read-request' && getTerminalReadRequestLabel(intent)).toBe('Read agent-team/SKILL.md · … and 3 Skill files')
+        expect(getTerminalCommandSummary(input)).toBe('sed -n')
+
+        const single = getTerminalCommandIntent({
+            command: "sed -n '1,240p' /Users/dev/.codex/skills/agent-team/SKILL.md"
+        })
+        expect(single?.kind === 'read-request' && getTerminalReadRequestLabel(single)).toBe(
+            'Read agent-team/SKILL.md · L1–240'
+        )
+    })
+
+    it('uses conservative semantic labels only when all read targets match', () => {
+        const source = getTerminalCommandIntent({ command: "cat src/a.ts; sed -n '1,20p' src/b.ts" })
+        const mixed = getTerminalCommandIntent({ command: "cat src/a.ts; sed -n '1,20p' README.md" })
+        const configuration = getTerminalCommandIntent({ command: "cat package.json; sed -n '1,20p' tsconfig.json" })
+        const documentation = getTerminalCommandIntent({ command: "cat README.md; sed -n '1,20p' docs/setup.md" })
+        const tests = getTerminalCommandIntent({ command: "cat src/a.test.ts; sed -n '1,20p' src/b.spec.tsx" })
+
+        expect(source?.kind === 'read-request' && getTerminalReadRequestLabel(source)).toBe('Read a.ts · … and 2 source files')
+        expect(mixed?.kind === 'read-request' && getTerminalReadRequestLabel(mixed)).toBe('Read 2 files')
+        expect(configuration?.kind === 'read-request' && getTerminalReadRequestLabel(configuration)).toBe('Read package.json · … and 2 configuration files')
+        expect(documentation?.kind === 'read-request' && getTerminalReadRequestLabel(documentation)).toBe('Read README.md · … and 2 documents')
+        expect(tests?.kind === 'read-request' && getTerminalReadRequestLabel(tests)).toBe('Read a.test.ts · … and 2 test files')
+    })
+
+    it('keeps search targets when rg is nested inside orchestration', () => {
+        const input = {
+            command: `const r = await tools.exec_command({ cmd: "rg -n ToolCard web/src/a.ts web/src/b.ts" }); text(r.output);`
+        }
+
+        expect(getTerminalCommandIntent(input)).toEqual({ kind: 'search-files', files: ['a.ts', 'b.ts'] })
+        expect(getTerminalCommandDisplayTitle(input)).toBe('rg · a.ts · … and 2 source files')
+    })
+
+    it('does not expose Codex Desktop orchestration as Run const', () => {
+        expect(getTerminalCommandDisplayTitle({
+            command: 'const matches = ALL_TOOLS.filter((tool) => tool.name); text(matches);'
+        })).toBe('Tool operation')
+
+        expect(getTerminalCommandDisplayTitle({
+            command: 'const result = await tools.browser_check({ url: "http://localhost", title: "Check local preview" }); text(result);'
+        })).toBe('Check local preview')
+
+        const receivedKeys: string[] = []
+        expect(getTerminalCommandDisplayTitle({
+            command: 'const result = await tools.exec_command({ cmd: buildCommand() }); text(result);'
+        }, (key) => {
+            receivedKeys.push(key)
+            return '执行工具命令'
+        })).toBe('执行工具命令')
+        expect(receivedKeys).toEqual(['terminal.execution.execCommandFallback'])
     })
 })

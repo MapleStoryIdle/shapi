@@ -159,10 +159,7 @@ export const knownTools: Record<string, {
     },
     Grep: {
         icon: () => <EyeIcon className={DEFAULT_ICON_CLASS} />,
-        title: (opts) => {
-            const pattern = getInputStringAny(opts.input, ['pattern'])
-            return pattern ? `grep(pattern: ${pattern})` : 'Search content'
-        },
+        title: () => 'grep',
         minimal: true
     },
     LS: {
@@ -579,7 +576,7 @@ export function getToolPresentation(
                         ? <SearchIcon className={DEFAULT_ICON_CLASS} />
                         : <TerminalIcon className={DEFAULT_ICON_CLASS} />,
                 title: getTerminalCommandIntentLabel(opts.input, intent, t),
-                subtitle: getTerminalCommandIntentDetail(intent),
+                subtitle: intent.kind === 'read-request' ? null : getTerminalCommandIntentDetail(intent, t),
                 minimal: isCodexTerminalMinimal(opts.result)
             }
         }

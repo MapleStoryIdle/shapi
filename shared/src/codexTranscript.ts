@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { readCodexTokenUsage, selectCodexTokenUsage, type CodexTokenUsage } from './codexUsage'
 import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { isAbsolute, join, resolve } from 'node:path'
@@ -11,7 +12,15 @@ import type { CodexLocalSessionSnapshotVersion } from './codexSnapshot'
 export type { CodexLocalSessionSnapshotVersion } from './codexSnapshot'
 import { parseAutomationHeartbeatMessageContent } from './messages'
 import { AGENT_MESSAGE_PAYLOAD_TYPE } from './modes'
+import { isCodexAuthenticationError, isHttpForbiddenError } from './utils'
+import { classifyCodexFailureMessage, extractCodexFailureMessage } from './codexFailure'
 import type { SlashCommand } from './apiTypes'
+import type { NativeCodexSessionControls } from './codexSessionControl'
+import {
+    parseNativeCodexAttachmentPrompt,
+    type NativeCodexAttachment
+} from './nativeCodexAttachments'
+export * from './codexSessionControl'
 
 export type CodexLocalSessionSummary = {
     id: string
@@ -28,12 +37,16 @@ export type CodexLocalSessionSummary = {
     modelReasoningEffort?: string | null
     /** Last native turn lifecycle observed while scanning this transcript. */
     runState?: CodexLocalSessionRunState
+    /** Timestamp of the latest non-terminal native turn. */
+    runStartedAt?: number
     /**
      * A local Codex `request_user_input` call is still awaiting an answer on
      * the originating machine. This is deliberately parallel to runState:
      * native delivery must continue to treat the session as processing.
      */
     waitingForUserInput?: boolean
+    /** Explicit current Codex Desktop SSH ownership; false clears a stale UI lock. */
+    controlledByCodexSsh?: boolean
 }
 
 /** Runner-to-browser list update; the local transcript path stays private. */
@@ -42,7 +55,7 @@ export type CodexLocalSessionListUpdate = Omit<CodexLocalSessionSummary, 'file'>
 /** Small metadata that may change while a transcript revision stays stable. */
 export type CodexLocalSessionDisplaySummary = Pick<
     CodexLocalSessionSummary,
-    'id' | 'title' | 'cwd' | 'modifiedAt' | 'model' | 'modelReasoningEffort'
+    'id' | 'title' | 'cwd' | 'modifiedAt' | 'model' | 'modelReasoningEffort' | 'controlledByCodexSsh'
 >
 
 export type CodexLocalSessionConfig = {
@@ -74,6 +87,11 @@ export type CodexImportedMessageContent = {
     content: {
         type: 'text'
         text: string
+        /**
+         * Browser-safe native attachment metadata. The runner-only path is
+         * stripped before a transcript leaves the machine.
+         */
+        attachments?: NativeCodexAttachment[]
     }
     meta: {
         sentFrom: 'cli'
@@ -89,6 +107,34 @@ export type CodexImportedMessageContent = {
     meta: {
         sentFrom: 'cli'
     }
+}
+
+/**
+ * A direct child Codex thread discovered from a native parent transcript.
+ * Child rollout files are intentionally kept out of the regular native
+ * session list, but an opened parent can present their progress as the same
+ * Codex-agent cards used by SHAPI-owned sessions.
+ */
+export type CodexLocalSessionSubagent = {
+    /** Native child thread id; never render this as the human-facing label. */
+    id: string
+    parentSessionId: string
+    /** Codex collaboration nickname, when the native transcript provides one. */
+    name?: string | null
+    /** Native collaboration role / specialization, when present. */
+    role?: string | null
+    /** Native agent path; the UI prefers it as a label after stripping the /root/ prefix. */
+    agentPath?: string | null
+    model?: string | null
+    modelReasoningEffort?: string | null
+    /** The UI intentionally reduces this to running vs terminal card states. */
+    status: 'running' | 'completed' | 'failed' | 'canceled' | 'unknown'
+    statusText?: string | null
+    startedAt: number
+    updatedAt: number
+    completedAt?: number
+    /** Bounded child transcript records for the existing agent detail dialog. */
+    traceMessages: CodexImportedMessageContent[]
 }
 
 export type CodexTranscriptImportData = CodexLocalSessionSummary & {
@@ -114,9 +160,13 @@ export type CodexLocalSessionSnapshotReadOptions = CodexLocalSessionReadOptions 
 }
 
 export type CodexLocalSessionData = {
+    tokenUsage?: CodexTokenUsage | null
+    modelProvider?: string | null
     session: CodexLocalSessionSummary
     context: CodexLocalSessionContextMessage[]
     importedMessages: CodexImportedMessageContent[]
+    /** Direct native Codex children, separate from parent pagination. */
+    subagents: CodexLocalSessionSubagent[]
     startIndex: number
     page: CodexLocalSessionPage
 }
@@ -210,6 +260,8 @@ export type CodexLocalSessionDirectSendProgress = {
     startedAt: number
     /** Lets clients show the duration of the currently visible stage. */
     phaseStartedAt: number
+    /** Ordered, bounded stages for this hand-off; survives coalesced status updates. */
+    history?: Array<{ phase: CodexLocalSessionDirectSendPhase; startedAt: number }>
     transport: 'app-server' | 'exec-resume'
     /** Present after SHAPI switches from the primary bridge to its safe fallback. */
     attempt?: number
@@ -221,16 +273,21 @@ export type CodexLocalSessionDirectSendRecoveryReason =
     | 'session_status_unknown'
     | 'launch_failed'
     | 'runner_restarted'
+    | 'review_guard_failed'
     /** Another Codex client owns this original thread; no prompt was delivered. */
     | 'external_writer_active'
 
 export type CodexLocalSessionStatusRpcResponse = {
     success: true
+    pendingUserInput?: import('./codexSessionControl').NativeCodexUserInput
     status: CodexLocalSessionRunState
+    controls?: NativeCodexSessionControls
     /** Current native turn identity only; plan contents stay in snapshot RPC. */
     activeTurnId?: string
     /** Native Codex is blocked on an answer in its own local UI. */
     waitingForUserInput?: boolean
+    /** Explicit current Codex Desktop SSH ownership; false clears a stale UI lock. */
+    controlledByCodexSsh?: boolean
     /**
      * The native transcript still says a turn is running but has not changed
      * for a long time. This is only a recovery hint: SHAPI never retries a
@@ -239,15 +296,19 @@ export type CodexLocalSessionStatusRpcResponse = {
     stalledSince?: number
     /** Present while the runner owns a direct native send for this thread. */
     startedAt?: number
+    /** Browser receipt owned by the runner's delivery lane; not proof that Codex accepted it. */
+    activeClientMessageId?: string
+    /** Receipt-specific evidence from Codex, distinct from a runner queue ACK. */
+    deliveryReceipts?: Array<{ id: string; state: 'accepted' | 'delivered' }>
     /** Present while the runner can describe its native direct-send hand-off. */
     progress?: CodexLocalSessionDirectSendProgress
-    /** Short runner-side launch/exit failure, if the most recent send failed. */
+    /** Short runner-side delivery diagnostic for the most recent send. */
     lastError?: string
-    /** Runner timestamp for `lastError`, used to associate a browser receipt safely. */
+    /** Runner timestamp for display/expiry only; receipt identity comes from the client message id. */
     lastErrorAt?: number
     /** Browser receipt that caused `lastError`, when the runner knows it. */
     lastErrorClientMessageId?: string
-    /** Stable UI-safe category for the latest native delivery failure. */
+    /** Stable UI-safe category for the latest native delivery diagnostic. */
     lastErrorCode?: CodexLocalSessionDirectSendRecoveryReason
     /** Messages waiting for the native thread to become idle. */
     queuedMessages?: CodexLocalSessionQueuedMessage[]
@@ -259,7 +320,7 @@ export type CodexLocalSessionStatusRpcResponse = {
 /** Queue identity carried by global realtime invalidations; message text stays in snapshot RPC. */
 export type CodexLocalSessionRealtimeQueuedMessage = Pick<
     CodexLocalSessionQueuedMessage,
-    'id' | 'recoveryRequired' | 'recoveryReason'
+    'id' | 'recoveryRequired' | 'recoveryReason' | 'cancelBlocked'
 >
 
 export type CodexLocalSessionRealtimeStatus = Omit<
@@ -276,7 +337,8 @@ export type CodexLocalSessionComposerCapabilities = {
     skills: Array<{
         name: string
         description?: string
-        scope: 'project' | 'user' | 'plugin' | 'system' | 'admin'
+        descriptions?: Partial<Record<'en' | 'zh-CN', string>>
+        scope: 'hub' | 'project' | 'user' | 'plugin' | 'system' | 'admin'
     }>
 }
 
@@ -320,6 +382,25 @@ export type CodexLocalSessionSnapshotRpcResponse = {
     error: string
 }
 
+/** A runner-owned, idempotent attempt to attach a managed Codex client without sending a turn. */
+export type RecoverCodexLocalSessionControlRequest = {
+    sessionId: string
+    recoveryRequestId: string
+    expectedVersion: CodexLocalSessionSnapshotVersion
+}
+
+export type CodexLocalSessionRecoveryResponse = {
+    success: true
+    status: 'pending' | 'ready' | 'unconfirmed'
+    recoveryRequestId: string
+    sessionId?: string
+    error?: string
+} | {
+    success: false
+    code: 'invalid_request' | 'stale_snapshot' | 'not_eligible' | 'recovery_busy' | 'launch_failed'
+    error: string
+}
+
 /**
  * Bounded transcript state sent by the runner only for a browser that has
  * already opened this native thread. It deliberately excludes the local
@@ -334,6 +415,7 @@ export type CodexLocalSessionRealtimeSnapshot = {
 }
 
 export type CodexLocalSessionQueuedMessage = {
+    cancelBlocked?: boolean
     id: string
     text: string
     queuedAt: number
@@ -350,6 +432,17 @@ export type CodexLocalSessionQueuedMessage = {
 /** Internal runner policy for prompts generated by a SHAPI Kanban review. */
 export type NativeCodexDeliveryPolicy = 'default' | 'untrusted-review'
 
+export {
+    MAX_NATIVE_CODEX_ATTACHMENT_BYTES,
+    MAX_NATIVE_CODEX_ATTACHMENTS,
+    formatNativeCodexAttachmentPrompt,
+    parseNativeCodexAttachmentPrompt
+} from './nativeCodexAttachments'
+export type {
+    NativeCodexAttachment,
+    NativeCodexResolvedAttachment
+} from './nativeCodexAttachments'
+
 /**
  * Runner-owned integrity capability for an untrusted Kanban review. It names
  * a single staged file and digest only; feedback bytes never travel through
@@ -363,6 +456,8 @@ export type NativeKanbanFeedbackReviewGuard = {
 export type SendCodexLocalSessionMessageRpcResponse = {
     success: true
     status: 'processing' | 'queued'
+    /** Present when the Hub delivered through the matching SHAPI-managed session. */
+    managedSessionId?: string
     /** Present when the request started a Codex child immediately. */
     startedAt?: number
     /** Present when the runner started a direct native app-server bridge. */
@@ -375,7 +470,7 @@ export type SendCodexLocalSessionMessageRpcResponse = {
 } | {
     success: false
     error: string
-    code: 'session_not_found' | 'session_busy' | 'session_status_unknown' | 'workspace_unavailable' | 'invalid_message' | 'invalid_client_message_id' | 'launch_failed' | 'queue_full' | 'not_native_session'
+    code: 'session_not_found' | 'session_busy' | 'session_status_unknown' | 'workspace_unavailable' | 'invalid_message' | 'invalid_client_message_id' | 'launch_failed' | 'queue_full' | 'not_native_session' | 'external_writer_active'
 }
 
 /**
@@ -414,6 +509,7 @@ export type ArchiveCodexLocalSessionRpcResponse = {
         | 'archive_in_progress'
         | 'archive_unsupported'
         | 'archive_failed'
+        | 'external_writer_active'
 }
 
 export type CodexTranscriptFileCandidate = {
@@ -428,6 +524,10 @@ const MAX_CODEX_CONTEXT_MESSAGE_CHARS = 24_000
 const MAX_CODEX_PLAN_STEPS = 32
 const MAX_CODEX_PLAN_STEP_CHARS = 600
 const MAX_CODEX_PLAN_ID_LENGTH = 512
+const MAX_CODEX_SUBAGENT_TRACE_MESSAGES = 160
+const MAX_CODEX_SUBAGENT_TRACE_BYTES = 1024 * 1024
+const MAX_CODEX_SUBAGENT_TRACE_PAYLOAD_BYTES = 64 * 1024
+const MAX_CODEX_SUBAGENTS_TRACE_PAYLOAD_BYTES = 1024 * 1024
 // Session lists only need metadata from the transcript header and latest
 // records. Large historical transcripts must not be fully loaded just to
 // render a row in the native-session list.
@@ -541,8 +641,16 @@ function getCodexRolloutTimestampKey(value: string | null): string | null {
     return Number.isFinite(milliseconds) ? String(Math.round(milliseconds / 1_000)) : value
 }
 
-function inferSessionIdFromFileName(filePath: string): string | null {
-    const match = /([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/.exec(filePath)
+/**
+ * Codex can continue one thread in a rotated rollout file such as
+ * `rollout-...-<thread-id>_<turn-id>.jsonl`. The first UUID remains the
+ * thread id; any later UUID belongs to the rollover turn.
+ */
+export function getCodexSessionIdFromTranscriptFilePath(filePath: string): string | null {
+    const fileName = filePath.split(/[\\/]/).pop() ?? ''
+    if (!/^rollout-.+\.jsonl$/i.test(fileName)) return null
+
+    const match = /([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/.exec(fileName)
     return match?.[1] ?? null
 }
 
@@ -814,13 +922,34 @@ function getLatestCodexUserMessage(lines: string[]): string | null {
             if (!record || record.type !== 'response_item') continue
             const payload = asRecord(record.payload)
             if (payload?.type !== 'message' || payload.role !== 'user') continue
-            const text = normalizeCodexUserMessageContent(payload.content)
-            if (text) return truncateText(text, 140)
+            const message = getCodexUserMessageForDisplay(payload.content)
+            if (message) return truncateText(message.text, 140)
         } catch {
             // Ignore malformed transcript records.
         }
     }
     return null
+}
+
+/**
+ * Native attachment prompts contain a Runner-private path envelope so Codex
+ * can read the staged file. Never let that envelope leave the Runner: keep
+ * only the visible request and opaque attachment metadata.
+ */
+function getCodexUserMessageForDisplay(value: unknown): {
+    text: string
+    attachments?: NativeCodexAttachment[]
+} | null {
+    const text = normalizeCodexUserMessageContent(value)
+    if (!text) return null
+    const nativeAttachmentPrompt = parseNativeCodexAttachmentPrompt(text)
+    if (!nativeAttachmentPrompt) return { text }
+    return {
+        text: nativeAttachmentPrompt.text,
+        ...(nativeAttachmentPrompt.attachments.length > 0
+            ? { attachments: nativeAttachmentPrompt.attachments }
+            : {})
+    }
 }
 
 function extractCodexSessionConfig(record: Record<string, unknown>): Partial<CodexLocalSessionConfig> {
@@ -886,6 +1015,81 @@ function isSubagentSource(value: unknown): boolean {
     return record ? Object.prototype.hasOwnProperty.call(record, 'subagent') : false
 }
 
+type CodexSubagentSessionHeader = {
+    sessionId: string | null
+    parentSessionId: string | null
+    name: string | null
+    role: string | null
+    agentPath: string | null
+}
+
+/**
+ * Native child sessions have a `source.subagent` marker in `session_meta`.
+ * Codex has used a few shapes over time, so keep the parent/name extraction
+ * tolerant while requiring a concrete direct parent before surfacing a card.
+ */
+function getCodexSubagentSessionHeader(lines: readonly string[]): CodexSubagentSessionHeader | null {
+    for (const line of lines.slice(0, 200)) {
+        try {
+            const record = asRecord(JSON.parse(line))
+            if (record?.type !== 'session_meta') continue
+            const payload = asRecord(record.payload)
+            const source = asRecord(payload?.source)
+            if (!payload || !source || !Object.prototype.hasOwnProperty.call(source, 'subagent')) continue
+
+            const subagent = asRecord(source.subagent)
+            const threadSpawn = asRecord(subagent?.thread_spawn ?? subagent?.threadSpawn)
+            const parentSessionId = asString(
+                threadSpawn?.parent_thread_id
+                ?? threadSpawn?.parentThreadId
+                ?? subagent?.parent_thread_id
+                ?? subagent?.parentThreadId
+                ?? payload.parent_thread_id
+                ?? payload.parentThreadId
+            )
+            const name = asString(
+                threadSpawn?.agent_nickname
+                ?? threadSpawn?.agentNickname
+                ?? threadSpawn?.agent_name
+                ?? threadSpawn?.agentName
+                ?? subagent?.agent_nickname
+                ?? subagent?.agentNickname
+                ?? subagent?.agent_name
+                ?? subagent?.agentName
+                ?? payload.agent_nickname
+                ?? payload.agentNickname
+            )
+            const role = asString(
+                threadSpawn?.agent_role
+                ?? threadSpawn?.agentRole
+                ?? subagent?.agent_role
+                ?? subagent?.agentRole
+                ?? payload.agent_role
+                ?? payload.agentRole
+            )
+            const agentPath = asString(
+                threadSpawn?.agent_path
+                ?? threadSpawn?.agentPath
+                ?? subagent?.agent_path
+                ?? subagent?.agentPath
+                ?? payload.agent_path
+                ?? payload.agentPath
+            )
+            return {
+                sessionId: asString(payload.id) ?? asString(payload.session_id) ?? asString(payload.sessionId),
+                parentSessionId,
+                name,
+                role,
+                agentPath
+            }
+        } catch {
+            // A native writer can expose a partial final JSONL record. The
+            // header lives at the beginning, so later attempts can recover.
+        }
+    }
+    return null
+}
+
 export function isHapiInitiatedCodexSession(
     session: Pick<CodexLocalSessionSummary, 'originator'>
 ): boolean {
@@ -934,8 +1138,8 @@ function getCodexSessionHeader(lines: readonly string[]): CodexSessionHeader {
             if (!firstUserMessage && type === 'response_item') {
                 const payload = asRecord(record?.payload)
                 if (payload?.type === 'message' && payload.role === 'user') {
-                    const text = normalizeCodexUserMessageContent(payload.content)
-                    if (text) firstUserMessage = text
+                    const message = getCodexUserMessageForDisplay(payload.content)
+                    if (message) firstUserMessage = message.text
                 }
             }
         } catch {
@@ -977,8 +1181,8 @@ function getCodexSummaryHeadLines(
     return bytes === null ? null : bytes.toString('utf8').split(/\r?\n/).filter(Boolean)
 }
 
-function getCodexSummaryTailLines(filePath: string, size: number): string[] | null {
-    const offset = Math.max(0, size - CODEX_SESSION_SUMMARY_WINDOW_BYTES)
+function getCodexSummaryTailLines(filePath: string, size: number, maxBytes = CODEX_SESSION_SUMMARY_WINDOW_BYTES): string[] | null {
+    const offset = Math.max(0, size - maxBytes)
     const bytes = readCodexTranscriptRange(filePath, offset, size - offset)
     if (bytes === null) return null
 
@@ -1002,12 +1206,13 @@ function buildCodexLocalSessionSummary(
         lastUserMessage: string | null
         config: CodexLocalSessionConfig
         runState: CodexLocalSessionRunState
+        runStartedAt?: number
         waitingForUserInput?: boolean
     }
 ): CodexLocalSessionSummary | null {
     if (header.isSubagent) return null
 
-    const sessionId = header.sessionId ?? inferSessionIdFromFileName(filePath)
+    const sessionId = header.sessionId ?? getCodexSessionIdFromTranscriptFilePath(filePath)
     if (!sessionId) return null
 
     return {
@@ -1022,6 +1227,7 @@ function buildCodexLocalSessionSummary(
         model: latest.config.model,
         modelReasoningEffort: latest.config.modelReasoningEffort,
         runState: latest.runState,
+        ...(latest.runStartedAt === undefined ? {} : { runStartedAt: latest.runStartedAt }),
         ...(latest.waitingForUserInput === undefined ? {} : {
             waitingForUserInput: latest.waitingForUserInput
         })
@@ -1063,11 +1269,13 @@ export function readLocalCodexSessionSummary(
         }
 
         const allLines = content.split(/\r?\n/).filter(Boolean)
+        const lifecycle = getCodexTranscriptRunLifecycle(allLines)
         return buildCodexLocalSessionSummary(filePath, resolvedModifiedAt, getCodexSessionHeader(allLines), {
             changedTitle: getLatestCodexChangedTitle(allLines),
             lastUserMessage: getLatestCodexUserMessage(allLines),
             config: getLatestCodexSessionConfig(allLines),
-            runState: getCodexTranscriptRunState(content),
+            runState: lifecycle.runState,
+            ...(lifecycle.runStartedAt === undefined ? {} : { runStartedAt: lifecycle.runStartedAt }),
             waitingForUserInput: getCodexTranscriptUserInputState(allLines).waiting
         })
     }
@@ -1099,6 +1307,7 @@ export function readLocalCodexSessionSummary(
         // Unknown is deliberately conservative: direct sends will queue until
         // a live transcript append proves the native turn is idle.
         runState: tail.runState ?? 'unknown',
+        ...(tail.runStartedAt === undefined ? {} : { runStartedAt: tail.runStartedAt }),
         ...(tail.waitingForUserInput === undefined ? {} : {
             waitingForUserInput: tail.waitingForUserInput
         })
@@ -1109,6 +1318,20 @@ export function listCodexTranscriptFilesByRecency(): CodexTranscriptFileCandidat
     const files: CodexTranscriptFileCandidate[] = []
     collectJsonlFiles(join(getCodexHome(), 'sessions'), files)
     return files.sort((left, right) => right.modifiedAt - left.modifiedAt)
+}
+
+/**
+ * Return every rollout segment for one native Codex thread in transcript
+ * order. Codex may rotate an active thread into a second JSONL file, so the
+ * newest segment alone is not its complete history.
+ */
+export function listLocalCodexSessionTranscriptFiles(sessionId: string): CodexTranscriptFileCandidate[] {
+    const id = sessionId.trim()
+    if (!id) return []
+
+    return listCodexTranscriptFilesByRecency()
+        .filter((candidate) => getCodexSessionIdFromTranscriptFilePath(candidate.file) === id)
+        .sort((left, right) => left.modifiedAt - right.modifiedAt || left.file.localeCompare(right.file))
 }
 
 export function listLocalCodexSessions(
@@ -1130,7 +1353,7 @@ export function listLocalCodexSessions(
 
 export function findLocalCodexSession(sessionId: string): CodexLocalSessionSummary | null {
     for (const candidate of listCodexTranscriptFilesByRecency()) {
-        const inferredId = inferSessionIdFromFileName(candidate.file)
+        const inferredId = getCodexSessionIdFromTranscriptFilePath(candidate.file)
         if (inferredId && inferredId !== sessionId) continue
         const session = readLocalCodexSessionSummary(candidate.file, candidate.modifiedAt, candidate.size)
         if (session?.id === sessionId) return session
@@ -1254,9 +1477,13 @@ export function getCodexTranscriptUserInputState(lines: readonly string[]): Code
     return { seen, waiting: active !== null }
 }
 
-function getCodexTranscriptRunState(content: string): CodexLocalSessionRunState {
+function getCodexTranscriptRunLifecycle(lines: readonly string[]): {
+    runState: CodexLocalSessionRunState
+    runStartedAt?: number
+} {
     let state: CodexLocalSessionRunState = 'unknown'
-    for (const line of content.split(/\r?\n/)) {
+    let runStartedAt: number | undefined
+    for (const line of lines) {
         if (!line) continue
         try {
             const record = asRecord(JSON.parse(line))
@@ -1265,8 +1492,10 @@ function getCodexTranscriptRunState(content: string): CodexLocalSessionRunState 
             const eventType = asString(payload?.type)
             if (eventType === 'task_started') {
                 state = 'processing'
+                runStartedAt = getCodexRecordTimestamp(record)
             } else if (eventType === 'task_complete' || eventType === 'turn_aborted' || eventType === 'task_failed') {
                 state = 'idle'
+                runStartedAt = undefined
             }
         } catch {
             // A runner can observe the transcript while Codex is appending a
@@ -1274,7 +1503,7 @@ function getCodexTranscriptRunState(content: string): CodexLocalSessionRunState 
             // give us the safest known state.
         }
     }
-    return state
+    return { runState: state, ...(runStartedAt === undefined ? {} : { runStartedAt }) }
 }
 
 /**
@@ -1288,6 +1517,7 @@ export type CodexTranscriptTailSummary = {
     model?: string
     modelReasoningEffort?: string
     runState?: CodexLocalSessionRunState
+    runStartedAt?: number
     waitingForUserInput?: boolean
 }
 
@@ -1309,9 +1539,9 @@ export function getCodexTranscriptTailSummary(lines: readonly string[]): CodexTr
             if (record.type === 'response_item') {
                 const payload = asRecord(record.payload)
                 if (payload?.type === 'message' && payload.role === 'user') {
-                    const text = normalizeCodexUserMessageContent(payload.content)
-                    if (text) {
-                        summary.lastUserMessage = truncateText(text, 140)
+                    const message = getCodexUserMessageForDisplay(payload.content)
+                    if (message) {
+                        summary.lastUserMessage = truncateText(message.text, 140)
                     }
                 }
             }
@@ -1321,8 +1551,10 @@ export function getCodexTranscriptTailSummary(lines: readonly string[]): CodexTr
                 const eventType = asString(payload?.type)
                 if (eventType === 'task_started') {
                     summary.runState = 'processing'
+                    summary.runStartedAt = getCodexRecordTimestamp(record)
                 } else if (eventType === 'task_complete' || eventType === 'turn_aborted' || eventType === 'task_failed') {
                     summary.runState = 'idle'
+                    delete summary.runStartedAt
                 }
             }
         } catch {
@@ -1343,11 +1575,19 @@ function getCodexRecordTimestamp(record: Record<string, unknown>): number | unde
     return Number.isFinite(parsed) ? parsed : undefined
 }
 
-function buildImportedUserMessage(text: string, createdAt?: number): CodexImportedMessageContent {
+function buildImportedUserMessage(
+    text: string,
+    createdAt?: number,
+    attachments?: NativeCodexAttachment[]
+): CodexImportedMessageContent {
     return {
         ...(createdAt === undefined ? {} : { createdAt }),
         role: 'user',
-        content: { type: 'text', text },
+        content: {
+            type: 'text',
+            text,
+            ...(attachments?.length ? { attachments } : {})
+        },
         meta: { sentFrom: 'cli' }
     }
 }
@@ -1427,6 +1667,47 @@ function convertCodexRecordToImportedMessage(record: Record<string, unknown>): C
         if (eventType === 'context_compacted') {
             return buildImportedAgentMessage({ type: 'context_compacted', id: randomUUID() }, createdAt)
         }
+        // Native Codex can end a failed turn with task_complete + error.
+        if (eventType === 'task_complete' || eventType === 'task_failed') {
+            const error = extractCodexFailureMessage([
+                payload.error,
+                payload.message,
+                payload.reason,
+                payload.detail,
+                payload.output,
+                payload.result,
+            ])
+            if (isCodexAuthenticationError(error)) {
+                return buildImportedAgentMessage({
+                    type: 'task-status',
+                    status: 'failed',
+                    source: 'codex',
+                    code: 'authentication',
+                    message: 'Codex authentication required',
+                    recoverable: false
+                }, createdAt)
+            }
+            if (isHttpForbiddenError(error)) {
+                return buildImportedAgentMessage({
+                    type: 'task-status',
+                    status: 'failed',
+                    source: 'codex',
+                    code: 'http_forbidden',
+                    message: 'HTTP 403 Forbidden',
+                    recoverable: false
+                }, createdAt)
+            }
+            if (eventType === 'task_failed' || error) {
+                return buildImportedAgentMessage({
+                    type: 'task-status',
+                    status: 'failed',
+                    source: 'codex',
+                    code: classifyCodexFailureMessage(error),
+                    message: error ?? 'Task failed',
+                    recoverable: false
+                }, createdAt)
+            }
+        }
         return null
     }
 
@@ -1436,8 +1717,8 @@ function convertCodexRecordToImportedMessage(record: Record<string, unknown>): C
     if (itemType === 'message') {
         const role = asString(payload.role)
         if (role === 'user') {
-            const text = normalizeCodexUserMessageContent(payload.content)
-            return text ? buildImportedUserMessage(text, createdAt) : null
+            const message = getCodexUserMessageForDisplay(payload.content)
+            return message ? buildImportedUserMessage(message.text, createdAt, message.attachments) : null
         }
         const text = extractCodexText(payload.content)
         if (!text) return null
@@ -1505,17 +1786,25 @@ function getHeartbeatTimestamp(message: CodexImportedMessageContent): number | u
  * the shape of a full transcript import.
  */
 export type CodexTranscriptImportAccumulator = {
+    tokenUsage: CodexTokenUsage | null
+    /** Latest usage reported inside the active parent turn. */
+    currentTurnTokenUsage: CodexTokenUsage | null
+    /** Cumulative counter immediately before the active parent turn. */
+    turnStartTokenUsage: CodexTokenUsage | null
+    modelProvider: string | null
+    usageSessionId: string | null
     messages: CodexImportedMessageContent[]
     canonicalChatMessageIndexByRolloutKey: Map<string, number>
     userMessageMirrorDeduper: ReturnType<typeof createCodexUserMessageMirrorDeduper>
-    /** Tool calls whose questions and answers must remain on the native client. */
-    localOnlyCallIds: Set<string>
     startedAtByCallId: Map<string, number>
     toolResultIndexesByCallId: Map<string, number[]>
     pendingHeartbeatTimestamp?: number
     pendingReasoningIndex?: number
     pendingReasoningParts: string[]
     reasoningFingerprintsInCurrentTurn: Set<string>
+    completionTurnId: string | null
+    completionTurnStartIndex: number
+    completionTurnSeen: boolean
     /** The transcript-owned current native turn. Never inferred from reasoning. */
     activePlanTurnId: string | null
     /** Valid update_plan calls await their matching successful tool output. */
@@ -1526,14 +1815,21 @@ export type CodexTranscriptImportAccumulator = {
 
 export function createCodexTranscriptImportAccumulator(): CodexTranscriptImportAccumulator {
     return {
+        tokenUsage: null,
+        currentTurnTokenUsage: null,
+        turnStartTokenUsage: null,
+        modelProvider: null,
+        usageSessionId: null,
         messages: [],
         canonicalChatMessageIndexByRolloutKey: new Map(),
         userMessageMirrorDeduper: createCodexUserMessageMirrorDeduper(),
-        localOnlyCallIds: new Set(),
         startedAtByCallId: new Map(),
         toolResultIndexesByCallId: new Map(),
         pendingReasoningParts: [],
         reasoningFingerprintsInCurrentTurn: new Set(),
+        completionTurnId: null,
+        completionTurnStartIndex: 0,
+        completionTurnSeen: false,
         activePlanTurnId: null,
         pendingPlansByCallId: new Map(),
         plan: null
@@ -1809,6 +2105,56 @@ function shouldClosePendingReasoning(message: CodexImportedMessageContent | null
     return data?.type !== 'token_count'
 }
 
+function getCurrentTurnMessageUsage(accumulator: CodexTranscriptImportAccumulator): Record<string, number> | undefined {
+    const current = accumulator.currentTurnTokenUsage
+    const baseline = accumulator.turnStartTokenUsage
+    const difference = (value: number | null, start: number | null): number | null => {
+        if (value === null) return null
+        if (start === null || value < start) return value
+        return value - start
+    }
+    const cumulativeTurnUsage = current && current.scope !== 'lastTurn'
+        ? {
+            input: difference(current.input, baseline?.input ?? null),
+            output: difference(current.output, baseline?.output ?? null),
+            cachedInput: difference(current.cachedInput, baseline?.cachedInput ?? null)
+        }
+        : null
+    const turnUsage = current?.lastTurn
+        ?? (current?.scope === 'lastTurn' ? current : cumulativeTurnUsage)
+    if (turnUsage?.input === null || turnUsage?.input === undefined || turnUsage.output === null) return undefined
+
+    return {
+        input_tokens: turnUsage.input,
+        output_tokens: turnUsage.output,
+        ...(turnUsage.cachedInput !== null ? { cache_read_input_tokens: turnUsage.cachedInput } : {}),
+        ...(accumulator.currentTurnTokenUsage?.contextTokens !== null
+            && accumulator.currentTurnTokenUsage?.contextTokens !== undefined
+            ? { context_tokens: accumulator.currentTurnTokenUsage.contextTokens } : {}),
+        ...(accumulator.currentTurnTokenUsage?.contextWindow !== null
+            && accumulator.currentTurnTokenUsage?.contextWindow !== undefined
+            ? { context_window: accumulator.currentTurnTokenUsage.contextWindow } : {})
+    }
+}
+
+function attachCurrentTurnUsage(accumulator: CodexTranscriptImportAccumulator): void {
+    if (!accumulator.completionTurnSeen) return
+    const usage = getCurrentTurnMessageUsage(accumulator)
+    if (!usage) return
+
+    for (let index = accumulator.messages.length - 1; index >= accumulator.completionTurnStartIndex; index--) {
+        const message = accumulator.messages[index]!
+        if (message.role === 'user') break
+        const data = asRecord(message.content.data)
+        if (data?.type !== 'message') continue
+        accumulator.messages[index] = {
+            ...message,
+            content: { ...message.content, data: { ...data, usage } }
+        }
+        return
+    }
+}
+
 /** Append complete JSONL records to an existing native transcript import. */
 export function appendCodexTranscriptImportLines(
     accumulator: CodexTranscriptImportAccumulator,
@@ -1820,32 +2166,75 @@ export function appendCodexTranscriptImportLines(
             const record = asRecord(JSON.parse(line))
             if (!record) continue
             const { recordType, payloadType, payload } = getCodexRecordKinds(record)
+            if (recordType === 'session_meta') accumulator.usageSessionId = asString(payload?.id) ?? accumulator.usageSessionId
+
+            if (recordType === 'session_meta' || recordType === 'turn_context') {
+                const provider = asString(payload?.model_provider ?? payload?.modelProvider)
+                if (provider) accumulator.modelProvider = provider
+            }
+
+            if (recordType === 'event_msg' && payloadType === 'token_count') {
+                const scope = asRecord(payload?.scope)
+                const info = asRecord(payload?.info)
+                const threadId = asString(payload?.thread_id ?? payload?.threadId ?? info?.thread_id ?? info?.threadId ?? scope?.thread_id)
+                if (payload?.scope_role !== 'child' && scope?.role !== 'child'
+                    && (!threadId || !accumulator.usageSessionId || threadId === accumulator.usageSessionId)) {
+                    const nextUsage = readCodexTokenUsage(info, getCodexRecordTimestamp(record) ?? 0)
+                    accumulator.tokenUsage = selectCodexTokenUsage(accumulator.tokenUsage, nextUsage)
+                    accumulator.currentTurnTokenUsage = nextUsage
+                    // Depending on the Codex version, token_count can arrive
+                    // either before or after task_complete. Persist it as soon
+                    // as it is observed so every historical turn keeps its own
+                    // usage instead of only the latest live turn showing it.
+                    attachCurrentTurnUsage(accumulator)
+                }
+            }
+
+            if (recordType === 'event_msg' && payloadType === 'task_started') {
+                accumulator.turnStartTokenUsage = accumulator.currentTurnTokenUsage?.scope === 'lastTurn'
+                    ? null
+                    : accumulator.currentTurnTokenUsage
+                accumulator.currentTurnTokenUsage = null
+                accumulator.completionTurnId = extractCodexTurnId(record, payload ?? {})
+                accumulator.completionTurnStartIndex = accumulator.messages.length
+                accumulator.completionTurnSeen = true
+            }
+
+            if (recordType === 'event_msg' && ['task_complete', 'task_failed', 'turn_aborted'].includes(payloadType ?? '')) {
+                const terminalTurnId = extractCodexTurnId(record, payload ?? {})
+                const matchesTurn = accumulator.completionTurnSeen
+                    && terminalTurnId === accumulator.completionTurnId
+                // Attach terminal evidence to the final text already in history;
+                // no extra visible lifecycle messages or child-trace noise.
+                for (let index = accumulator.messages.length - 1; matchesTurn && index >= accumulator.completionTurnStartIndex; index--) {
+                    const message = accumulator.messages[index]!
+                    if (message.role === 'user') break
+                    const data = asRecord(message.content.data)
+                    if (data?.type !== 'message') continue
+                    // A failure/abort is authoritative even after an earlier
+                    // completion for this same turn. Never resurrect a failure.
+                    const outcome = payloadType === 'turn_aborted' ? 'aborted' : payloadType === 'task_failed' || payload?.error ? 'failed' : 'completed'
+                    if (outcome === 'completed' && (data.turnOutcome === 'failed' || data.turnOutcome === 'aborted')) break
+                    const usage = getCurrentTurnMessageUsage(accumulator)
+                    accumulator.messages[index] = { ...message, content: { ...message.content, data: {
+                        ...data,
+                        final: true,
+                        turnOutcome: outcome,
+                        ...(usage ? { usage } : {})
+                    } } }
+                    break
+                }
+            }
 
             if (applyCodexTranscriptPlanRecord(accumulator, record)) {
                 finalizePendingReasoning(accumulator)
                 continue
             }
 
-            if (
-                recordType === 'response_item'
-                && (payloadType === 'function_call' || payloadType === 'custom_tool_call')
-                && payload?.name === 'request_user_input'
-            ) {
-                const callId = extractCodexToolCallId(payload)
-                if (callId) accumulator.localOnlyCallIds.add(callId)
-                finalizePendingReasoning(accumulator)
-                continue
-            }
-            if (
-                recordType === 'response_item'
-                && (payloadType === 'function_call_output' || payloadType === 'custom_tool_call_output')
-            ) {
-                const callId = payload ? extractCodexToolCallId(payload) : null
-                if (callId && accumulator.localOnlyCallIds.has(callId)) {
-                    finalizePendingReasoning(accumulator)
-                    continue
-                }
-            }
+            // Question/answer records are chat history, not permission RPCs.
+            // Import both so another client's answer replaces the message card
+            // and survives refreshing the page. Control still requires an
+            // exact, live pending request on the native channel.
 
             if (recordType === 'event_msg' && payloadType === 'agent_reasoning_delta') {
                 continue
@@ -1916,6 +2305,210 @@ export function appendCodexTranscriptImportLines(
     }
 }
 
+type CodexSubagentTranscriptGroup = {
+    id: string
+    header: CodexSubagentSessionHeader
+    files: CodexTranscriptFileCandidate[]
+    filePaths: Set<string>
+}
+
+function addCodexSubagentTranscriptFile(
+    group: CodexSubagentTranscriptGroup,
+    candidate: CodexTranscriptFileCandidate
+): void {
+    if (group.filePaths.has(candidate.file)) return
+    group.filePaths.add(candidate.file)
+    group.files.push(candidate)
+}
+
+function getNativeSubagentStatusText(status: CodexLocalSessionSubagent['status']): string {
+    if (status === 'completed') return 'Completed'
+    if (status === 'failed') return 'Failed'
+    if (status === 'canceled') return 'Canceled'
+    if (status === 'unknown') return 'Unknown'
+    return 'Working'
+}
+
+function normalizeNativeSubagentField(value: string | null): string | null {
+    const normalized = value?.trim()
+    return normalized ? normalized : null
+}
+
+function boundCodexSubagentTrace(messages: readonly CodexImportedMessageContent[], budget: number): CodexImportedMessageContent[] {
+    const recent: CodexImportedMessageContent[] = []
+    let bytes = 0
+    for (let index = messages.length - 1; index >= 0 && recent.length < MAX_CODEX_SUBAGENT_TRACE_MESSAGES; index--) {
+        const message = messages[index]
+        const size = Buffer.byteLength(JSON.stringify(message), 'utf8')
+        // A giant tool result must not crowd out the following answer or
+        // delay the entire parent conversation. Raw transcripts stay intact.
+        if (bytes + size > budget) continue
+        bytes += size
+        recent.push(message)
+    }
+    return recent.reverse()
+}
+
+function buildCodexLocalSessionSubagent(
+    parentSessionId: string,
+    group: CodexSubagentTranscriptGroup
+): CodexLocalSessionSubagent {
+    const files = [...group.files].sort((left, right) => (
+        left.modifiedAt - right.modifiedAt || left.file.localeCompare(right.file)
+    ))
+    const accumulator = createCodexTranscriptImportAccumulator()
+    let model: string | null = null
+    let modelReasoningEffort: string | null = null
+    let status: CodexLocalSessionSubagent['status'] = 'unknown'
+    let currentTurnId: string | null = null
+    let startedAt: number | null = null
+    let completedAt: number | undefined
+    let updatedAt = files.reduce((latest, file) => Math.max(latest, file.modifiedAt), 0)
+
+    for (const file of files) {
+        // Child cards expose a bounded recent trace. Reading every historical
+        // body here can block the parent snapshot for tens of seconds and
+        // allocate gigabytes even when its own message page is only 50 rows.
+        const lines = getCodexSummaryTailLines(file.file, file.size, MAX_CODEX_SUBAGENT_TRACE_BYTES)
+        if (lines === null) continue
+        if (file.size > MAX_CODEX_SUBAGENT_TRACE_BYTES) {
+            const head = getCodexSummaryHeadLines(file.file, file.size) ?? []
+            const initialConfig = getLatestCodexSessionConfig(head)
+            if (initialConfig.model) model = initialConfig.model
+            if (initialConfig.modelReasoningEffort) modelReasoningEffort = initialConfig.modelReasoningEffort
+            // A skipped middle can contain another turn. Do not use an old
+            // segment's turn id to reject the latest terminal or claim busy.
+            currentTurnId = null
+            status = 'unknown'
+            startedAt = null
+            completedAt = undefined
+        }
+        const config = getLatestCodexSessionConfig(lines)
+        if (config.model) model = config.model
+        if (config.modelReasoningEffort) modelReasoningEffort = config.modelReasoningEffort
+        appendCodexTranscriptImportLines(accumulator, lines)
+
+        for (const line of lines) {
+            try {
+                const record = asRecord(JSON.parse(line))
+                if (record?.type !== 'event_msg') continue
+                const payload = asRecord(record.payload)
+                const eventType = asString(payload?.type)
+                if (!payload || !eventType) continue
+                const eventAt = getCodexRecordTimestamp(record) ?? file.modifiedAt
+                updatedAt = Math.max(updatedAt, eventAt)
+                const turnId = extractCodexTurnId(record, payload)
+                if (eventType === 'task_started') {
+                    status = 'running'
+                    currentTurnId = turnId
+                    startedAt = eventAt
+                    completedAt = undefined
+                    continue
+                }
+                if (eventType !== 'task_complete' && eventType !== 'task_failed' && eventType !== 'turn_aborted') {
+                    continue
+                }
+                // A delayed terminal from an older turn must not close a
+                // newer child run in a rotated transcript segment.
+                if (currentTurnId && turnId && currentTurnId !== turnId) continue
+                status = eventType === 'task_complete'
+                    ? 'completed'
+                    : eventType === 'task_failed'
+                        ? 'failed'
+                        : 'canceled'
+                currentTurnId = turnId ?? currentTurnId
+                startedAt ??= eventAt
+                completedAt = eventAt
+            } catch {
+                // Ignore malformed/partially written JSONL lines.
+            }
+        }
+    }
+
+    const traceMessages = accumulator.messages.filter((message) => message.role === 'agent')
+    const boundedTraceMessages = boundCodexSubagentTrace(traceMessages, MAX_CODEX_SUBAGENT_TRACE_PAYLOAD_BYTES)
+    const fallbackStartedAt = files[0]?.modifiedAt ?? updatedAt ?? Date.now()
+    const name = normalizeNativeSubagentField(group.header.name)
+    const role = normalizeNativeSubagentField(group.header.role)
+    const agentPath = normalizeNativeSubagentField(group.header.agentPath)
+
+    return {
+        id: group.id,
+        parentSessionId,
+        ...(name ? { name } : {}),
+        ...(role ? { role } : {}),
+        ...(agentPath ? { agentPath } : {}),
+        model,
+        modelReasoningEffort,
+        status,
+        statusText: getNativeSubagentStatusText(status),
+        startedAt: startedAt ?? fallbackStartedAt,
+        updatedAt: Math.max(updatedAt, completedAt ?? 0),
+        ...(completedAt === undefined ? {} : { completedAt }),
+        traceMessages: boundedTraceMessages
+    }
+}
+
+/**
+ * Return direct native Codex children for one parent thread. These files are
+ * hidden from the native session list, so association must happen before the
+ * normal summary filter discards their `source.subagent` metadata.
+ */
+export function listLocalCodexSessionSubagents(parentSessionId: string): CodexLocalSessionSubagent[] {
+    const parentId = parentSessionId.trim()
+    if (!parentId) return []
+
+    const candidates = listCodexTranscriptFilesByRecency()
+    const groups = new Map<string, CodexSubagentTranscriptGroup>()
+    const childIdByTranscriptId = new Map<string, string>()
+
+    for (const candidate of candidates) {
+        const lines = getCodexSummaryHeadLines(candidate.file, candidate.size)
+        const header = lines ? getCodexSubagentSessionHeader(lines) : null
+        if (!header || header.parentSessionId !== parentId) continue
+        const transcriptId = getCodexSessionIdFromTranscriptFilePath(candidate.file)
+        const childId = header.sessionId ?? transcriptId
+        if (!childId) continue
+
+        const group = groups.get(childId) ?? {
+            id: childId,
+            header,
+            files: [],
+            filePaths: new Set<string>()
+        }
+        groups.set(childId, group)
+        addCodexSubagentTranscriptFile(group, candidate)
+        if (transcriptId) childIdByTranscriptId.set(transcriptId, childId)
+    }
+
+    // A rotated follow-up segment can omit the full subagent header. Once a
+    // first segment identifies the child, keep every same-thread segment in
+    // its ordered history exactly as the parent transcript cache does.
+    for (const candidate of candidates) {
+        const transcriptId = getCodexSessionIdFromTranscriptFilePath(candidate.file)
+        if (!transcriptId) continue
+        const childId = childIdByTranscriptId.get(transcriptId) ?? (groups.has(transcriptId) ? transcriptId : null)
+        if (!childId) continue
+        const group = groups.get(childId)
+        if (group) addCodexSubagentTranscriptFile(group, candidate)
+    }
+
+    const subagents = Array.from(groups.values())
+        .map((group) => buildCodexLocalSessionSubagent(parentId, group))
+        .sort((left, right) => (
+            left.startedAt - right.startedAt
+            || left.updatedAt - right.updatedAt
+            || left.id.localeCompare(right.id)
+        ))
+    let remaining = MAX_CODEX_SUBAGENTS_TRACE_PAYLOAD_BYTES
+    for (let index = subagents.length - 1; index >= 0; index--) {
+        const subagent = subagents[index]
+        subagent.traceMessages = boundCodexSubagentTrace(subagent.traceMessages, remaining)
+        remaining = Math.max(0, remaining - Buffer.byteLength(JSON.stringify(subagent.traceMessages), 'utf8'))
+    }
+    return subagents
+}
+
 export function parseCodexTranscriptImportData(summary: CodexLocalSessionSummary): CodexTranscriptImportData | null {
     let content: string
     try {
@@ -1981,13 +2574,15 @@ function getCodexTranscriptMessagePage(
 export function createLocalCodexSessionData(
     session: CodexLocalSessionSummary,
     importedMessages: CodexImportedMessageContent[],
-    options: CodexLocalSessionReadOptions = {}
+    options: CodexLocalSessionReadOptions = {},
+    subagents: CodexLocalSessionSubagent[] = []
 ): CodexLocalSessionData {
     const transcriptPage = getCodexTranscriptMessagePage(importedMessages, options)
     return {
         session,
         context: getCodexTranscriptContextFromImportedMessages(transcriptPage.messages),
         importedMessages: transcriptPage.messages,
+        subagents,
         startIndex: transcriptPage.startIndex,
         page: transcriptPage.page
     }
@@ -2000,5 +2595,10 @@ export function getLocalCodexSessionData(
     const session = findLocalCodexSession(sessionId)
     if (!session) return null
     const importedMessages = parseCodexTranscriptImportData(session)?.messages ?? []
-    return createLocalCodexSessionData(session, importedMessages, options)
+    return createLocalCodexSessionData(
+        session,
+        importedMessages,
+        options,
+        listLocalCodexSessionSubagents(session.id)
+    )
 }

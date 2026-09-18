@@ -7,6 +7,7 @@ import { useAppGoBack } from '@/hooks/useAppGoBack'
 import { useSession } from '@/hooks/queries/useSession'
 import { useTerminalSocket } from '@/hooks/useTerminalSocket'
 import { useLongPress } from '@/hooks/useLongPress'
+import { useLocalPluginEnabled } from '@/hooks/useLocalPluginEnabled'
 import { useTranslation } from '@/lib/use-translation'
 import { randomId } from '@/lib/randomId'
 import { TerminalView } from '@/components/Terminal/TerminalView'
@@ -174,10 +175,11 @@ function QuickKeyButton(props: {
 export default function TerminalPage() {
     const { t } = useTranslation()
     const { sessionId } = useParams({ from: '/sessions/$sessionId/terminal' })
+    const { enabled: terminalPluginEnabled } = useLocalPluginEnabled('terminal')
     const { api, token, baseUrl } = useAppContext()
     const goBack = useAppGoBack()
     const { session } = useSession(api, sessionId)
-    const terminalSupported = isRemoteTerminalSupported(session?.metadata)
+    const terminalSupported = terminalPluginEnabled && isRemoteTerminalSupported(session?.metadata)
     const terminalId = useMemo(() => randomId(), [sessionId])
     const terminalRef = useRef<Terminal | null>(null)
     const inputDisposableRef = useRef<{ dispose: () => void } | null>(null)
@@ -190,6 +192,12 @@ export default function TerminalPage() {
     const [altActive, setAltActive] = useState(false)
     const [pasteDialogOpen, setPasteDialogOpen] = useState(false)
     const [manualPasteText, setManualPasteText] = useState('')
+
+    useEffect(() => {
+        if (!terminalPluginEnabled) {
+            goBack()
+        }
+    }, [goBack, terminalPluginEnabled])
 
     const {
         state: terminalState,
@@ -522,7 +530,7 @@ export default function TerminalPage() {
                         value={manualPasteText}
                         onChange={(event) => setManualPasteText(event.target.value)}
                         placeholder={t('terminal.paste.placeholder')}
-                        className="mt-2 min-h-32 w-full resize-y rounded-md border border-[var(--app-border)] bg-[var(--app-bg)] p-2 text-sm focus:outline-none focus:ring-2 focus:ring-[var(--app-link)]"
+                        className="ios-form-control mt-2 min-h-32 w-full resize-y p-3 text-sm"
                         autoCapitalize="none"
                         autoCorrect="off"
                     />

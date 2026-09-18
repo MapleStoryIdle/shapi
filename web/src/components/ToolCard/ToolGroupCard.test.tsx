@@ -4,8 +4,16 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { ToolCallBlock } from '@/chat/types'
 import type { ToolGroupBlock } from '@/chat/toolGroups'
 import { HappyChatProvider } from '@/components/AssistantChat/context'
-import { ToolGroupCard } from '@/components/ToolCard/ToolGroupCard'
+import {
+    ToolGroupCard,
+    formatToolGroupCompactTitle,
+    assignCodexSubagentCardColors,
+    getCodexSubagentCardColor,
+    getCodexSubagentCardIdentity,
+    getCodexSubagentCardState
+} from '@/components/ToolCard/ToolGroupCard'
 import type { TerminalToolDisplayMode } from '@/hooks/useTerminalToolDisplayMode'
+import type { ToolGroupExpansionState, ToolGroupExpansionStates } from '@/components/ToolCard/toolGroupExpansion'
 import { I18nProvider } from '@/lib/i18n-context'
 
 function makeToolBlock(id: string, name: string, input: unknown = {}, toolOverrides: Partial<ToolCallBlock['tool']> = {}): ToolCallBlock {
@@ -71,6 +79,22 @@ function makeGroup(overrides: Partial<ToolGroupBlock> = {}): ToolGroupBlock {
     }
 }
 
+describe('compact summary separators', () => {
+    it.each(['Processed', '已处理'])('adds duration once for %s', (label) => {
+        const tool = makeToolBlock('command', 'Bash', { command: 'git status; git diff' }, { durationMs: 3000 })
+        const group = makeGroup({ tools: [tool] })
+        const t = () => label
+        expect(formatToolGroupCompactTitle(group, 5000, t)).toBe('git status; git diff; 3s')
+        expect(formatToolGroupCompactTitle({ ...group, forceGenericCompactTitle: true }, 5000, t)).toBe(`${label} 3s`)
+        tool.tool.durationMs = 0
+        expect(formatToolGroupCompactTitle({ ...group, forceGenericCompactTitle: true }, 5000, t)).toBe(label)
+        expect(formatToolGroupCompactTitle(group, 5000, t)).toBe('git status; git diff')
+        tool.tool.input = { title: 'Check files; ' }
+        tool.tool.durationMs = 3000
+        expect(formatToolGroupCompactTitle(group, 5000, t)).toBe('Check files; 3s')
+    })
+})
+
 function renderCard(block: ToolGroupBlock, options?: {
     loadOlder?: () => Promise<boolean>
     hasMore?: boolean
@@ -99,6 +123,7 @@ function renderCard(block: ToolGroupBlock, options?: {
 
 describe('ToolGroupCard', () => {
     afterEach(() => {
+        vi.useRealTimers()
         cleanup()
     })
 
@@ -150,6 +175,316 @@ describe('ToolGroupCard', () => {
         fireEvent.click(toggle)
         expect(toggle).toHaveAttribute('aria-expanded', 'true')
         expect(within(view.container).getAllByText('查看本地会话')).toHaveLength(2)
+    })
+
+    it('keeps native Codex subagent cards visible below a closed processed group', () => {
+        const firstAgent = makeToolBlock('codex-agent-first', 'CodexAgent', {
+            summary: 'Explore the codebase',
+            model: 'gpt-5.3-codex',
+            reasoning_effort: 'high',
+            activity: 'Completed exploration'
+        }, {
+            createdAt: 10,
+            startedAt: 10,
+            completedAt: 11,
+        })
+        const modelFromBlockAgent: ToolCallBlock = {
+            ...makeToolBlock('codex-agent-second', 'CodexAgent', {
+                summary: 'Verify the changes',
+                reasoning_effort: 'medium',
+                agentStatus: 'completed'
+            }, {
+                createdAt: 20,
+                startedAt: 20,
+                completedAt: 21,
+            }),
+            createdAt: 20,
+            model: 'gpt-5.4'
+        }
+        const fallbackAgent = makeToolBlock('codex-agent-third', 'CodexAgent', {
+            summary: 'Report the result'
+        }, {
+            createdAt: 30,
+            startedAt: 30,
+            completedAt: 31,
+        })
+        const claudeTask = makeToolBlock('claude-task', 'Task', { description: 'Do not render as a Codex card' })
+        const claudeAgent = makeToolBlock('claude-agent', 'Agent', { description: 'Do not render as a Codex card' })
+        const view = renderCard(makeGroup({
+            tools: [fallbackAgent, claudeTask, modelFromBlockAgent, claudeAgent, firstAgent],
+            forceCompact: true,
+            forceGenericCompactTitle: true,
+        }))
+
+        const processed = within(view.container).getByRole('button', { name: 'Processed' })
+        expect(processed).toHaveAttribute('aria-expanded', 'false')
+
+        const cards = Array.from(view.container.querySelectorAll<HTMLButtonElement>('[data-codex-subagent-card]'))
+        expect(cards.map((card) => card.dataset.toolId)).toEqual([
+            'codex-agent-first',
+            'codex-agent-second',
+            'codex-agent-third'
+        ])
+        expect(view.container.querySelector('[data-tool-id="claude-task"]')).toBeNull()
+        expect(view.container.querySelector('[data-tool-id="claude-agent"]')).toBeNull()
+        expect(view.container.querySelector('[data-codex-subagent-cards]')).toHaveClass('flex', 'flex-wrap')
+        expect(cards[0]).toHaveClass('min-h-11')
+        expect(cards[0]).toHaveAttribute('aria-haspopup', 'dialog')
+        expect(cards[0]).toHaveAccessibleName(/Explore the codebase/)
+        expect(cards[0]).toHaveAccessibleName(/gpt-5\.3-codex · high/)
+        expect(cards[0]).toHaveAccessibleName(/Completed/)
+        expect(cards[0]).not.toHaveAccessibleName(/Agent:|Model:|Reasoning:|Status:/)
+
+        expect(within(cards[0]).getByText('Explore the codebase')).toBeInTheDocument()
+        expect(within(cards[0]).getByText('gpt-5.3-codex · high')).toBeInTheDocument()
+        expect(within(cards[0]).getByRole('status', { name: 'Completed' })).toHaveClass('sr-only')
+        expect(within(cards[0]).queryByText('Completed exploration')).toBeNull()
+        expect(within(cards[1]).getByText('gpt-5.4 · medium')).toBeInTheDocument()
+        expect(within(cards[2]).queryByText('unavailable')).toBeNull()
+    })
+
+    it('uses explicit, child, then parent configuration for Codex subagent cards', () => {
+        const explicitlyConfigured = makeToolBlock('explicit-agent', 'CodexAgent', {
+            summary: 'Explicit configuration',
+            model: 'gpt-explicit',
+            reasoning_effort: 'max',
+            hapiSubagentConfig: {
+                childModel: 'gpt-child',
+                childReasoningEffort: 'medium',
+                parentModel: 'gpt-parent',
+                parentReasoningEffort: 'high'
+            }
+        })
+        const childConfigured: ToolCallBlock = {
+            ...makeToolBlock('child-agent', 'CodexAgent', {
+                summary: 'Child configuration',
+                hapiSubagentConfig: {
+                    childModel: 'gpt-child',
+                    childReasoningEffort: 'medium',
+                    parentModel: 'gpt-parent',
+                    parentReasoningEffort: 'high'
+                }
+            }),
+            model: 'gpt-parent-message'
+        }
+        const inheritedConfiguration = makeToolBlock('inherited-agent', 'CodexAgent', {
+            summary: 'Inherited configuration',
+            hapiSubagentConfig: {
+                parentModel: 'gpt-parent',
+                parentReasoningEffort: 'high'
+            }
+        })
+        const view = renderCard(makeGroup({
+            tools: [explicitlyConfigured, childConfigured, inheritedConfiguration],
+            forceCompact: true,
+            forceGenericCompactTitle: true,
+        }))
+        const cards = Array.from(view.container.querySelectorAll<HTMLButtonElement>('[data-codex-subagent-card]'))
+
+        expect(cards).toHaveLength(3)
+        expect(cards[0]).toHaveTextContent('gpt-explicit · max')
+        expect(cards[0]).not.toHaveTextContent('inherited')
+        expect(cards[1]).toHaveTextContent('gpt-child · medium')
+        expect(cards[1]).not.toHaveTextContent('inherited')
+        expect(cards[2]).toHaveTextContent('gpt-parent · high')
+        expect(cards[2]).not.toHaveTextContent('inherited')
+        expect(cards[0]).toHaveClass('w-[calc((100%-0.5rem)/2)]', 'max-w-[calc((100%-0.5rem)/2)]')
+        expect(cards[0]).not.toHaveClass('flex-1')
+    })
+
+    it('shows the current agent action when its model is unavailable', () => {
+        const actionAgent = makeToolBlock('action-agent', 'CodexAgent', {
+            summary: 'Inspect the queue',
+            activity: '**Running command: bun test**'
+        }, { state: 'running' })
+        const view = renderCard(makeGroup({
+            tools: [actionAgent],
+            forceCompact: true,
+            forceGenericCompactTitle: true,
+        }))
+        const card = view.container.querySelector<HTMLElement>('[data-codex-subagent-card]')
+
+        expect(card).toHaveTextContent('Running command: bun test')
+        expect(card).not.toHaveTextContent('unavailable')
+    })
+
+    it.each([
+        [{ agent_path: '/root/execution_scout', displayName: 'Ada' }, 'execution_scout'],
+        [{ agentPath: ' /root/team/scout ', name: 'Ada' }, 'team/scout'],
+        [{ agent_path: '/other/root/scout', name: 'Ada' }, '/other/root/scout'],
+        [{ agent_path: '/root/', displayName: 'Ada' }, 'Ada'],
+        [{ agent_path: ' ', displayName: 'Ada' }, 'Ada'],
+    ])('prefers the agent path for card identities: %j', (input, expected) => {
+        const tool = makeToolBlock('path-agent', 'CodexAgent', input)
+        expect(getCodexSubagentCardIdentity(tool)).toBe(expected)
+        const view = renderCard(makeGroup({
+            tools: [tool],
+            forceCompact: true,
+            forceGenericCompactTitle: true,
+        }))
+        expect(view.container.querySelector('[data-codex-subagent-card]')).toHaveTextContent(expected)
+    })
+
+    it('uses friendly card identities, deterministic colors, and icon-only tool states', () => {
+        const named = makeToolBlock('agent-alpha', 'CodexAgent', {
+            displayName: 'Ada',
+            agentId: 'agent-id-must-not-leak',
+            model: 'gpt-5.4',
+            reasoning_effort: 'high'
+        })
+        const role = makeToolBlock('agent-beta', 'CodexAgent', {
+            agent_type: 'reviewer',
+            agentId: 'another-agent-id'
+        }, { state: 'pending' })
+        const summary = makeToolBlock('agent-gamma', 'CodexAgent', {
+            summary: 'Check the test failures'
+        }, { state: 'error' })
+        const fallback = makeToolBlock('agent-delta', 'CodexAgent', {
+            agentId: 'only-an-agent-id'
+        })
+        const spawnNickname = makeToolBlock('agent-epsilon', 'CodexAgent', {
+            message: 'Implement the parser',
+            agentId: 'result-agent-id'
+        }, {
+            result: JSON.stringify({ agent_id: 'result-agent-id', nickname: 'Raman' })
+        })
+        const disguisedId = makeToolBlock('agent-zeta', 'CodexAgent', {
+            agentId: 'unsafe-agent-id',
+            name: 'unsafe-agent-id'
+        })
+        const view = renderCard(makeGroup({
+            tools: [named, role, summary, fallback, spawnNickname, disguisedId],
+            forceCompact: true,
+            forceGenericCompactTitle: true,
+        }))
+        const cards = Array.from(view.container.querySelectorAll<HTMLButtonElement>('[data-codex-subagent-card]'))
+
+        expect(getCodexSubagentCardIdentity(named)).toBe('Ada')
+        expect(getCodexSubagentCardIdentity(role)).toBe('reviewer')
+        expect(getCodexSubagentCardIdentity(summary)).toBe('Check the test failures')
+        expect(getCodexSubagentCardIdentity(fallback)).toMatch(/^(Atlas|Nova|Orbit|Sage|Scout|Beacon|Harbor|Piper)$/)
+        expect(getCodexSubagentCardIdentity(spawnNickname)).toBe('Raman')
+        expect(getCodexSubagentCardIdentity(disguisedId)).toMatch(/^(Atlas|Nova|Orbit|Sage|Scout|Beacon|Harbor|Piper)$/)
+        expect(cards.map((card) => card.textContent)).toEqual(expect.arrayContaining([
+            expect.stringContaining('Ada'),
+            expect.stringContaining('reviewer'),
+            expect.stringContaining('Check the test failures'),
+            expect.stringContaining(getCodexSubagentCardIdentity(fallback)),
+            expect.stringContaining('Raman'),
+            expect.stringContaining(getCodexSubagentCardIdentity(disguisedId))
+        ]))
+        expect(view.container).not.toHaveTextContent('agent-id-must-not-leak')
+        expect(view.container).not.toHaveTextContent('another-agent-id')
+        expect(view.container).not.toHaveTextContent('only-an-agent-id')
+        expect(view.container).not.toHaveTextContent('result-agent-id')
+        expect(view.container).not.toHaveTextContent('unsafe-agent-id')
+
+        expect(getCodexSubagentCardColor('agent-alpha')).toBe(getCodexSubagentCardColor('agent-alpha'))
+        expect(getCodexSubagentCardColor('agent-alpha')).not.toBe(getCodexSubagentCardColor('agent-beta'))
+        const collisionColors = assignCodexSubagentCardColors(['summary-card', 'fallback-card'])
+        const reversedCollisionColors = assignCodexSubagentCardColors(['fallback-card', 'summary-card'])
+        expect(collisionColors.get('summary-card')).not.toBe(collisionColors.get('fallback-card'))
+        expect(collisionColors.get('summary-card')).toBe(reversedCollisionColors.get('summary-card'))
+        expect(collisionColors.get('fallback-card')).toBe(reversedCollisionColors.get('fallback-card'))
+        expect(cards[0]).toHaveAttribute('data-codex-subagent-color', getCodexSubagentCardColor('agent-alpha'))
+        expect(cards[1]).toHaveAttribute('data-codex-subagent-color', getCodexSubagentCardColor('agent-beta'))
+        expect(cards[0].querySelector('[data-codex-subagent-icon]')).toBeNull()
+
+        expect(cards[0]).toHaveTextContent('gpt-5.4 · high')
+        expect(cards[0]).not.toHaveTextContent('Model:')
+        expect(cards[0]).not.toHaveTextContent('Reasoning:')
+        expect(cards[1]).toHaveAttribute('data-codex-subagent-status', 'pending')
+        expect(cards[2]).toHaveAttribute('data-codex-subagent-status', 'error')
+        expect(cards[0].firstElementChild).toHaveTextContent('Ada')
+        expect(cards[0].lastElementChild).toHaveTextContent('gpt-5.4 · high')
+        expect(within(cards[1]).getByRole('status', { name: 'Waiting to run' })).toHaveClass('sr-only')
+        expect(within(cards[2]).getByRole('status', { name: 'Failed' })).toHaveClass('sr-only')
+        expect(getCodexSubagentCardState('failed')).toBe('error')
+        expect(getCodexSubagentCardState('cancelled')).toBe('error')
+        expect(getCodexSubagentCardState('not-found')).toBe('error')
+    })
+
+    it('resolves colliding palette slots across rendered Codex agent cards', () => {
+        const first = makeToolBlock('summary-card', 'CodexAgent', { summary: 'First agent' })
+        const second = makeToolBlock('fallback-card', 'CodexAgent', { summary: 'Second agent' })
+        const view = renderCard(makeGroup({
+            tools: [first, second],
+            forceCompact: true,
+            forceGenericCompactTitle: true,
+        }))
+        const cards = Array.from(view.container.querySelectorAll<HTMLButtonElement>('[data-codex-subagent-card]'))
+
+        expect(getCodexSubagentCardColor(first.id)).toBe(getCodexSubagentCardColor(second.id))
+        expect(cards[0]).toHaveAttribute('data-codex-subagent-color')
+        expect(cards[1]).toHaveAttribute('data-codex-subagent-color')
+        expect(cards[0].dataset.codexSubagentColor).not.toBe(cards[1].dataset.codexSubagentColor)
+    })
+
+    it('opens Codex subagent cards with activity first and basic information in the second tab', async () => {
+        const agent = makeToolBlock('codex-agent-detail', 'CodexAgent', {
+            summary: 'Inspect the implementation',
+            model: 'gpt-5.3-codex',
+            reasoning_effort: 'high',
+            agentStatus: 'completed',
+            agentId: 'dialog-agent-id'
+        }, {
+            createdAt: 10,
+            startedAt: 10,
+            completedAt: 11,
+            result: undefined,
+        })
+        const read = makeToolBlock('read-1', 'Read', { file_path: 'repo/src/a.ts' })
+        const view = renderCard(makeGroup({
+            tools: [agent, read],
+            detailBlocks: [agent, read],
+            forceCompact: true,
+            forceGenericCompactTitle: true,
+        }))
+
+        const card = within(view.container).getByRole('button', { name: /Inspect the implementation/i })
+        const processed = within(view.container).getByRole('button', { name: 'Processed' })
+        expect(card).not.toHaveTextContent('dialog-agent-id')
+        expect(card).not.toHaveAccessibleName(/dialog-agent-id/)
+        expect(card.innerHTML).not.toContain('dialog-agent-id')
+
+        fireEvent.click(processed)
+
+        expect(screen.getAllByText('Inspect the implementation')).toHaveLength(1)
+        expect(screen.getByText('a.ts')).toBeInTheDocument()
+
+        fireEvent.click(card)
+
+        await waitFor(() => {
+            expect(screen.getByRole('dialog')).toBeInTheDocument()
+        })
+        expect(within(screen.getByRole('dialog')).getByRole('heading', { name: 'Inspect the implementation' })).toBeInTheDocument()
+        const drawer = screen.getByRole('dialog')
+        expect(drawer).toHaveAttribute('data-chat-detail-drawer', 'true')
+        expect(within(drawer).getByRole('tab', { name: 'Activity' })).toHaveAttribute('aria-selected', 'true')
+        expect(within(drawer).queryByText('dialog-agent-id')).not.toBeInTheDocument()
+        fireEvent.click(within(drawer).getByRole('tab', { name: 'Information' }))
+        expect(within(drawer).getByText('dialog-agent-id')).toBeVisible()
+    })
+
+    it('keeps the source launch order when Codex agents share a timestamp', () => {
+        const firstAgent = makeToolBlock('z-agent', 'CodexAgent', { summary: 'First launch' }, {
+            createdAt: 10,
+            startedAt: 10,
+            completedAt: 11,
+        })
+        const secondAgent = makeToolBlock('a-agent', 'CodexAgent', { summary: 'Second launch' }, {
+            createdAt: 10,
+            startedAt: 10,
+            completedAt: 11,
+        })
+        const view = renderCard(makeGroup({
+            tools: [firstAgent, secondAgent],
+            forceCompact: true,
+            forceGenericCompactTitle: true,
+        }))
+
+        expect(Array.from(view.container.querySelectorAll<HTMLButtonElement>('[data-codex-subagent-card]'))
+            .map((card) => card.dataset.toolId)).toEqual(['z-agent', 'a-agent'])
     })
 
     it('keeps forced compact activity collapsed while a tool is running', () => {
@@ -364,7 +699,7 @@ describe('ToolGroupCard', () => {
         fireEvent.click(within(view.container).getByRole('button'))
 
         expect(within(view.container).queryByText('Failed')).not.toBeInTheDocument()
-        expect(within(view.container).getByRole('button', { name: /ls \/definitely-not-exists 1s/i })).toHaveAttribute('aria-expanded', 'true')
+        expect(within(view.container).getByRole('button', { name: /ls \/definitely-not-exists; 1s/i })).toHaveAttribute('aria-expanded', 'true')
         expect(within(view.container).queryByText('1.3s')).not.toBeInTheDocument()
         expect(within(view.container).queryByText('exit 1')).not.toBeInTheDocument()
         expect(within(view.container).queryByText('The agent did not return terminal output for this command.')).not.toBeInTheDocument()
@@ -436,14 +771,13 @@ describe('ToolGroupCard', () => {
             },
         }), { terminalToolDisplayMode: 'compact' })
 
-        const singleToggle = within(singleView.container).getByRole('button', { name: /^read file · App\.tsx · L12–80$/i })
+        const singleToggle = within(singleView.container).getByRole('button', { name: /^read App\.tsx · L12–80$/i })
         fireEvent.click(singleToggle)
 
-        expect(within(singleView.container).getByText('Read file')).toBeInTheDocument()
-        expect(within(singleView.container).getByText('App.tsx · L12–80')).toBeInTheDocument()
+        expect(within(singleView.container).getAllByText('Read App.tsx · L12–80')).toHaveLength(2)
         expect(singleView.container.querySelector('[data-tool-group-timeline]')).toHaveClass('left-0')
         const singleRow = within(singleView.container)
-            .getAllByRole('button', { name: /read file App\.tsx/i })
+            .getAllByRole('button', { name: /read App\.tsx/i })
             .find((button) => !button.hasAttribute('aria-expanded'))
         expect(singleRow).toHaveClass('-ml-[7px]', 'px-0')
 
@@ -474,12 +808,39 @@ describe('ToolGroupCard', () => {
             },
         }), { terminalToolDisplayMode: 'compact' })
 
-        const batchToggle = within(batchView.container).getByRole('button', { name: /^read a batch of files$/i })
+        const batchToggle = within(batchView.container).getByRole('button', { name: /^read a\.ts · … and 2 source files$/i })
         fireEvent.click(batchToggle)
 
-        expect(within(batchView.container).getAllByText('Read a batch of files')).toHaveLength(2)
+        expect(within(batchView.container).getAllByText('Read a.ts · … and 2 source files')).toHaveLength(2)
         expect(within(batchView.container).queryByText('web/src/a.ts')).not.toBeInTheDocument()
         expect(within(batchView.container).queryByText('web/src/b.ts · L1–20')).not.toBeInTheDocument()
+    })
+
+    it('shows the real Skill-read action instead of the orchestration wrapper or sed', () => {
+        const skillRead = makeToolBlock('skill-read', 'CodexBash', {
+            command: `const r = await tools.exec_command({
+                cmd: "sed -n '1,240p' /Users/dev/.codex/skills/agent-team/SKILL.md\\nsed -n '1,220p' /Users/dev/.codex/skills/karpathy-guidelines/SKILL.md\\nsed -n '1,220p' /Users/dev/.codex/skills/agent-team/references/team-profiles.md"
+            }); text(r.output);`
+        })
+        const view = renderCard(makeGroup({
+            id: 'tool-group:skill-read',
+            tools: [skillRead],
+            summary: {
+                totalTools: 1,
+                countsByKind: { read: 1, search: 0, command: 0, mutation: 0, web: 0, other: 0 },
+                fileTargets: [],
+                commandTargets: [],
+                searchTargets: [],
+                urlTargets: [],
+                otherTargets: [],
+                errorCount: 0,
+                runningCount: 0,
+                pendingCount: 0,
+            },
+        }), { terminalToolDisplayMode: 'compact' })
+
+        expect(within(view.container).getByRole('button', { name: /^read agent-team\/SKILL\.md · … and 3 Skill files$/i })).toBeInTheDocument()
+        expect(within(view.container).queryByText('sed -n')).not.toBeInTheDocument()
     })
 
     it('uses action-specific compact titles for single tool groups', () => {
@@ -513,7 +874,7 @@ describe('ToolGroupCard', () => {
             },
         }), { terminalToolDisplayMode: 'compact' })
 
-        expect(within(view.container).getByRole('button', { name: /bun test 2s/i })).toHaveAttribute('aria-expanded', 'false')
+        expect(within(view.container).getByRole('button', { name: /bun test; 2s/i })).toHaveAttribute('aria-expanded', 'false')
         expect(screen.queryByText('Processed 2s')).not.toBeInTheDocument()
     })
 
@@ -548,7 +909,7 @@ describe('ToolGroupCard', () => {
             },
         }), { terminalToolDisplayMode: 'compact' })
 
-        const toggle = within(view.container).getByRole('button', { name: /bun test 6s/i })
+        const toggle = within(view.container).getByRole('button', { name: /bun test; 6s/i })
         expect(toggle).toHaveAttribute('aria-expanded', 'false')
 
         fireEvent.click(toggle)
@@ -588,7 +949,7 @@ describe('ToolGroupCard', () => {
             },
         }), { terminalToolDisplayMode: 'compact' })
 
-        expect(within(view.container).getByRole('button', { name: /bun test 9s/i })).toHaveAttribute('aria-expanded', 'false')
+        expect(within(view.container).getByRole('button', { name: /bun test; 9s/i })).toHaveAttribute('aria-expanded', 'false')
     })
 
     it('uses action-specific processing titles for active single tool groups', () => {
@@ -625,10 +986,77 @@ describe('ToolGroupCard', () => {
         }), { terminalToolDisplayMode: 'compact' })
 
         const toggle = within(view.container)
-            .getAllByRole('button', { name: /bun test \d+s/i })
+            .getAllByRole('button', { name: /Running · bun test; \d+s/i })
             .find((button) => button.hasAttribute('aria-expanded'))
         expect(toggle).toHaveAttribute('aria-expanded', 'true')
-        expect(screen.queryByText(/Processing \d+s/i)).not.toBeInTheDocument()
+        expect(screen.queryByText(/Processing; \d+s/i)).not.toBeInTheDocument()
+    })
+
+    it('keeps a running terminal visible when a later process detail exists', () => {
+        const startedAt = Date.now() - 8_000
+        const terminal = makeToolBlock('bash-1', 'CodexBash', { command: 'bun test' }, {
+            state: 'running',
+            createdAt: startedAt,
+            startedAt,
+            completedAt: null,
+            result: null,
+        })
+        const view = renderCard(makeGroup({
+            createdAt: startedAt,
+            invokedAt: startedAt,
+            tools: [terminal],
+            turnActive: true,
+            forceGenericCompactTitle: true,
+            detailBlocks: [terminal, {
+                kind: 'agent-reasoning',
+                id: 'reasoning-later',
+                localId: null,
+                createdAt: startedAt + 1_000,
+                text: 'Checking results',
+            }],
+            summary: {
+                totalTools: 1,
+                countsByKind: { read: 0, search: 0, command: 1, mutation: 0, web: 0, other: 0 },
+                fileTargets: [],
+                commandTargets: ['bun test'],
+                searchTargets: [],
+                urlTargets: [],
+                otherTargets: [],
+                errorCount: 0,
+                runningCount: 1,
+                pendingCount: 0,
+            },
+        }), { terminalToolDisplayMode: 'compact' })
+
+        expect(within(view.container).getByRole('button', { name: /Running · bun test; \d+s/i }))
+            .toHaveAttribute('aria-expanded', 'true')
+        expect(screen.queryByText(/Checking results; \d+s/i)).not.toBeInTheDocument()
+    })
+
+    it('shows the latest terminal state instead of generic processing while the turn continues', () => {
+        const terminal = makeToolBlock('bash-1', 'CodexBash', { command: 'bun test' })
+        const view = renderCard(makeGroup({
+            tools: [terminal],
+            turnActive: true,
+            forceGenericCompactTitle: true,
+            detailBlocks: [],
+            summary: {
+                totalTools: 1,
+                countsByKind: { read: 0, search: 0, command: 1, mutation: 0, web: 0, other: 0 },
+                fileTargets: [],
+                commandTargets: ['bun test'],
+                searchTargets: [],
+                urlTargets: [],
+                otherTargets: [],
+                errorCount: 0,
+                runningCount: 0,
+                pendingCount: 0,
+            },
+        }), { terminalToolDisplayMode: 'compact' })
+
+        expect(within(view.container).getByRole('button', { name: /Completed · bun test/i }))
+            .toBeInTheDocument()
+        expect(screen.queryByRole('button', { name: /Processing/i })).not.toBeInTheDocument()
     })
 
     it('uses the latest active action instead of Processing for aggregated groups', () => {
@@ -671,10 +1099,61 @@ describe('ToolGroupCard', () => {
         }), { terminalToolDisplayMode: 'compact' })
 
         const toggle = within(view.container)
-            .getAllByRole('button', { name: /bun test \d+s/i })
+            .getAllByRole('button', { name: /bun test; \d+s/i })
             .find((button) => button.hasAttribute('aria-expanded'))
         expect(toggle).toHaveAttribute('aria-expanded', 'true')
-        expect(screen.queryByText(/Processing \d+s/i)).not.toBeInTheDocument()
+        expect(screen.queryByText(/Processing; \d+s/i)).not.toBeInTheDocument()
+    })
+
+    it('uses the newest reasoning action while the native turn remains active', () => {
+        const now = Date.now()
+        const tool = makeToolBlock('read-1', 'Read', { file_path: 'src/old.ts' }, {
+            createdAt: now - 8_000,
+            startedAt: now - 8_000,
+            completedAt: now - 7_000
+        })
+        const view = renderCard(makeGroup({
+            createdAt: now - 8_000,
+            invokedAt: now - 8_000,
+            tools: [tool],
+            detailBlocks: [tool, {
+                kind: 'agent-reasoning',
+                id: 'reasoning-1',
+                localId: null,
+                createdAt: now - 1_000,
+                text: '**Inspecting files**\n\n**Verifying the final result**'
+            }],
+            forceGenericCompactTitle: true,
+            forceCompact: true,
+            showAgentIcon: true,
+            turnActive: true,
+            summary: {
+                totalTools: 1,
+                countsByKind: {
+                    read: 1,
+                    search: 0,
+                    command: 0,
+                    mutation: 0,
+                    web: 0,
+                    other: 0
+                },
+                fileTargets: ['src/old.ts'],
+                commandTargets: [],
+                searchTargets: [],
+                urlTargets: [],
+                otherTargets: [],
+                errorCount: 0,
+                runningCount: 0,
+                pendingCount: 0
+            }
+        }), { terminalToolDisplayMode: 'compact' })
+
+        const toggle = within(view.container)
+            .getAllByRole('button', { name: /Verifying the final result; \d+s/i })
+            .find((button) => button.hasAttribute('aria-expanded'))
+        expect(toggle).toHaveAttribute('aria-expanded', 'false')
+        expect(toggle?.querySelector('.motion-safe\\:animate-pulse')).not.toBeNull()
+        expect(screen.queryByText(/Processing; \d+s/i)).not.toBeInTheDocument()
     })
 
     it('treats running tools as active even when summary counts are stale', () => {
@@ -711,10 +1190,10 @@ describe('ToolGroupCard', () => {
         }), { terminalToolDisplayMode: 'compact' })
 
         const toggle = within(view.container)
-            .getAllByRole('button', { name: /bun test \d+s/i })
+            .getAllByRole('button', { name: /bun test; \d+s/i })
             .find((button) => button.hasAttribute('aria-expanded'))
         expect(toggle).toHaveAttribute('aria-expanded', 'true')
-        expect(screen.queryByText(/Processing \d+s/i)).not.toBeInTheDocument()
+        expect(screen.queryByText(/Processing; \d+s/i)).not.toBeInTheDocument()
     })
 
     it('uses the raw command when a mutation has no parsed file target', () => {
@@ -809,8 +1288,8 @@ describe('ToolGroupCard', () => {
         fireEvent.click(mutationRow!)
 
         const dialog = screen.getByRole('dialog')
-        expect(dialog).toHaveAttribute('data-file-mutation-dialog', 'true')
-        expect(dialog).toHaveClass('left-1/2', 'top-1/2', 'h-[60dvh]', 'rounded-xl')
+        expect(dialog).toHaveAttribute('data-chat-detail-drawer', 'true')
+        expect(dialog).toHaveClass('question-drawer', 'inset-x-0', 'rounded-t-[28px]')
         expect(dialog).not.toHaveClass('inset-0', 'h-[100dvh]', 'w-screen', 'rounded-none')
         expect(within(dialog).getByRole('button', { name: 'Close' })).toBeInTheDocument()
     })
@@ -856,7 +1335,7 @@ describe('ToolGroupCard', () => {
 
         const toggle = within(view.container).getByRole('button', { name: /processed 2s/i })
         expect(toggle).toHaveAttribute('aria-expanded', 'false')
-        expect(screen.queryByText('Ran 2s')).not.toBeInTheDocument()
+        expect(screen.queryByText('Ran; 2s')).not.toBeInTheDocument()
 
         fireEvent.click(toggle)
 
@@ -904,7 +1383,7 @@ describe('ToolGroupCard', () => {
             },
         }), { terminalToolDisplayMode: 'compact' })
 
-        expect(within(view.container).getByRole('button', { name: /used imagegen 2s/i })).toBeInTheDocument()
+        expect(within(view.container).getByRole('button', { name: /used imagegen; 2s/i })).toBeInTheDocument()
         expect(screen.queryByText(/Processed 2s/i)).not.toBeInTheDocument()
     })
 
@@ -1009,16 +1488,17 @@ describe('ToolGroupCard', () => {
         expect(screen.queryByText('bun test')).not.toBeInTheDocument()
     })
 
-    it('keeps an auto-open compact group open until an explicit turn completion', async () => {
+    it('keeps the latest Process open across a missing terminal update until the session becomes idle', async () => {
+        vi.useFakeTimers()
         const startedAt = Date.now() - 10_000
 
-        function makeActiveGroup(active: boolean): ToolGroupBlock {
+        function makeActiveGroup(toolActive: boolean, runActive: boolean): ToolGroupBlock {
             const tools = [
                 makeToolBlock('bash-1', 'Bash', { command: 'bun test' }, {
-                    state: active ? 'running' : 'completed',
+                    state: toolActive ? 'running' : 'completed',
                     createdAt: startedAt,
                     startedAt,
-                    completedAt: active ? null : startedAt + 10_000,
+                    completedAt: toolActive ? null : startedAt + 10_000,
                 }),
                 makeToolBlock('read-1', 'Read', { file_path: 'repo/src/a.ts' }, {
                     createdAt: startedAt + 1000,
@@ -1028,6 +1508,7 @@ describe('ToolGroupCard', () => {
             ]
             return makeGroup({
                 tools,
+                defaultOpen: runActive,
                 summary: {
                     totalTools: tools.length,
                     countsByKind: {
@@ -1044,14 +1525,21 @@ describe('ToolGroupCard', () => {
                     urlTargets: [],
                     otherTargets: [],
                     errorCount: 0,
-                    runningCount: active ? 1 : 0,
+                    runningCount: toolActive ? 1 : 0,
                     pendingCount: 0,
                 },
             })
         }
 
         function Harness() {
-            const [active, setActive] = useState(true)
+            const [toolActive, setToolActive] = useState(true)
+            const [runActive, setRunActive] = useState(true)
+            const [expansionStates, setExpansionStates] = useState<ToolGroupExpansionStates>({})
+            const setToolGroupExpansionState = useCallback((key: string, state: ToolGroupExpansionState) => {
+                setExpansionStates((current) => current[key] === state
+                    ? current
+                    : { ...current, [key]: state })
+            }, [])
             return (
                 <I18nProvider>
                     <HappyChatProvider value={{
@@ -1064,9 +1552,13 @@ describe('ToolGroupCard', () => {
                         hasMoreMessages: false,
                         isLoadingMoreMessages: false,
                         loadOlderMessagesPreservingScroll: vi.fn(async () => false),
+                        toolGroupExpansionStates: expansionStates,
+                        setToolGroupExpansionState,
+                        toolGroupRunActive: runActive,
                     }}>
-                        <button type="button" onClick={() => setActive(false)}>finish</button>
-                        <ToolGroupCard block={makeActiveGroup(active)} metadata={{ path: 'repo', host: 'local' }} />
+                        <button type="button" onClick={() => setToolActive(false)}>lose terminal update</button>
+                        <button type="button" onClick={() => setRunActive(false)}>finish session</button>
+                        <ToolGroupCard block={makeActiveGroup(toolActive, runActive)} metadata={{ path: 'repo', host: 'local' }} />
                     </HappyChatProvider>
                 </I18nProvider>
             )
@@ -1076,16 +1568,94 @@ describe('ToolGroupCard', () => {
         let toggle = within(view.container)
             .getAllByRole('button', { name: /bun test/i })
             .find((button) => button.hasAttribute('aria-expanded'))!
+        expect(toggle).toHaveAttribute('aria-expanded', 'false')
+        expect(screen.queryByText('bun test')).not.toBeInTheDocument()
+
+        act(() => vi.advanceTimersByTime(2_999))
+        expect(toggle).toHaveAttribute('aria-expanded', 'false')
+
+        act(() => vi.advanceTimersByTime(1))
+        toggle = within(view.container)
+            .getAllByRole('button', { name: /bun test/i })
+            .find((button) => button.hasAttribute('aria-expanded'))!
         expect(toggle).toHaveAttribute('aria-expanded', 'true')
         expect(screen.getByText('bun test')).toBeInTheDocument()
 
-        fireEvent.click(screen.getByRole('button', { name: 'finish' }))
+        fireEvent.click(screen.getByRole('button', { name: 'lose terminal update' }))
 
-        await waitFor(() => {
-            toggle = within(view.container).getByRole('button', { name: /processed/i })
-            expect(toggle).toHaveAttribute('aria-expanded', 'true')
-        })
+        toggle = within(view.container).getByRole('button', { name: /processing/i })
+        expect(toggle).toHaveAttribute('aria-expanded', 'true')
         expect(screen.getByText('bun test')).toBeInTheDocument()
+
+        fireEvent.click(screen.getByRole('button', { name: 'finish session' }))
+
+        toggle = within(view.container).getByRole('button', { name: /processed/i })
+        expect(toggle).toHaveAttribute('aria-expanded', 'false')
+        expect(screen.queryByText('bun test')).not.toBeInTheDocument()
+    })
+
+    it('shows a compact terminal command immediately while it is running', () => {
+        const startedAt = Date.now()
+
+        function Harness() {
+            const [active, setActive] = useState(true)
+            const [expansionStates, setExpansionStates] = useState<ToolGroupExpansionStates>({})
+            const tool = makeToolBlock('quick-command', 'Bash', { command: 'pwd' }, {
+                state: active ? 'running' : 'completed',
+                createdAt: startedAt,
+                startedAt,
+                completedAt: active ? null : startedAt + 500,
+            })
+            const block = makeGroup({
+                id: 'tool-group:quick-command',
+                tools: [tool],
+                defaultOpen: active,
+                forceCompact: true,
+                forceGenericCompactTitle: true,
+                summary: {
+                    ...makeGroup().summary,
+                    totalTools: 1,
+                    runningCount: active ? 1 : 0,
+                    commandTargets: ['pwd'],
+                },
+            })
+            return (
+                <I18nProvider>
+                    <HappyChatProvider value={{
+                        api: {} as never,
+                        sessionId: 'session-1',
+                        metadata: { path: 'repo', host: 'local' },
+                        terminalToolDisplayMode: 'compact',
+                        disabled: false,
+                        onRefresh: vi.fn(),
+                        hasMoreMessages: false,
+                        isLoadingMoreMessages: false,
+                        loadOlderMessagesPreservingScroll: vi.fn(async () => false),
+                        toolGroupExpansionStates: expansionStates,
+                        setToolGroupExpansionState: (key, state) => {
+                            setExpansionStates((current) => ({ ...current, [key]: state }))
+                        },
+                    }}>
+                        <button type="button" onClick={() => setActive(false)}>finish quick</button>
+                        <ToolGroupCard block={block} metadata={{ path: 'repo', host: 'local' }} />
+                    </HappyChatProvider>
+                </I18nProvider>
+            )
+        }
+
+        const view = render(<Harness />)
+        let toggle = within(view.container)
+            .getAllByRole('button', { name: /Running · pwd/i })
+            .find((button) => button.hasAttribute('aria-expanded'))!
+        expect(toggle).toHaveAttribute('aria-expanded', 'true')
+        expect(screen.getByText('pwd')).toBeInTheDocument()
+        expect(view.container.querySelector('svg.animate-spin')).not.toBeNull()
+
+        fireEvent.click(screen.getByRole('button', { name: 'finish quick' }))
+
+        toggle = within(view.container).getByRole('button', { name: /processed/i })
+        expect(toggle).toHaveAttribute('aria-expanded', 'false')
+        expect(screen.queryByText('pwd')).not.toBeInTheDocument()
     })
 
     it('auto-loads older history after expand when the group is incomplete', async () => {

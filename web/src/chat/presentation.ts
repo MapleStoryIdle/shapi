@@ -1,4 +1,5 @@
 import type { AgentEvent } from '@/chat/types'
+import { isCodexAuthenticationError, isHttpForbiddenError } from '@hapi/protocol'
 
 function normalizeTimestamp(value: number): Date {
     const ms = value < 1_000_000_000_000 ? value * 1000 : value
@@ -92,13 +93,59 @@ function formatTaskStatusAttempt(event: AgentEvent): string {
     return retryAttempt !== null && maxRetries !== null ? ` ${retryAttempt}/${maxRetries}` : ''
 }
 
+const NETWORK_TASK_FAILURE_PATTERNS = [
+    'network error',
+    'network request failed',
+    'failed to fetch',
+    'fetch failed',
+    'error sending request',
+    'stream disconnected before completion',
+    'connection reset',
+    'connection refused',
+    'connection timed out',
+    'connection timeout',
+    'network is unreachable',
+    'network unreachable',
+    'socket hang up',
+    'could not resolve host',
+    'dns error',
+    'econnreset',
+    'econnrefused',
+    'etimedout',
+    'enotfound',
+    'eai_again'
+]
+
+/** Recognize HTTP 403 even when an older runner classified it as unknown. */
+export function isForbiddenTaskStatus(event: AgentEvent): boolean {
+    return event.type === 'task-status'
+        && (event.code === 'http_forbidden' || isHttpForbiddenError(event.message))
+}
+
+/** Keeps older runners' unclassified network errors understandable in the UI. */
+export function isNetworkTaskStatus(event: AgentEvent): boolean {
+    if (event.type !== 'task-status') return false
+    if (event.code === 'network_error') return true
+    const message = typeof event.message === 'string' ? event.message.toLowerCase() : ''
+    return NETWORK_TASK_FAILURE_PATTERNS.some((pattern) => message.includes(pattern))
+}
+
+export function isAuthenticationTaskStatus(event: AgentEvent): boolean {
+    return event.type === 'task-status'
+        && (event.code === 'authentication' || isCodexAuthenticationError(event.message))
+}
+
 function formatTaskStatusEvent(event: AgentEvent): EventPresentation {
     const record = event as Record<string, unknown>
     const status = typeof record.status === 'string' ? record.status : 'failed'
     const code = typeof record.code === 'string' ? record.code : 'unknown'
     const attempt = formatTaskStatusAttempt(event)
+    const isNetworkFailure = isNetworkTaskStatus(event)
 
     if (status === 'retrying') {
+        if (isNetworkFailure) {
+            return { icon: '↻', text: `Network connection issue; retrying${attempt}` }
+        }
         return { icon: '↻', text: `Codex task failed; retrying${attempt}` }
     }
     if (status === 'compacting') {
@@ -106,6 +153,12 @@ function formatTaskStatusEvent(event: AgentEvent): EventPresentation {
     }
     if (status === 'compacted') {
         return { icon: '↻', text: 'Context compacted; retrying' }
+    }
+    if (isForbiddenTaskStatus(event)) {
+        return { icon: '⚠️', text: 'Request denied (HTTP 403)' }
+    }
+    if (isAuthenticationTaskStatus(event)) {
+        return { icon: '⚠️', text: 'Codex sign-in required' }
     }
     if (code === 'usage_limit') {
         const resetAtText = typeof record.resetAtText === 'string' ? record.resetAtText : ''
@@ -119,6 +172,9 @@ function formatTaskStatusEvent(event: AgentEvent): EventPresentation {
     }
     if (code === 'context_window') {
         return { icon: '⚠️', text: 'Codex task failed: context window is too large' }
+    }
+    if (isNetworkFailure) {
+        return { icon: '⚠️', text: 'Network connection issue' }
     }
     return { icon: '⚠️', text: 'Codex task failed' }
 }

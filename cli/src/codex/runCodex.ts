@@ -14,11 +14,13 @@ import { isPermissionModeAllowedForFlavor } from '@hapi/protocol';
 import { RPC_METHODS } from '@hapi/protocol/rpcMethods';
 import { CodexCollaborationModeSchema, PermissionModeSchema } from '@hapi/protocol/schemas';
 import { formatMessageWithAttachments } from '@/utils/attachmentFormatter';
+import { createManagedSkillInvocationExpander } from '@/managedSkills';
 import { getInvokedCwd } from '@/utils/invokedCwd';
 import type { ReasoningEffort } from './appServerTypes';
 import { parseCodexSpecialCommand } from './codexSpecialCommands';
 import { listSlashCommands } from '@/modules/common/slashCommands';
 import { resolveCodexSlashCommand } from './utils/slashCommands';
+import { configureNonInteractiveTerminalColors } from '@/agent/terminalColorEnv';
 
 export { emitReadyIfIdle } from './utils/emitReadyIfIdle';
 
@@ -35,10 +37,12 @@ export async function runCodex(opts: {
     serviceTier?: string;
     collaborationMode?: EnhancedMode['collaborationMode'];
     existingSessionId?: string;
+    recoveryRequestId?: string;
     workingDirectory?: string;
 }): Promise<void> {
     const workingDirectory = opts.workingDirectory ?? getInvokedCwd();
     const startedBy = opts.startedBy ?? 'terminal';
+    if (startedBy === 'runner') configureNonInteractiveTerminalColors();
 
     logger.debug(`[codex] Starting with options: startedBy=${startedBy}`);
 
@@ -73,6 +77,7 @@ export async function runCodex(opts: {
         collaborationMode: mode.collaborationMode,
         serviceTier: mode.serviceTier
     }));
+    const expandManagedSkill = createManagedSkillInvocationExpander();
 
     const codexCliOverrides = parseCodexCliOverrides(opts.codexArgs);
     const sessionWrapperRef: { current: CodexSession | null } = { current: null };
@@ -95,12 +100,25 @@ export async function runCodex(opts: {
     const lifecycle = createRunnerLifecycle({
         session,
         logTag: 'codex',
-        stopKeepAlive: () => sessionWrapperRef.current?.stopKeepAlive()
+        stopKeepAlive: () => sessionWrapperRef.current?.stopKeepAlive(),
+        onBeforeClose: () => sessionWrapperRef.current?.cleanupActiveTransport()
     });
 
     lifecycle.registerProcessHandlers();
     registerKillSessionHandler(session.rpcHandlerManager, lifecycle);
-    registerLocalHandoffHandler(session.rpcHandlerManager, lifecycle);
+    registerLocalHandoffHandler(session.rpcHandlerManager, lifecycle, {
+        // Hub checks the durable queue and session state first. Recheck the
+        // authoritative in-process Codex state immediately before teardown:
+        // a message may already have crossed the socket boundary but not yet
+        // be reflected in Hub state.
+        canReleaseControl: () => {
+            const codex = sessionWrapperRef.current;
+            if (!codex) return 'Codex is still starting; wait until it is ready before releasing control';
+            if (codex.thinking) return 'Codex is processing; wait for the current turn to finish';
+            if (messageQueue.queue.length > 0) return 'Codex has queued messages; send or cancel them before releasing control';
+            return null;
+        }
+    });
 
     const applyCurrentConfigToSession = (options?: { syncModel?: boolean }) => {
         const sessionInstance = sessionWrapperRef.current;
@@ -234,7 +252,7 @@ export async function runCodex(opts: {
                         isolatedCommandText = message.content.text.trim();
                     }
                 }
-                text = formatMessageWithAttachments(text, message.content.attachments);
+                text = formatMessageWithAttachments(expandManagedSkill(text), message.content.attachments);
 
                 const messagePermissionMode = currentPermissionMode;
                 logger.debug(
@@ -264,7 +282,7 @@ export async function runCodex(opts: {
                     collaborationMode: currentCollaborationMode,
                     serviceTier: currentServiceTier
                 };
-                const fallbackText = formatMessageWithAttachments(message.content.text, message.content.attachments);
+                const fallbackText = formatMessageWithAttachments(expandManagedSkill(message.content.text), message.content.attachments);
                 messageQueue.push(fallbackText, enhancedMode, localId);
             }
         }).catch((error) => {
@@ -415,6 +433,7 @@ export async function runCodex(opts: {
             resumeSessionId: opts.resumeSessionId,
             forkSessionId: opts.forkSessionId,
             replayTranscriptHistoryOnStart,
+            recoveryRequestId: opts.recoveryRequestId,
             onModeChange: createModeChangeHandler(session),
             onSessionReady: (instance) => {
                 sessionWrapperRef.current = instance;

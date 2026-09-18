@@ -15,10 +15,10 @@ Run Claude Code, Codex, Cursor Agent, Gemini, or OpenCode sessions from your ter
 
 ## Typical flow
 
-1. Start the hub and set env vars (see ../hub/README.md).
-2. Set the same CLI_API_TOKEN on this machine or run `shapi auth login`.
-3. Run `shapi` to start a session.
-4. Use the web app or Telegram Mini App to monitor and control.
+1. Start the Hub with workspace registration enabled (see `../hub/README.md`).
+2. Run the Hub's `install.sh`; choose a new workspace or join one with an existing `spw...` credential.
+3. The installer pairs this machine, starts the Runner, and prints the Hub URL plus `spw...`.
+4. Sign in to Hub Web with `spw...`; run `shapi` locally or start sessions remotely.
 
 ## Commands
 
@@ -39,7 +39,7 @@ subcommand with `--hapi-help-json`) to receive the stable JSON capability catalo
 - `shapi opencode` - Start OpenCode mode via ACP. See `src/opencode/runOpencode.ts`.
   Note: OpenCode supports local and remote modes; local mode streams via OpenCode plugins.
 - `shapi resume [sessionId]` - List resumable sessions for this machine or resume one locally.
-- `shapi inspect-peer <session-id-or-prefix>` - Read another same-namespace SHAPI session's metadata and recent text; never resumes it.
+- `shapi inspect-peer <session-id-or-prefix>` - Read another same-workspace SHAPI session's metadata and recent text; never resumes it.
 - `shapi ping-peer <session-id-or-prefix> <message>` - Resume a peer session when needed, then deliver a handoff/nudge message. It refuses to message the calling SHAPI session itself; use `shapi ping-peer --list` for discovery.
 
 ### Resume a remote session locally
@@ -53,15 +53,21 @@ shapi resume <session-id>
 
 ### Authentication
 
-- `shapi auth status` - Show authentication configuration and token source.
-- `shapi auth login` - Interactively enter and save CLI_API_TOKEN.
-- `shapi auth logout` - Clear saved credentials.
+- `shapi runner pair --hub <url> [--name <name>] [--web-token-file <path>]` - Generate this Runner's `spr...` credential and P-256 key, then request workspace approval.
+- `shapi workspace register [--name <name>] --hub <url> [--registration-secret <secret>]` - Create a workspace and print its `spw...` Web credential.
+- `shapi auth status|login|logout` - Legacy shared-token compatibility only; do not use for new workspace installs.
 
-See `src/commands/auth.ts`.
+The CLI stores each Runner credential under `$HAPI_HOME/credentials-v2/runner-<hub-sha256>.json` with private-file permissions. It does not persist the workspace's `spw...` credential. The Runner exchanges `spr...` plus a DPoP proof for short-lived Hub access tokens.
+
+See `src/authV2/`, `src/commands/runner.ts`, and `src/commands/workspace.ts`.
 
 ### Runner management
 
 - `shapi runner start` - Start runner as detached process.
+- `shapi runner pair --hub <url> [--name <name>]` - Pair this machine with an existing Web workspace.
+- `shapi workspace register [--name <name>] --hub <url> [--registration-secret <secret>]` - Create an isolated workspace and print its one-time Web credential. The name defaults to the system username. Open-registration Hubs need no secret.
+- `shapi uninstall` - Stop the Runner and remove the program/runtime files while preserving credentials.
+- `shapi uninstall --purge` - Also remove all local SHAPI settings and credentials.
 - `shapi runner stop` - Stop runner gracefully.
 - `shapi runner status` - Show runner diagnostics.
 - `shapi runner list` - List active sessions managed by runner.
@@ -92,20 +98,35 @@ See `src/ui/doctor.ts`.
 - `shapi share publish <relative-file> [--expires <seconds>] [--session <session-id>] [--feedback] [--feedback-request <text>]` - Create an expiring public link / 中文看板任务 for one local file (5 minutes–7 days; default 24h). `--session` binds the task to its source SHAPI session; when run inside a managed SHAPI agent session, that source is filled in automatically. `--feedback` is Markdown-only and embeds a one-time, 10 MiB feedback contract in the public document; the external Agent must self-report its model and environment in the returned Markdown.
 - `shapi share revoke <share-id>` - Revoke a public link. Public links are bearer links; redact `/s/*` paths in reverse-proxy logs.
 
+The Hub exposes SHAPI-managed Skills such as `public-share`, `agent-team`, and `git-merge-current-to-target`. A managed Skill is a standard bundle with `SKILL.md` and optional `agents/`, `assets/`, `references/`, and `scripts/` directories. On first use the Hub sends the enabled bundle to the selected Runner, which caches it under `$HAPI_HOME/managed-skills`; Agent skill directories are never modified. Later uses compare the Runner-reported version and SHA-256 with the Hub catalog and refresh only when they differ.
+
+Hub operators can publish and roll back public Skill bundles directly against the running Hub database:
+
+```bash
+shapi hub skills publish ./my-skill
+shapi hub skills list [skill-id]
+shapi hub skills activate <skill-id> <version>
+```
+
+Publishing is immutable per `id@version`, activates the new version immediately, and does not require a Hub or Runner restart. Every new version must use a new semantic version in `hapi.json`.
+
+`shapi hub skills` is server-local and only manages public Skills shared by every workspace. The Hub database and its parent directory are owner-only, so remote workspace users cannot use this command. An authenticated workspace can publish a personal package through `POST /api/managed-skills/personal`; it is visible only in that workspace. A personal package with the same ID overrides the public package for that workspace only.
+
 The legacy `hapi` command remains supported as an alias; `hapi server` remains an alias for `shapi hub`.
 
 ## Configuration
 
 See `src/configuration.ts` for all options.
 
-### Required
+### Core
 
-- `CLI_API_TOKEN` - Shared secret; must match the hub. Can be set via env or `~/.hapi/settings.json` (env wins).
-- `HAPI_API_URL` - Hub base URL (default: http://localhost:3006).
+- `HAPI_API_URL` - Hub base URL (default: `http://localhost:3006`). Pairing saves the selected Hub URL.
+- `HAPI_HOME` - Config/data directory (default: `~/.hapi`).
+
+New installs need no manually shared environment token. `CLI_API_TOKEN` remains the internal credential slot and legacy override: a paired Runner loads its `spr...` credential; old installations may still provide a shared Hub token through the environment or settings file.
 
 ### Optional
 
-- `HAPI_HOME` - Config/data directory (default: ~/.hapi).
 - `HAPI_EXPERIMENTAL` - Enable experimental features (true/1/yes).
 - `HAPI_EXTRA_HEADERS_JSON` - JSON object of extra headers to send on CLI → hub requests, e.g. `{"Cookie":"CF_Authorization=..."}`.
 - `HAPI_CLAUDE_PATH` - Path to a specific `claude` executable.
@@ -115,6 +136,30 @@ See `src/configuration.ts` for all options.
 - `HAPI_OPENVIKING_API_KEY` (or `HAPI_OPENVIKING_BEARER_TOKEN`), `HAPI_OPENVIKING_ACCOUNT`, `HAPI_OPENVIKING_USER` - Optional OpenViking credentials for the read-only Context page. When omitted, the runner uses matching values from `~/.openviking/ovcli.conf`.
 
 The recent Codex transcript API is runner-scoped: the selected runner reads its own `CODEX_HOME` through Hub RPC, so a remote Hub never needs access to your local transcript files.
+
+Native sessions can be renamed from the session header menu, using the same
+dialog as managed sessions. The runner calls Codex's `thread/name/set` metadata
+API without resuming or interrupting the thread. Names are stored by Codex and
+refreshed in SHAPI's list and detail views; older Codex versions without this
+API return an error and keep the existing name.
+
+Native Codex controls use the same composer as managed sessions. A runner-owned app-server turn can be stopped without killing Codex; an existing Desktop SSH control socket can interrupt only the exact currently running turn. Non-SSH external owners, exec-resume turns, and pending Desktop queue hand-offs do not expose a stop button. Interrupt acknowledgement is not completion: SHAPI waits for the matching terminal event before allowing its paused queue to resume.
+
+Native input questions are not automatically canceled by the direct-send bridge.
+Its pending question is returned in session status and answered through the
+authenticated control endpoint with exact turn/item IDs. Closing the Web drawer
+does not answer the question; refreshing can reopen it while its Runner connection
+remains alive. A stopped/disconnected bridge cannot accept old answers.
+Shared Desktop observers ignore unrelated server requests. For an exact SHAPI
+queue receipt, the runner keeps the shared socket alive, correlates its client
+message and turn IDs, and can expose that turn's synchronous question in Web.
+Desktop and Web may both answer it; Codex's first resolution wins.
+Desktop `request_user_input_async` forms can be recovered from loaded transcript
+history. Their `accepted` tool result is not a user answer: Web sends an explicit
+selection as an idempotent, structured user-message reply (queued when busy), not
+as a permission approval. This does not recreate or control Desktop's own dialog.
+
+Model, reasoning effort and supported Standard/Fast settings apply to new SHAPI messages. Already queued messages keep their saved settings. Preferences and queue pauses are stored in the runner's `native-codex-controls.json`; Codex global configuration is not changed. Codex may retain the model/effort in the thread's own configuration. Desktop's shared queue cannot accept per-message settings, so its model controls stay read-only; configured messages wait instead of silently losing their settings. Stopping pauses SHAPI's queue until the user explicitly resumes delivery.
 
 ### Runner
 
@@ -133,9 +178,12 @@ The recent Codex transcript API is runner-scoped: the selected runner reads its 
 
 Data is stored in `~/.hapi/` (or `$HAPI_HOME`):
 
-- `settings.json` - User settings (machineId, token, onboarding flag). See `src/persistence.ts`.
+- `settings.json` - Machine ID, selected Hub, compatibility settings. See `src/persistence.ts`.
+- `credentials-v2/runner-<hub-sha256>.json` - Per-Hub `spr...`, P-256 key pair, workspace binding; mode `0600`.
 - `runner.state.json` - Runner state (pid, port, version, heartbeat).
 - `logs/` - Log files.
+
+`spw...` is intentionally not stored by the CLI. Keep it in a password manager; Hub Web stores an HttpOnly session cookie after login.
 
 ## Requirements
 
@@ -159,9 +207,22 @@ For an all-in-one binary that also embeds the web app:
 bun run build:single-exe
 ```
 
+### Runner-only release
+
+Runner releases use the independent version in `runner-version.json` and GitHub Release tags named `runner-v*`:
+
+```bash
+# Only when Runner behavior/runtime changes
+bun run build:runner-downloads
+scripts/deploy/publish-runner-downloads.sh <ssh-host>
+```
+
+Hub/Web-only changes must not bump `runner-version.json` or publish Runner binaries. Runner updates are manual: rerun the Hub's `install.sh`; the script downloads, replaces, and restarts the Runner.
+
 ## Source structure
 
 - `src/api/` - Bot communication (Socket.IO + REST).
+- `src/authV2/` - Runner credentials, pairing, and DPoP authentication.
 - `src/claude/` - Claude Code integration.
 - `src/codex/` - Codex mode integration.
 - `src/cursor/` - Cursor Agent integration.

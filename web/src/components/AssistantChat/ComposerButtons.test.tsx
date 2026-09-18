@@ -325,6 +325,14 @@ describe('getComposerOptionalControlsVisibility', () => {
             permission: true,
             skill: true
         })
+        expect(getComposerOptionalControlsVisibility(305, 160, 0, true, true)).toEqual({
+            permission: true,
+            skill: false
+        })
+        expect(getComposerOptionalControlsVisibility(306, 160, 0, true, true)).toEqual({
+            permission: true,
+            skill: true
+        })
     })
 
     /**
@@ -419,8 +427,12 @@ describe('ComposerButtons — permission mode button', () => {
         expect(screen.getByText('Full Access')).toBeInTheDocument()
         expect(screen.getByText('Full computer access (higher risk)')).toBeInTheDocument()
         const defaultRow = screen.getByText('Request Approval').closest('button')
+        const readOnlyRow = screen.getByText('Read Only').closest('button')
         const safeYoloRow = screen.getByText('Approve For Me').closest('button')
         const fullAccessRow = screen.getByText('Full Access').closest('button')
+        expect(readOnlyRow?.querySelector('.lucide-eye')).toBeInTheDocument()
+        expect(defaultRow?.querySelector('.lucide-eye')).not.toBeInTheDocument()
+        expect(readOnlyRow!.compareDocumentPosition(defaultRow!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
         expect(defaultRow?.querySelector('span')?.className).toContain('text-black/55')
         expect(safeYoloRow?.querySelector('span')?.className).not.toContain('text-orange-500')
         expect(safeYoloRow?.querySelector('span')?.className).toContain('text-blue-500')
@@ -626,7 +638,7 @@ describe('ComposerButtons — skill picker', () => {
         document.documentElement.removeAttribute('data-app-keyboard-open')
     })
 
-    it('groups skills by scope without tab or count badges', () => {
+    it('puts Hub below Project and keeps scope groups collapsed with counts', () => {
         renderInProviders(
             <ComposerButtons
                 canSend={false}
@@ -636,6 +648,7 @@ describe('ComposerButtons — skill picker', () => {
                 skills={[
                     { name: 'plugin-beta', description: 'Plugin skill', scope: 'plugin' },
                     { name: 'project-bravo', description: 'Project skill', scope: 'project' },
+                    { name: 'public-share', description: 'Hub skill', scope: 'hub' },
                     { name: 'system-delta', description: 'System skill', scope: 'system' },
                     { name: 'global-alpha', description: 'Global skill', scope: 'user' },
                 ]}
@@ -661,16 +674,30 @@ describe('ComposerButtons — skill picker', () => {
 
         fireEvent.click(screen.getByRole('button', { name: 'Skills' }))
 
-        const projectSkill = screen.getByText('project-bravo')
-        const globalSkill = screen.getByText('global-alpha')
-        const pluginSkill = screen.getByText('plugin-beta')
-        const systemSkill = screen.getByText('system-delta')
-        expect(projectSkill.compareDocumentPosition(globalSkill) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
-        expect(globalSkill.compareDocumentPosition(pluginSkill) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
-        expect(pluginSkill.compareDocumentPosition(systemSkill) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
-        expect(screen.queryByRole('button', { name: /Custom\s+\d/ })).not.toBeInTheDocument()
-        expect(screen.queryByRole('button', { name: /Other\s+\d/ })).not.toBeInTheDocument()
-        expect(screen.queryByText('4')).not.toBeInTheDocument()
+        const hubSection = screen.getByTestId('composer-skill-section-hub')
+        const projectSection = screen.getByTestId('composer-skill-section-project')
+        expect(screen.getByTestId('composer-skill-total')).toHaveTextContent('5')
+        expect(screen.queryByPlaceholderText('Search skills')).not.toBeInTheDocument()
+        expect(hubSection).toHaveAttribute('aria-expanded', 'false')
+        expect(hubSection).toHaveTextContent('Hub')
+        expect(hubSection).toHaveTextContent('1')
+        expect(projectSection.compareDocumentPosition(hubSection) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+        expect(screen.queryByText('Public Share')).not.toBeInTheDocument()
+
+        fireEvent.click(hubSection)
+        const hubSkill = screen.getByText('Public Share')
+        expect(hubSection.compareDocumentPosition(hubSkill) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+
+        for (const section of ['project', 'user', 'plugin', 'system']) {
+            const button = screen.getByTestId(`composer-skill-section-${section}`)
+            expect(button).toHaveAttribute('aria-expanded', 'false')
+            expect(button).toHaveTextContent('1')
+        }
+        expect(screen.queryByText('project-bravo')).not.toBeInTheDocument()
+        expect(screen.queryByText('global-alpha')).not.toBeInTheDocument()
+
+        fireEvent.click(screen.getByTestId('composer-skill-section-project'))
+        expect(screen.getByText('project-bravo')).toBeInTheDocument()
     })
 
     it('shows the last deliberately clicked skills for the current project only', () => {
@@ -705,11 +732,14 @@ describe('ComposerButtons — skill picker', () => {
 
         const view = renderInProviders(<ComposerButtons {...props} projectPath="/work/alpha" />)
         fireEvent.click(screen.getByRole('button', { name: 'Skills' }))
+        fireEvent.click(screen.getByTestId('composer-skill-section-project'))
         fireEvent.click(screen.getByText('second'))
         fireEvent.click(screen.getByRole('button', { name: 'Skills' }))
 
         const recent = screen.getByTestId('composer-recent-skills')
         expect(within(recent).getByText('Recent')).toBeInTheDocument()
+        expect(screen.getByTestId('composer-skill-section-recent')).toHaveAttribute('aria-expanded', 'true')
+        expect(screen.getByTestId('composer-skill-section-recent')).toHaveTextContent('1')
         expect(within(recent).getByText('second')).toBeInTheDocument()
 
         view.rerender(
@@ -753,9 +783,58 @@ describe('ComposerButtons — skill picker', () => {
         fireEvent.click(screen.getByRole('button', { name: 'Skills' }))
 
         const menu = screen.getByTestId('toolbar-menu')
+        expect(screen.queryByPlaceholderText('Search skills')).not.toBeInTheDocument()
+        fireEvent.click(screen.getByRole('button', { name: 'Show skill filters' }))
         const search = screen.getByPlaceholderText('Search skills')
         expect(menu.parentElement).toBe(document.body)
         expect(search).not.toHaveFocus()
+    })
+
+    it('shows the last entered skill search instead of a fixed lark filter', () => {
+        const props = {
+            canSend: false,
+            controlsDisabled: false,
+            showSettingsButton: false,
+            onSettingsToggle: noop,
+            skills: [
+                { name: 'lark-doc', scope: 'plugin' as const },
+                { name: 'public-share', scope: 'hub' as const }
+            ],
+            onSkillSelect: noop,
+            showTerminalButton: false,
+            terminalDisabled: false,
+            terminalLabel: 'Terminal',
+            onTerminal: noop,
+            showAbortButton: false,
+            abortDisabled: false,
+            isAborting: false,
+            onAbort: noop,
+            showSwitchButton: false,
+            switchDisabled: false,
+            isSwitching: false,
+            onSwitch: noop,
+            voiceEnabled: false,
+            voiceStatus: 'disconnected' as const,
+            onVoiceToggle: noop,
+            onSend: noop,
+        }
+
+        const first = renderInProviders(<ComposerButtons {...props} />)
+        fireEvent.click(screen.getByRole('button', { name: 'Skills' }))
+        fireEvent.click(screen.getByTestId('composer-skill-section-plugin'))
+        expect(screen.getByText('lark-doc')).toBeInTheDocument()
+        fireEvent.click(screen.getByRole('button', { name: 'Show skill filters' }))
+        expect(screen.queryByRole('button', { name: /lark- skills/i })).not.toBeInTheDocument()
+        fireEvent.change(screen.getByPlaceholderText('Search skills'), { target: { value: 'share' } })
+        first.unmount()
+
+        renderInProviders(<ComposerButtons {...props} />)
+        fireEvent.click(screen.getByRole('button', { name: 'Skills' }))
+        fireEvent.click(screen.getByRole('button', { name: 'Show skill filters' }))
+        const recentSearch = screen.getByRole('button', { name: 'Use recent search: share' })
+        expect(recentSearch).toHaveTextContent('share')
+        fireEvent.click(recentSearch)
+        expect(screen.getByPlaceholderText('Search skills')).toHaveValue('share')
     })
 })
 
@@ -844,5 +923,33 @@ describe('ContextUsageProgressRail', () => {
         render(<ContextUsageProgressRail percentage={null} />)
 
         expect(screen.queryByRole('progressbar')).not.toBeInTheDocument()
+    })
+})
+
+describe('shared model control read-only state', () => {
+    afterEach(cleanup)
+
+    it.each([true, false])('uses the shared style and only allows editable controls to open (readOnly=%s)', (readOnly) => {
+        const toggle = vi.fn()
+        const noop = () => {}
+        renderInProviders(
+            <ComposerButtons
+                canSend={false} controlsDisabled={false} showSettingsButton
+                settingsReadOnly={readOnly} onSettingsToggle={toggle}
+                settingsLabel="gpt-5.6-terra high" settingsModelLabel="5.6-terra" settingsReasoningLabel="high"
+                showTerminalButton={false} terminalDisabled={false} terminalLabel="Terminal" onTerminal={noop}
+                showAbortButton={false} abortDisabled={false} isAborting={false} onAbort={noop}
+                showSwitchButton={false} switchDisabled={false} isSwitching={false} onSwitch={noop}
+                voiceEnabled={false} voiceStatus="disconnected" onVoiceToggle={noop} onSend={noop}
+            />
+        )
+        const button = screen.getByRole('button', { name: readOnly ? /Current model:.*read-only/ : 'Settings' })
+        expect(button).toHaveClass('settings-button')
+        expect(button).toHaveTextContent('5.6-terra')
+        expect(button).toHaveTextContent('high')
+        if (readOnly) expect(button).toBeDisabled()
+        else expect(button).toBeEnabled()
+        fireEvent.click(button)
+        expect(toggle).toHaveBeenCalledTimes(readOnly ? 0 : 1)
     })
 })

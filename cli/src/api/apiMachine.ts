@@ -7,12 +7,17 @@ import { readdir, realpath, stat } from 'node:fs/promises'
 import { realpathSync } from 'node:fs'
 import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath } from 'node:path'
 import { logger } from '@/ui/logger'
+import { browseSessionFiles } from '@/modules/common/sessionFileBrowser'
 import { configuration } from '@/configuration'
 import type {
     BinaryFileReadRequest,
     BinaryFileReadResponse,
     ClientToServerEvents,
     ExternalCodexRequestPayload,
+    NativeCodexAttachmentDeleteRequest,
+    NativeCodexAttachmentDeleteResponse,
+    NativeCodexAttachmentStageRequest,
+    NativeCodexAttachmentStageResponse,
     NativeKanbanFeedbackDeleteRequest,
     NativeKanbanFeedbackDeleteResponse,
     NativeKanbanFeedbackStageRequest,
@@ -21,7 +26,25 @@ import type {
     Update,
     UpdateMachineBody
 } from '@hapi/protocol'
-import type { FileReadResponse, GitBranchResponse, GitCommandResponse, MachineDirectoryEntry, MachineListDirectoryResponse, PathExistsResponse } from '@hapi/protocol/apiTypes'
+import type { MachineHealth } from '@hapi/protocol/types'
+import {
+    MachineGitBranchCreateRequestSchema,
+    MachineGitBranchCommitRequestSchema,
+    MachineGitBranchesRequestSchema,
+    MachineGitBranchFetchRequestSchema,
+    MachineGitBranchPushRequestSchema,
+    MachineGitBranchSwitchRequestSchema,
+    MachineGitBranchUpdateRequestSchema
+} from '@hapi/protocol/apiTypes'
+import type {
+    FileReadResponse,
+    GitBranchResponse,
+    GitBranchesResponse,
+    GitCommandResponse,
+    MachineDirectoryEntry,
+    MachineListDirectoryResponse,
+    PathExistsResponse
+} from '@hapi/protocol/apiTypes'
 import {
     type CodexLocalSessionListUpdate,
     type CodexLocalSessionDisplaySummary,
@@ -34,21 +57,40 @@ import {
     type CodexLocalSessionSnapshotRpcResponse,
     type CodexLocalSessionSnapshotVersion,
     type CodexLocalSessionStatusRpcResponse,
+    type RecoverCodexLocalSessionControlRequest,
+    type CodexLocalSessionRecoveryResponse,
     type CodexLocalSessionSummary,
+    type CodexImportedMessageContent,
+    type CodexTranscriptLifecycleEvent,
     type CodexLocalSessionsRpcResponse,
     type NativeCodexDeliveryPolicy,
+    type NativeCodexSessionControlAction,
+    type NativeCodexSessionConfiguration,
+    type NativeCodexSessionControlResponse,
     type NativeKanbanFeedbackReviewGuard,
     type SendCodexLocalSessionMessageRpcResponse,
-    isHapiInitiatedCodexSession
+    isHapiInitiatedCodexSession,
+    parseNativeCodexAttachmentPrompt,
+    readLocalCodexSessionSummary
 } from '@hapi/protocol/codexTranscript'
+import { NativeCodexSessionControlActionSchema } from '@hapi/protocol/codexTranscript'
 import { RPC_METHODS } from '@hapi/protocol/rpcMethods'
-import { FileNativeCodexSessionDirectSendStore, NativeCodexSessionDirectSender } from '@/codex/nativeSessionDirectSend'
+import {
+    FileNativeCodexSessionDirectSendStore,
+    type NativeCodexSessionControlContext,
+    NativeCodexSessionDirectSender,
+    type NativeCodexTranscriptUserMessageEvidence
+} from '@/codex/nativeSessionDirectSend'
+import { FileNativeCodexSessionControlStore } from '@/codex/nativeCodexControlStore'
+import { NativeCodexAttachmentStore } from '@/codex/nativeCodexAttachmentStore'
 import { NativeKanbanFeedbackStore } from '@/codex/nativeKanbanFeedbackStore'
 import { CodexAppServerClient } from '@/codex/codexAppServerClient'
+import { CodexSshAppServerClient } from '@/codex/codexSshAppServerClient'
 import { NativeCodexSessionListCache } from '@/codex/nativeSessionListCache'
 import { NativeCodexSessionTitleCache } from '@/codex/nativeSessionTitleCache'
-import { NativeCodexTranscriptCache, type NativeCodexTranscriptRead } from '@/codex/nativeTranscriptCache'
+import { NativeCodexTranscriptCache, readRecentLifecycleTail, type NativeCodexTranscriptRead } from '@/codex/nativeTranscriptCache'
 import { NativeCodexSessionWatcher } from '@/codex/nativeSessionWatcher'
+import { CodexSshSessionOwnershipProbe, getCodexSshControlSocketPath } from '@/codex/codexSshOwnership'
 import {
     NativeCodexTurnLifecycleTracker,
     normalizeNativeCodexSessionForDisplay,
@@ -61,9 +103,23 @@ import { backoff } from '@/utils/time'
 import { getInvokedCwd } from '@/utils/invokedCwd'
 import { RpcHandlerManager } from './rpc/RpcHandlerManager'
 import { registerCommonHandlers } from '../modules/common/registerCommonHandlers'
+import { LocalServiceTunnels } from '../runner/localServiceTunnels'
+import { localServiceSocketWire } from '@hapi/protocol/localServiceTransport'
+import { LOCAL_SERVICE_RPC, type LocalServiceTunnelRequest, type LocalServiceTunnelResponse } from '@hapi/protocol/localServices'
 import { listSlashCommands } from '../modules/common/slashCommands'
 import { listSkills } from '../modules/common/skills'
-import { getGitBranchStatusForCwd } from '../modules/common/handlers/git'
+import { listCodexModels } from '../modules/common/codexModels'
+import { RenameNativeCodexSessionRequestSchema, type RenameNativeCodexSessionResponse, type CodexModelSummary } from '@hapi/protocol/apiTypes'
+import {
+    commitGitChangesForCwd,
+    createGitBranchForCwd,
+    fetchGitBranchesForCwd,
+    getGitBranchesForCwd,
+    getGitBranchStatusForCwd,
+    pushGitBranchForCwd,
+    switchGitBranchForCwd,
+    updateGitBranchForCwd
+} from '../modules/common/handlers/git'
 import {
     listOpencodeModelsForCwd,
     type ListOpencodeModelsForCwdRequest,
@@ -72,16 +128,24 @@ import {
 import type { SpawnSessionOptions, SpawnSessionResult } from '../modules/common/rpcTypes'
 import { applyVersionedAck } from './versionedUpdate'
 import { buildSocketIoExtraHeaderOptions } from './hubExtraHeaders'
+import { asHubAuth, type HubAuth } from '@/authV2/runnerAuth'
 import { collectMachineHealth } from '@/utils/machineHealth'
+import { collectShapiResourceUsage, stopShapiResourceUsageCollection } from '@/utils/shapiResourceUsage'
 import { readGeneratedImageFileBytes, readSessionFileBytes } from '@/modules/common/handlers/files'
 import { readUploadFileBytes } from '@/modules/common/handlers/uploads'
+import { createManagedSkillInvocationExpander, listManagedSkillInventory, reconcileManagedSkill, removeManagedSkill } from '@/managedSkills'
+
+const CODEX_SSH_OWNERSHIP_MONITOR_INTERVAL_MS = 1_000
+const NATIVE_CODEX_ATTACHMENT_CLEANUP_INTERVAL_MS = 60 * 60 * 1_000
 
 type NativeCodexArchiveClient = Pick<CodexAppServerClient, 'connect' | 'initialize' | 'archiveThread' | 'disconnect'>
 
 type MachineRpcHandlers = {
     spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>
-    stopSession: (sessionId: string) => boolean
+    stopSession: (sessionId: string) => boolean | Promise<boolean>
     requestShutdown: () => void
+    recoverCodexControl?: (input: { threadId: string; recoveryRequestId: string; cwd: string }) => { status: 'pending' | 'ready' | 'unconfirmed'; recoveryRequestId: string; sessionId?: string; error?: string }
+    getCodexRecovery?: (threadId: string) => { status: 'pending' | 'ready' | 'unconfirmed'; recoveryRequestId: string; sessionId?: string; error?: string } | null
 }
 
 interface PathExistsRequest {
@@ -121,6 +185,17 @@ interface GetCodexLocalSessionStatusRequest {
     sessionId?: unknown
 }
 
+interface RecoverCodexLocalSessionControlRpcRequest extends RecoverCodexLocalSessionControlRequest {}
+
+interface ControlCodexLocalSessionRequest {
+    requestId?: unknown
+    answers?: unknown
+    sessionId?: unknown
+    action?: unknown
+    expectedTurnId?: unknown
+    configuration?: unknown
+}
+
 interface GetCodexLocalSessionComposerCapabilitiesRequest {
     sessionId?: unknown
 }
@@ -133,6 +208,8 @@ interface SendCodexLocalSessionMessageRequest {
     forceRecovery?: unknown
     deliveryPolicy?: unknown
     reviewGuard?: unknown
+    attachmentIds?: unknown
+    allowHapiInitiated?: unknown
 }
 
 interface DiscardCodexLocalSessionMessageRequest {
@@ -144,9 +221,24 @@ interface ArchiveCodexLocalSessionRequest {
     sessionId?: unknown
 }
 
+function getNativeCodexTranscriptUserMessageEvidence(
+    messages: readonly CodexImportedMessageContent[]
+): NativeCodexTranscriptUserMessageEvidence[] {
+    const evidence: NativeCodexTranscriptUserMessageEvidence[] = []
+    for (const message of messages) {
+        if (message.role !== 'user' || message.content.type !== 'text') continue
+        const text = (parseNativeCodexAttachmentPrompt(message.content.text)?.text ?? message.content.text).trim()
+        const createdAt = message.createdAt
+        if (!text || createdAt === undefined || !Number.isFinite(createdAt) || createdAt < 0) continue
+        evidence.push({ text, createdAt })
+    }
+    return evidence
+}
+
 function toNativeCodexSessionListUpdate(session: CodexLocalSessionSummary): CodexLocalSessionListUpdate {
-    const { file: _file, ...summary } = normalizeNativeCodexSessionForDisplay(session)
-    return summary
+    const normalized = normalizeNativeCodexSessionForDisplay(session)
+    const { file: _file, ...summary } = normalized
+    return { ...summary, controlledByCodexSsh: normalized.controlledByCodexSsh ?? false }
 }
 
 function toNativeCodexSessionDisplaySummary(session: CodexLocalSessionSummary): CodexLocalSessionDisplaySummary {
@@ -157,7 +249,8 @@ function toNativeCodexSessionDisplaySummary(session: CodexLocalSessionSummary): 
         cwd: normalized.cwd,
         modifiedAt: normalized.modifiedAt,
         model: normalized.model,
-        modelReasoningEffort: normalized.modelReasoningEffort
+        modelReasoningEffort: normalized.modelReasoningEffort,
+        controlledByCodexSsh: normalized.controlledByCodexSsh ?? false
     }
 }
 
@@ -169,8 +262,9 @@ function buildNativeCodexRealtimeSnapshot(
     const realtimeStatus: CodexLocalSessionRealtimeStatus = {
         ...baseStatus,
         ...(queuedMessages === undefined ? {} : {
-            queuedMessageRefs: queuedMessages.map(({ id, recoveryRequired, recoveryReason }) => ({
+            queuedMessageRefs: queuedMessages.map(({ id, recoveryRequired, recoveryReason, cancelBlocked }) => ({
                 id,
+                ...(cancelBlocked === undefined ? {} : { cancelBlocked }),
                 ...(recoveryRequired ? { recoveryRequired: true } : {}),
                 ...(recoveryReason ? { recoveryReason } : {})
             }))
@@ -232,6 +326,7 @@ function runnerMetadataMatchesAdvertised(
     return current.host === advertised.host
         && current.platform === advertised.platform
         && current.happyCliVersion === advertised.happyCliVersion
+        && current.runnerVersion === advertised.runnerVersion
         && current.homeDir === advertised.homeDir
         && current.codexHome === advertised.codexHome
         && current.nativeCodexRealtime === advertised.nativeCodexRealtime
@@ -248,6 +343,7 @@ function mergeAdvertisedRunnerMetadata(
         host: _host,
         platform: _platform,
         happyCliVersion: _happyCliVersion,
+        runnerVersion: _runnerVersion,
         homeDir: _homeDir,
         codexHome: _codexHome,
         nativeCodexRealtime: _nativeCodexRealtime,
@@ -264,11 +360,29 @@ function mergeAdvertisedRunnerMetadata(
 }
 
 export class ApiMachineClient {
+    private readonly auth: HubAuth
+    private readonly localServiceTunnels = new LocalServiceTunnels(() => {
+        const ports = [this.machine.runnerState?.httpPort].filter((port): port is number => typeof port === 'number')
+        try {
+            const hub = new URL(configuration.apiUrl)
+            if (['localhost', '127.0.0.1', '[::1]'].includes(hub.hostname)) {
+                ports.push(Number(hub.port || (hub.protocol === 'https:' ? 443 : 80)))
+            }
+        } catch { /* Existing connection validation reports invalid Hub URLs. */ }
+        return ports
+    })
     private socket!: Socket<ServerToClientEvents, ClientToServerEvents>
     private keepAliveInterval: NodeJS.Timeout | null = null
     private keepAliveStartTimeout: ReturnType<typeof setTimeout> | null = null
+    private healthCollectionInFlight = false
+    private healthCollectionRun = 0
+    private latestShapiResources: MachineHealth['shapi'] | undefined
+    private codexSshOwnershipMonitor: ReturnType<typeof setInterval> | null = null
+    private nativeCodexAttachmentCleanupTimer: ReturnType<typeof setInterval> | null = null
+    private nativeControlRecoveryStatus: ((threadId: string) => { status: 'pending' | 'ready' | 'unconfirmed' } | null) | null = null
     private rpcHandlerManager: RpcHandlerManager
     private readonly nativeCodexSessionTitleCache = new NativeCodexSessionTitleCache()
+    private readonly nativeManagedSkillExpanders = new Map<string, (text: string) => string>()
     private readonly nativeCodexTurnLifecycle = new NativeCodexTurnLifecycleTracker({
         onUnconfirmedLeaseExpired: (codexSessionId) => this.handleNativeCodexLifecycleChange(codexSessionId),
         onUserInputLeaseExpired: (codexSessionId) => this.handleNativeCodexLifecycleChange(codexSessionId),
@@ -278,6 +392,21 @@ export class ApiMachineClient {
         applyLifecycle: (session) => this.nativeCodexTurnLifecycle.applyToSummary(session)
     })
     private readonly nativeCodexSessionListCache = new NativeCodexSessionListCache({
+        readSummary: (filePath, modifiedAt, size) => {
+            const session = readLocalCodexSessionSummary(filePath, modifiedAt, size)
+            if (session && size !== undefined) {
+                // A missed watcher callback must not leave the old hook lease
+                // overriding a completed transcript on the list page.
+                const tail = readRecentLifecycleTail(filePath, size)
+                this.observeNativeCodexLifecycleEvents(session.id, tail.lifecycleEvents)
+                if (this.nativeCodexSessionDirectSender.ownsActiveDelivery(session.id)) {
+                    this.nativeCodexTurnLifecycle.suppressUserInputWait(session.id)
+                } else {
+                    this.nativeCodexTurnLifecycle.observeTranscriptUserInputEvents(session.id, tail.userInputEvents)
+                }
+            }
+            return session
+        },
         resolveTitles: (sessionIds, options) => this.nativeCodexSessionTitleCache.resolve(sessionIds, options),
         applyLifecycle: (session) => normalizeNativeCodexSessionForDisplay(
             this.maskRunnerOwnedNativeUserInput(
@@ -285,15 +414,28 @@ export class ApiMachineClient {
             )
         )
     })
+    private readonly nativeCodexSshOwnership = new CodexSshSessionOwnershipProbe()
     private readonly nativeCodexSessionDirectSender: NativeCodexSessionDirectSender
+    private nativeCodexModelCatalog: { loadedAt: number; models: CodexModelSummary[] } | null = null
     private readonly nativeKanbanFeedbackStore = new NativeKanbanFeedbackStore(
         join(configuration.happyHomeDir, 'native-kanban-feedback')
     )
+    private readonly nativeCodexAttachmentStore = new NativeCodexAttachmentStore(
+        join(configuration.happyHomeDir, 'native-codex-attachments')
+    )
     private readonly nativeCodexSessionWatcher = new NativeCodexSessionWatcher({
         onChange: ({ codexSessionId, filePath, modifiedAt }) => {
-            const summaryRead = this.nativeCodexTranscriptCache.refreshSummary(codexSessionId)
+            let read = this.nativeCodexTranscriptCache.refreshCachedFromFile(
+                codexSessionId,
+                filePath,
+                { limit: 50 }
+            )
+            if (!read && this.nativeCodexSessionDirectSender.needsTranscriptDeliveryEvidence(codexSessionId)) {
+                read = this.nativeCodexTranscriptCache.read(codexSessionId, { limit: 50 })
+            }
+            const summaryRead = read ?? this.nativeCodexTranscriptCache.refreshSummaryFromFile(codexSessionId, filePath)
             if (summaryRead) {
-                this.nativeCodexTurnLifecycle.observeTranscriptEvents(codexSessionId, summaryRead.lifecycleEvents)
+                this.observeNativeCodexLifecycleEvents(codexSessionId, summaryRead.lifecycleEvents)
                 if (this.nativeCodexSessionDirectSender.ownsActiveDelivery(codexSessionId)) {
                     this.nativeCodexTurnLifecycle.suppressUserInputWait(codexSessionId)
                 } else {
@@ -301,8 +443,10 @@ export class ApiMachineClient {
                 }
             }
             const listSession = this.nativeCodexSessionListCache.update(filePath, modifiedAt)
-            const read = this.nativeCodexTranscriptCache.refreshCached(codexSessionId, { limit: 50 })
-            this.nativeCodexSessionDirectSender.notifyTranscriptChanged(codexSessionId)
+            this.nativeCodexSessionDirectSender.notifyTranscriptChanged(
+                codexSessionId,
+                read ? getNativeCodexTranscriptUserMessageEvidence(read.data.importedMessages) : []
+            )
             this.reportNativeCodexSessionUpdated(codexSessionId, modifiedAt, read, listSession)
         }
     })
@@ -310,12 +454,14 @@ export class ApiMachineClient {
     private readonly normalizedWorkspaceRoots: string[] | undefined
 
     constructor(
-        private readonly token: string,
+        auth: string | HubAuth,
         private readonly machine: Machine,
         private readonly workspaceRoots?: string[],
         private readonly advertisedMetadata?: MachineMetadata,
-        private readonly createNativeCodexArchiveClient: () => NativeCodexArchiveClient = () => new CodexAppServerClient()
+        private readonly createNativeCodexArchiveClient: () => NativeCodexArchiveClient = () => new CodexAppServerClient(),
+        private readonly createNativeCodexRenameClient: () => Pick<CodexAppServerClient, 'connect' | 'initialize' | 'setThreadName' | 'disconnect'> = () => new CodexAppServerClient()
     ) {
+        this.auth = asHubAuth(auth)
         // Realpath roots once so all subsequent comparisons are against
         // canonical, symlink-resolved locations. Falls back to lexical
         // resolution if realpath fails so we still get protection.
@@ -330,7 +476,13 @@ export class ApiMachineClient {
             // continue editing the transcript outside SHAPI.
             () => new CodexAppServerClient(),
             new FileNativeCodexSessionDirectSendStore(join(configuration.happyHomeDir, 'native-codex-direct-outbox.json')),
-            (sessionId, guard) => this.nativeKanbanFeedbackStore.verify(sessionId, guard)
+            (sessionId, guard) => this.nativeKanbanFeedbackStore.verify(sessionId, guard),
+            (sessionId) => this.isNativeCodexSessionControlledBySsh(sessionId, { forceRefresh: true }),
+            () => new CodexSshAppServerClient({ socketPath: getCodexSshControlSocketPath() }),
+            new FileNativeCodexSessionControlStore(join(configuration.happyHomeDir, 'native-codex-controls.json')),
+            (sessionId, nativeConfiguration) => this.validateNativeCodexConfiguration(sessionId, nativeConfiguration),
+            (sessionId, attachmentIds) => this.nativeCodexAttachmentStore.resolve(sessionId, attachmentIds),
+            (sessionId, attachmentIds) => this.nativeCodexAttachmentStore.deleteMany(sessionId, attachmentIds)
         )
 
         this.rpcHandlerManager = new RpcHandlerManager({
@@ -340,8 +492,16 @@ export class ApiMachineClient {
         this.nativeCodexSessionDirectSender.setStateChangeListener((sessionId) => {
             this.reportNativeCodexSessionUpdated(sessionId)
         })
+        this.startNativeCodexAttachmentCleanup()
 
         registerCommonHandlers(this.rpcHandlerManager, getInvokedCwd())
+        this.rpcHandlerManager.registerHandler<{ cwd: string; request: unknown }, Awaited<ReturnType<typeof browseSessionFiles>>>(
+            RPC_METHODS.BrowseSessionFiles, params => browseSessionFiles(params.cwd, params.request)
+        )
+        this.rpcHandlerManager.registerHandler<LocalServiceTunnelRequest, LocalServiceTunnelResponse>(
+            LOCAL_SERVICE_RPC,
+            (request) => this.localServiceTunnels.open(request)
+        )
 
         this.rpcHandlerManager.registerHandler<ReadMachineFileRequest, FileReadResponse>(
             RPC_METHODS.ReadMachineFile,
@@ -378,13 +538,14 @@ export class ApiMachineClient {
                 if (forceRefresh !== undefined && typeof forceRefresh !== 'boolean') {
                     return { success: false, error: 'forceRefresh must be a boolean' }
                 }
+                const heldSessionIds = await this.refreshNativeCodexSshOwnership({ forceRefresh: forceRefresh === true })
                 return {
                     success: true,
                     sessions: this.nativeCodexSessionListCache.list(
                         limit ?? 500,
                         { excludeHapiInitiated },
                         { forceRefresh }
-                    )
+                    ).map((session) => this.withNativeCodexSshControl(session, heldSessionIds))
                 }
             }
         )
@@ -404,12 +565,14 @@ export class ApiMachineClient {
                 if (limit !== undefined && (typeof limit !== 'number' || !Number.isInteger(limit) || limit < 1 || limit > 100)) {
                     return { success: false, error: 'limit must be an integer between 1 and 100' }
                 }
+                await this.refreshNativeCodexSshOwnership()
                 const read = this.readNativeCodexTranscript(sessionId, { before, limit })
                 if (read) {
                     this.observeNativeCodexSession(sessionId)
                 }
-                return read
-                    ? { success: true, data: read.data }
+                const controlledRead = read ? this.withNativeCodexSshControlForRead(read) : null
+                return controlledRead
+                    ? { success: true, data: controlledRead.data }
                     : { success: false, error: 'Codex session not found' }
             }
         )
@@ -436,40 +599,42 @@ export class ApiMachineClient {
                     return { success: false, error: 'knownVersion must contain runnerEpoch and a positive integer revision' }
                 }
 
+                await this.refreshNativeCodexSshOwnership()
                 const read = this.readNativeCodexTranscript(sessionId, { before, limit })
                 if (!read) {
                     return { success: false, error: 'Codex session not found' }
                 }
                 this.observeNativeCodexSession(sessionId)
-                const status = this.getNativeCodexSessionStatus(sessionId, read.data.session, read.plan)
+                const controlledRead = this.withNativeCodexSshControlForRead(read)
+                const status = this.getNativeCodexSessionStatus(sessionId, controlledRead.data.session)
                 if (status.success !== true) {
                     return { success: false, error: status.error }
                 }
                 const canUseKnownVersion = before === undefined && (limit ?? 50) === 50
                 if (knownVersion
                     && canUseKnownVersion
-                    && knownVersion.runnerEpoch === read.version.runnerEpoch
-                    && knownVersion.revision === read.version.revision) {
+                    && knownVersion.runnerEpoch === controlledRead.version.runnerEpoch
+                    && knownVersion.revision === controlledRead.version.revision) {
                     return {
                         success: true,
                         unchanged: true,
-                        version: read.version,
-                        revision: read.revision,
-                        session: toNativeCodexSessionDisplaySummary(read.data.session),
+                        version: controlledRead.version,
+                        revision: controlledRead.revision,
+                        session: toNativeCodexSessionDisplaySummary(controlledRead.data.session),
                         status,
-                        timing: read.timing
+                        timing: controlledRead.timing
                     }
                 }
                 return {
                     success: true,
                     unchanged: false,
                     snapshot: {
-                        data: read.data,
+                        data: controlledRead.data,
                         status,
-                        plan: read.plan,
-                        version: read.version,
-                        revision: read.revision,
-                        timing: read.timing
+                        plan: controlledRead.plan,
+                        version: controlledRead.version,
+                        revision: controlledRead.revision,
+                        timing: controlledRead.timing
                     }
                 }
             }
@@ -486,7 +651,46 @@ export class ApiMachineClient {
                 if (summary) {
                     this.observeNativeCodexSession(sessionId)
                 }
+                await this.refreshNativeCodexSshOwnership()
                 return this.getNativeCodexSessionStatus(sessionId, summary ?? undefined)
+            }
+        )
+
+        this.rpcHandlerManager.registerHandler<ControlCodexLocalSessionRequest, NativeCodexSessionControlResponse>(
+            RPC_METHODS.ControlCodexLocalSession,
+            async (params) => {
+                const sessionId = typeof params?.sessionId === 'string' ? params.sessionId.trim() : ''
+                if (!sessionId) {
+                    return { success: false, code: 'invalid_request', error: 'sessionId is required' }
+                }
+                if (this.nativeControlRecoveryStatus?.(sessionId)) {
+                    return { success: false, code: 'control_busy', error: 'Native control recovery is in progress' }
+                }
+                const action = NativeCodexSessionControlActionSchema.safeParse({
+                    action: params?.action,
+                    ...(params?.expectedTurnId === undefined ? {} : { expectedTurnId: params.expectedTurnId }),
+                    ...(params?.requestId === undefined ? {} : { requestId: params.requestId }),
+                    ...(params?.answers === undefined ? {} : { answers: params.answers }),
+                    ...(params?.configuration === undefined ? {} : { configuration: params.configuration })
+                })
+                if (!action.success) {
+                    return { success: false, code: 'invalid_request', error: 'A valid native control action is required' }
+                }
+                const summary = this.getNativeCodexSessionSummary(sessionId)
+                if (!summary) {
+                    return { success: false, code: 'session_not_found', error: 'Codex session not found' }
+                }
+                this.observeNativeCodexSession(sessionId)
+                await this.refreshNativeCodexSshOwnership({ forceRefresh: true })
+                const currentSummary = this.getNativeCodexSessionSummary(sessionId) ?? summary
+                const status = this.getNativeCodexSessionStatus(sessionId, currentSummary)
+                const controlledByCodexSsh = !isHapiInitiatedCodexSession(currentSummary)
+                    && this.nativeCodexSshOwnership.getCachedHeldSessionIds().has(sessionId)
+                const activeTurnId = status.success === true ? status.activeTurnId ?? null : null
+                const context: NativeCodexSessionControlContext = { controlledByCodexSsh, activeTurnId }
+                const result = await this.nativeCodexSessionDirectSender.control(sessionId, action.data, context)
+                this.reportNativeCodexSessionUpdated(sessionId)
+                return result
             }
         )
 
@@ -529,8 +733,14 @@ export class ApiMachineClient {
                 if (!sessionId) {
                     return { success: false, code: 'invalid_message', error: 'sessionId is required' }
                 }
+                if (this.nativeControlRecoveryStatus?.(sessionId)) {
+                    return { success: false, code: 'launch_failed', error: 'Native control recovery is in progress' }
+                }
                 if (params?.forceRecovery !== undefined && typeof params.forceRecovery !== 'boolean') {
                     return { success: false, code: 'invalid_message', error: 'forceRecovery must be a boolean' }
+                }
+                if (params?.allowHapiInitiated !== undefined && typeof params.allowHapiInitiated !== 'boolean') {
+                    return { success: false, code: 'invalid_message', error: 'allowHapiInitiated must be a boolean' }
                 }
                 if (params?.deliveryPolicy !== undefined && params.deliveryPolicy !== 'default' && params.deliveryPolicy !== 'untrusted-review') {
                     return { success: false, code: 'invalid_message', error: 'deliveryPolicy is invalid' }
@@ -542,14 +752,19 @@ export class ApiMachineClient {
                 if (summary) {
                     this.observeNativeCodexSession(sessionId)
                 }
-                return this.nativeCodexSessionDirectSender.send(
+                const expandedMessage = typeof params?.message === 'string'
+                    ? this.getNativeManagedSkillExpander(sessionId)(params.message)
+                    : params?.message
+                return await this.nativeCodexSessionDirectSender.sendWithExternalControlCheck(
                     sessionId,
-                    params?.message,
+                    expandedMessage,
                     params?.displayMessage,
                     params?.clientMessageId,
                     params?.forceRecovery,
                     params?.deliveryPolicy as NativeCodexDeliveryPolicy | undefined,
-                    params?.reviewGuard as NativeKanbanFeedbackReviewGuard | undefined
+                    params?.reviewGuard as NativeKanbanFeedbackReviewGuard | undefined,
+                    params?.attachmentIds,
+                    params?.allowHapiInitiated === true
                 )
             }
         )
@@ -563,6 +778,9 @@ export class ApiMachineClient {
                 const sessionId = typeof params?.sessionId === 'string' ? params.sessionId.trim() : ''
                 if (!sessionId) {
                     return { success: false, code: 'invalid_client_message_id', error: 'sessionId is required' }
+                }
+                if (this.nativeControlRecoveryStatus?.(sessionId)) {
+                    return { success: false, code: 'launch_failed', error: 'Native control recovery has claimed this session' }
                 }
                 this.observeNativeCodexSession(sessionId)
                 return this.nativeCodexSessionDirectSender.discard(sessionId, params?.clientMessageId)
@@ -578,6 +796,9 @@ export class ApiMachineClient {
                 const sessionId = typeof params?.sessionId === 'string' ? params.sessionId.trim() : ''
                 if (!sessionId) {
                     return { success: false, code: 'session_not_found', error: 'sessionId is required' }
+                }
+                if (this.nativeControlRecoveryStatus?.(sessionId)) {
+                    return { success: false, code: 'archive_in_progress', error: 'Native control recovery is in progress' }
                 }
 
                 // A Kanban card has not necessarily opened the native drawer,
@@ -627,6 +848,51 @@ export class ApiMachineClient {
             }
         )
 
+        this.rpcHandlerManager.registerHandler<{ sessionId?: unknown; name?: unknown }, RenameNativeCodexSessionResponse>(
+            RPC_METHODS.RenameCodexLocalSession,
+            async (params) => {
+                const sessionId = typeof params?.sessionId === 'string' ? params.sessionId.trim() : ''
+                const request = RenameNativeCodexSessionRequestSchema.safeParse(params)
+                if (!sessionId || !request.success) {
+                    return { success: false, code: 'invalid_request', error: 'A session ID and a name of 1–255 characters are required' }
+                }
+                if (this.nativeControlRecoveryStatus?.(sessionId)) {
+                    return { success: false, code: 'rename_failed', error: 'Native control recovery has claimed this session' }
+                }
+                const summary = this.getNativeCodexSessionSummary(sessionId)
+                if (!summary) {
+                    return { success: false, code: 'session_not_found', error: 'Codex session not found' }
+                }
+                if (isHapiInitiatedCodexSession(summary)) {
+                    return { success: false, code: 'not_native_session', error: 'Rename this session from its SHAPI session page' }
+                }
+                const appServer = this.createNativeCodexRenameClient()
+                try {
+                    await appServer.connect()
+                    await appServer.initialize({
+                        clientInfo: { name: 'hapi-native-session-rename', title: 'SHAPI Native Session Rename', version: '1.0.0' },
+                        capabilities: { experimentalApi: true }
+                    })
+                    // Metadata-only API: do not resume a thread or acquire its writer.
+                    await appServer.setThreadName({ threadId: sessionId, name: request.data.name })
+                    this.nativeCodexSessionTitleCache.set(sessionId, request.data.name)
+                    this.nativeCodexSessionListCache.invalidate()
+                    this.reportNativeCodexSessionUpdated(sessionId, summary.modifiedAt, undefined, { ...summary, title: request.data.name })
+                    return { success: true, name: request.data.name }
+                } catch (error) {
+                    const message = error instanceof Error ? error.message : String(error)
+                    const unsupported = /method not found|unknown method|-32601/i.test(message)
+                    return {
+                        success: false,
+                        code: unsupported ? 'rename_unsupported' : 'rename_failed',
+                        error: unsupported ? 'This Codex version does not support renaming native sessions' : message
+                    }
+                } finally {
+                    await appServer.disconnect().catch(() => {})
+                }
+            }
+        )
+
         this.rpcHandlerManager.registerHandler<PathExistsRequest, PathExistsResponse>(RPC_METHODS.PathExists, async (params) => {
             const rawPaths = Array.isArray(params?.paths) ? params.paths : []
             const uniquePaths = Array.from(new Set(rawPaths.filter((path): path is string => typeof path === 'string')))
@@ -659,6 +925,100 @@ export class ApiMachineClient {
                 // policy so historical session groups can still show branch.
                 const cwd = await this.resolveForWorkspaceCheck(rawCwd)
                 return await getGitBranchStatusForCwd(cwd)
+            }
+        )
+
+        this.rpcHandlerManager.registerHandler<unknown, GitBranchesResponse>(
+            RPC_METHODS.GetMachineGitBranches,
+            async (params) => {
+                const parsed = MachineGitBranchesRequestSchema.safeParse(params)
+                if (!parsed.success) {
+                    return { success: false, error: 'Invalid Git branch request' }
+                }
+
+                const cwd = await this.resolveForWorkspaceCheck(parsed.data.cwd)
+                return await getGitBranchesForCwd(cwd)
+            }
+        )
+
+        this.rpcHandlerManager.registerHandler<unknown, GitBranchesResponse>(
+            RPC_METHODS.SwitchMachineGitBranch,
+            async (params) => {
+                const parsed = MachineGitBranchSwitchRequestSchema.safeParse(params)
+                if (!parsed.success) {
+                    return { success: false, error: 'Invalid Git branch switch request' }
+                }
+
+                const cwd = await this.resolveForWorkspaceCheck(parsed.data.cwd)
+                return await switchGitBranchForCwd(cwd, {
+                    target: parsed.data.target,
+                    confirmDirty: parsed.data.confirmDirty
+                })
+            }
+        )
+
+        this.rpcHandlerManager.registerHandler<unknown, GitBranchesResponse>(
+            RPC_METHODS.CreateMachineGitBranch,
+            async (params) => {
+                const parsed = MachineGitBranchCreateRequestSchema.safeParse(params)
+                if (!parsed.success) {
+                    return { success: false, error: 'Invalid Git branch creation request' }
+                }
+
+                const cwd = await this.resolveForWorkspaceCheck(parsed.data.cwd)
+                return await createGitBranchForCwd(cwd, { name: parsed.data.name })
+            }
+        )
+
+        this.rpcHandlerManager.registerHandler<unknown, GitBranchesResponse>(
+            RPC_METHODS.CommitMachineGitChanges,
+            async (params) => {
+                const parsed = MachineGitBranchCommitRequestSchema.safeParse(params)
+                if (!parsed.success) {
+                    return { success: false, error: 'Invalid Git commit request' }
+                }
+
+                const cwd = await this.resolveForWorkspaceCheck(parsed.data.cwd)
+                return await commitGitChangesForCwd(cwd, { message: parsed.data.message })
+            }
+        )
+
+        this.rpcHandlerManager.registerHandler<unknown, GitBranchesResponse>(
+            RPC_METHODS.PushMachineGitBranch,
+            async (params) => {
+                const parsed = MachineGitBranchPushRequestSchema.safeParse(params)
+                if (!parsed.success) {
+                    return { success: false, error: 'Invalid Git push request' }
+                }
+
+                const cwd = await this.resolveForWorkspaceCheck(parsed.data.cwd)
+                return await pushGitBranchForCwd(cwd)
+            }
+        )
+
+        this.rpcHandlerManager.registerHandler<unknown, GitBranchesResponse>(
+            RPC_METHODS.FetchMachineGitBranches,
+            async (params) => {
+                const parsed = MachineGitBranchFetchRequestSchema.safeParse(params)
+                if (!parsed.success) {
+                    return { success: false, error: 'Invalid Git fetch request' }
+                }
+
+                const cwd = await this.resolveForWorkspaceCheck(parsed.data.cwd)
+                return await fetchGitBranchesForCwd(cwd)
+            }
+        )
+
+        this.rpcHandlerManager.registerHandler<unknown, GitBranchesResponse>(
+            RPC_METHODS.UpdateMachineGitBranch,
+            async (params) => {
+                const parsed = MachineGitBranchUpdateRequestSchema.safeParse(params)
+                if (!parsed.success) {
+                    return { success: false, error: 'Invalid Git update request' }
+                }
+
+                const cwd = await this.resolveForWorkspaceCheck(parsed.data.cwd)
+                return await updateGitBranchForCwd(cwd)
             }
         )
 
@@ -752,6 +1112,22 @@ export class ApiMachineClient {
         )
     }
 
+    private getNativeManagedSkillExpander(sessionId: string): (text: string) => string {
+        const existing = this.nativeManagedSkillExpanders.get(sessionId)
+        if (existing) {
+            this.nativeManagedSkillExpanders.delete(sessionId)
+            this.nativeManagedSkillExpanders.set(sessionId, existing)
+            return existing
+        }
+        if (this.nativeManagedSkillExpanders.size >= 128) {
+            const oldestSessionId = this.nativeManagedSkillExpanders.keys().next().value
+            if (typeof oldestSessionId === 'string') this.nativeManagedSkillExpanders.delete(oldestSessionId)
+        }
+        const created = createManagedSkillInvocationExpander()
+        this.nativeManagedSkillExpanders.set(sessionId, created)
+        return created
+    }
+
     private isWithinWorkspaceRoots(absolutePath: string): boolean {
         if (!this.normalizedWorkspaceRoots?.length) return true
         return this.normalizedWorkspaceRoots.some((workspaceRoot) => {
@@ -791,7 +1167,71 @@ export class ApiMachineClient {
         }
     }
 
-    setRPCHandlers({ spawnSession, stopSession, requestShutdown }: MachineRpcHandlers): void {
+    setRPCHandlers({ spawnSession, stopSession, requestShutdown, recoverCodexControl, getCodexRecovery }: MachineRpcHandlers): void {
+        const publishManagedSkillInventory = async () => {
+            const managedSkills = await listManagedSkillInventory()
+            await this.updateMachineMetadata((metadata) => ({
+                ...(metadata ?? this.machine.metadata ?? {
+                    host: 'unknown', platform: process.platform, happyCliVersion: 'unknown'
+                }),
+                managedSkills
+            }))
+        }
+        this.rpcHandlerManager.registerHandler(RPC_METHODS.ManagedSkillReconcile, async (params: unknown) => {
+            const result = await reconcileManagedSkill(params)
+            await publishManagedSkillInventory()
+            return result
+        })
+        this.rpcHandlerManager.registerHandler(RPC_METHODS.ManagedSkillRemove, async (params: unknown) => {
+            const result = await removeManagedSkill(params)
+            await publishManagedSkillInventory()
+            return result
+        })
+        this.nativeControlRecoveryStatus = getCodexRecovery ?? null
+        this.rpcHandlerManager.registerHandler<RecoverCodexLocalSessionControlRpcRequest, CodexLocalSessionRecoveryResponse>(
+            RPC_METHODS.RecoverCodexLocalSessionControl,
+            async (params) => {
+                const sessionId = typeof params?.sessionId === 'string' ? params.sessionId.trim() : ''
+                const recoveryRequestId = typeof params?.recoveryRequestId === 'string' ? params.recoveryRequestId.trim() : ''
+                const expected = params?.expectedVersion
+                if (!sessionId || !/^[a-zA-Z0-9:._-]{1,200}$/.test(recoveryRequestId) || !expected || typeof expected.runnerEpoch !== 'string' || !Number.isInteger(expected.revision)) {
+                    return { success: false, code: 'invalid_request', error: 'A thread id, recovery request id, and snapshot version are required' }
+                }
+                const existing = getCodexRecovery?.(sessionId)
+                if (existing) {
+                    return { success: true, ...existing }
+                }
+                if (!recoverCodexControl) return { success: false, code: 'launch_failed', error: 'This runner does not support native control recovery' }
+                await this.refreshNativeCodexSshOwnership({ forceRefresh: true })
+                const read = this.readNativeCodexTranscript(sessionId, { limit: 50 })
+                if (!read || read.version.runnerEpoch !== expected.runnerEpoch || read.version.revision !== expected.revision) {
+                    return { success: false, code: 'stale_snapshot', error: 'The native transcript changed; refresh before recovering control' }
+                }
+                const summary = this.withNativeCodexSshControlForRead(read).data.session
+                const status = this.getNativeCodexSessionStatus(sessionId, summary)
+                const controls = status.success ? this.nativeCodexSessionDirectSender.getControls(sessionId, {
+                    controlledByCodexSsh: summary.controlledByCodexSsh,
+                    activeTurnId: status.activeTurnId ?? null
+                }) : null
+                if (!status.success || status.status !== 'unknown' || !status.stalledSince || status.waitingForUserInput || status.activeTurnId || summary.controlledByCodexSsh !== false || this.nativeCodexSessionDirectSender.ownsActiveDelivery(sessionId) || (status.queuedMessages?.length ?? 0) > 0 || controls?.queuePaused || controls?.stoppingTurnId) {
+                    return { success: false, code: 'not_eligible', error: 'The native session is no longer safe to recover' }
+                }
+                const cwd = summary.cwd?.trim()
+                if (!cwd) return { success: false, code: 'not_eligible', error: 'The native session has no recoverable working directory' }
+                const operation = recoverCodexControl({ threadId: sessionId, recoveryRequestId, cwd })
+                return { success: true, ...operation }
+            }
+        )
+        this.rpcHandlerManager.registerHandler<{ sessionId?: unknown }, CodexLocalSessionRecoveryResponse>(
+            RPC_METHODS.GetCodexLocalSessionRecovery,
+            async (params) => {
+                const sessionId = typeof params?.sessionId === 'string' ? params.sessionId.trim() : ''
+                const operation = sessionId ? getCodexRecovery?.(sessionId) : null
+                return operation
+                    ? { success: true, ...operation }
+                    : { success: false, code: 'invalid_request', error: 'No native control recovery operation exists for this thread' }
+            }
+        )
         this.rpcHandlerManager.registerHandler(RPC_METHODS.SpawnHappySession, async (params: any) => {
             const { directory, sessionId, resumeSessionId, forkSessionId, machineId, approvedNewDirectoryCreation, agent, model, effort, modelReasoningEffort, yolo, permissionMode, serviceTier, token, sessionType, worktreeName } = params || {}
 
@@ -831,13 +1271,13 @@ export class ApiMachineClient {
             }
         })
 
-        this.rpcHandlerManager.registerHandler(RPC_METHODS.StopSession, (params: any) => {
+        this.rpcHandlerManager.registerHandler(RPC_METHODS.StopSession, async (params: any) => {
             const { sessionId } = params || {}
             if (!sessionId) {
                 throw new Error('Session ID is required')
             }
 
-            const success = stopSession(sessionId)
+            const success = await stopSession(sessionId)
             if (!success) {
                 throw new Error('Session not found or failed to stop')
             }
@@ -941,7 +1381,7 @@ export class ApiMachineClient {
         let transcriptChanged = false
         let transcriptUserInputChanged = false
         if (initialSummary) {
-            transcriptChanged = this.nativeCodexTurnLifecycle.observeTranscriptEvents(
+            transcriptChanged = this.observeNativeCodexLifecycleEvents(
                 request.codexSessionId,
                 initialSummary.lifecycleEvents
             )
@@ -999,7 +1439,7 @@ export class ApiMachineClient {
         // hook. A completed turn must never be resurrected by late delivery.
         const initialSummary = this.nativeCodexTranscriptCache.readSummary(event.codexSessionId)
         const transcriptChanged = initialSummary
-            ? this.nativeCodexTurnLifecycle.observeTranscriptEvents(event.codexSessionId, initialSummary.lifecycleEvents)
+            ? this.observeNativeCodexLifecycleEvents(event.codexSessionId, initialSummary.lifecycleEvents)
             : false
         const userInputChanged = initialSummary
             ? this.nativeCodexTurnLifecycle.observeTranscriptUserInputEvents(event.codexSessionId, initialSummary.userInputEvents)
@@ -1025,7 +1465,7 @@ export class ApiMachineClient {
         const initialRead = this.nativeCodexTranscriptCache.read(sessionId, options)
         if (!initialRead) return null
 
-        const lifecycleChanged = this.nativeCodexTurnLifecycle.observeTranscriptEvents(
+        const lifecycleChanged = this.observeNativeCodexLifecycleEvents(
             sessionId,
             initialRead.lifecycleEvents
         )
@@ -1036,12 +1476,13 @@ export class ApiMachineClient {
                 sessionId,
                 initialRead.userInputEvents
             )
-        if (lifecycleChanged || userInputChanged) {
-            this.nativeCodexSessionDirectSender.notifyTranscriptChanged(sessionId)
-        }
         const read = lifecycleChanged || userInputChanged
             ? this.nativeCodexTranscriptCache.readCached(sessionId, options) ?? initialRead
             : initialRead
+        this.nativeCodexSessionDirectSender.notifyTranscriptChanged(
+            sessionId,
+            getNativeCodexTranscriptUserMessageEvidence(read.data.importedMessages)
+        )
         return this.withNativeCodexTitle(read)
     }
 
@@ -1055,7 +1496,7 @@ export class ApiMachineClient {
         const initialRead = this.nativeCodexTranscriptCache.readSummary(sessionId)
         if (!initialRead) return null
 
-        const lifecycleChanged = this.nativeCodexTurnLifecycle.observeTranscriptEvents(
+        const lifecycleChanged = this.observeNativeCodexLifecycleEvents(
             sessionId,
             initialRead.lifecycleEvents
         )
@@ -1090,6 +1531,69 @@ export class ApiMachineClient {
         this.nativeCodexSessionWatcher.observeTranscript(session.file, session.id)
     }
 
+    /**
+     * Refreshes the optional Desktop SSH owner list. A change emits the same
+     * native-session invalidation used for transcript updates, including an
+     * explicit `controlledByCodexSsh: false` when SSH releases a thread.
+     */
+    private async refreshNativeCodexSshOwnership(
+        options: { forceRefresh?: boolean } = {}
+    ): Promise<ReadonlySet<string>> {
+        const previous = this.nativeCodexSshOwnership.getCachedHeldSessionIds()
+        const current = await this.nativeCodexSshOwnership.getHeldSessionIds(options)
+        const changedSessionIds = new Set<string>()
+        for (const sessionId of previous) {
+            if (!current.has(sessionId)) changedSessionIds.add(sessionId)
+        }
+        for (const sessionId of current) {
+            if (!previous.has(sessionId)) changedSessionIds.add(sessionId)
+        }
+
+        for (const sessionId of changedSessionIds) {
+            // Populate the small summary when it is still available. This is
+            // deliberately bounded to changed thread ids, not a global scan.
+            this.reportNativeCodexSessionUpdated(
+                sessionId,
+                Date.now(),
+                undefined,
+                this.getNativeCodexSessionSummary(sessionId)
+            )
+        }
+        return current
+    }
+
+    /** Fresh send/archive gate. HAPI-originated app-server threads are never claimed. */
+    private async isNativeCodexSessionControlledBySsh(
+        sessionId: string,
+        options: { forceRefresh?: boolean } = {}
+    ): Promise<boolean> {
+        const session = this.getNativeCodexSessionSummary(sessionId)
+        if (!session || isHapiInitiatedCodexSession(session)) return false
+        return (await this.refreshNativeCodexSshOwnership(options)).has(sessionId)
+    }
+
+    private withNativeCodexSshControl(
+        session: CodexLocalSessionSummary,
+        heldSessionIds = this.nativeCodexSshOwnership.getCachedHeldSessionIds()
+    ): CodexLocalSessionSummary {
+        const controlledByCodexSsh = !isHapiInitiatedCodexSession(session) && heldSessionIds.has(session.id)
+        return session.controlledByCodexSsh === controlledByCodexSsh
+            ? session
+            : { ...session, controlledByCodexSsh }
+    }
+
+    private withNativeCodexSshControlForRead(read: NativeCodexTranscriptRead): NativeCodexTranscriptRead {
+        const session = this.withNativeCodexSshControl(read.data.session)
+        if (session === read.data.session) return read
+        return {
+            ...read,
+            data: {
+                ...read.data,
+                session
+            }
+        }
+    }
+
     private reportNativeCodexSessionUpdated(
         codexSessionId: string,
         modifiedAt = Date.now(),
@@ -1103,13 +1607,15 @@ export class ApiMachineClient {
         const cachedRead = transcriptRead === undefined
             ? this.nativeCodexTranscriptCache.readCached(codexSessionId, { limit: 50 })
             : transcriptRead
-        const read = cachedRead ? this.withNativeCodexTitle(cachedRead) : null
+        const read = cachedRead
+            ? this.withNativeCodexSshControlForRead(this.withNativeCodexTitle(cachedRead))
+            : null
         // The watcher also monitors recently active local transcripts that no
         // browser has opened. Do not turn those lightweight invalidations
         // into a full cross-directory session lookup merely to construct a
         // status payload; an open detail already has a hot cache entry.
         const status = read
-            ? this.getNativeCodexSessionStatus(codexSessionId, read.data.session, read.plan)
+            ? this.getNativeCodexSessionStatus(codexSessionId, read.data.session)
             : null
         // Every matching browser receives this global event. Send an
         // invalidation version plus status only; an opened detail asks for
@@ -1118,7 +1624,9 @@ export class ApiMachineClient {
             ? buildNativeCodexRealtimeSnapshot(read, status)
             : undefined
         const rawSummary = read?.data.session ?? listSession
-        const summary = rawSummary ? this.maskRunnerOwnedNativeUserInput(rawSummary) : null
+        const summary = rawSummary
+            ? this.withNativeCodexSshControl(this.maskRunnerOwnedNativeUserInput(rawSummary))
+            : null
         socket.emit('codex-session-updated', {
             machineId: this.machine.id,
             codexSessionId,
@@ -1136,16 +1644,84 @@ export class ApiMachineClient {
      */
     private getNativeCodexSessionStatus(
         sessionId: string,
-        summary?: CodexLocalSessionSummary | null,
-        plan?: NativeCodexTranscriptRead['plan']
+        summary?: CodexLocalSessionSummary | null
     ): CodexLocalSessionStatusRpcResponse {
-        const status = this.nativeCodexSessionDirectSender.getStatus(sessionId, summary)
-        if (status.success !== true || status.status !== 'processing') {
-            return status
+        const resolvedSummary = summary === undefined ? this.getNativeCodexSessionSummary(sessionId) : summary
+        const status = this.nativeCodexSessionDirectSender.getStatus(sessionId, resolvedSummary)
+        if (status.success !== true) return status
+        const controlledByCodexSsh = Boolean(
+            resolvedSummary
+            && !isHapiInitiatedCodexSession(resolvedSummary)
+            && this.nativeCodexSshOwnership.getCachedHeldSessionIds().has(sessionId)
+        )
+        const privateDelivery = this.nativeCodexSessionDirectSender.hasPrivateActiveDelivery(sessionId)
+        const activeTurnId = status.status === 'processing'
+            ? privateDelivery
+                ? this.nativeCodexSessionDirectSender.getActiveTurnId(sessionId)
+                // A cached plan belongs to a prior observed turn and is not
+                // sufficient evidence for an interrupt target. Shared SSH
+                // stop stays disabled until the lifecycle tracker has an
+                // exact active turn id.
+                : this.nativeCodexTurnLifecycle.getActiveTurnId(sessionId) ?? null
+            : null
+        const controls = this.nativeCodexSessionDirectSender.getControls(sessionId, {
+            controlledByCodexSsh,
+            activeTurnId
+        })
+        return {
+            ...status,
+            ...(activeTurnId ? { activeTurnId } : {}),
+            controlledByCodexSsh,
+            controls
         }
-        const activeTurnId = this.nativeCodexTurnLifecycle.getActiveTurnId(sessionId)
-            ?? plan?.turnId
-        return activeTurnId ? { ...status, activeTurnId } : status
+    }
+
+    private async getNativeCodexModelCatalog(): Promise<CodexModelSummary[]> {
+        const now = Date.now()
+        if (this.nativeCodexModelCatalog && now - this.nativeCodexModelCatalog.loadedAt < 60_000) {
+            return this.nativeCodexModelCatalog.models
+        }
+        const models = await listCodexModels()
+        this.nativeCodexModelCatalog = { loadedAt: now, models }
+        return models
+    }
+
+    private async validateNativeCodexConfiguration(
+        sessionId: string,
+        nativeConfiguration: NativeCodexSessionConfiguration
+    ): Promise<{ success: true } | { success: false; error: string }> {
+        const hasModel = nativeConfiguration.model !== undefined && nativeConfiguration.model !== null
+        const hasEffort = nativeConfiguration.modelReasoningEffort !== undefined && nativeConfiguration.modelReasoningEffort !== null
+        const hasFast = nativeConfiguration.serviceTier === 'fast'
+        if (!hasModel && !hasEffort && !hasFast) return { success: true }
+
+        let models: CodexModelSummary[]
+        try {
+            models = await this.getNativeCodexModelCatalog()
+        } catch {
+            return { success: false, error: 'The Codex model catalog is unavailable' }
+        }
+        const summary = this.getNativeCodexSessionSummary(sessionId)
+        const modelId = hasModel
+            ? nativeConfiguration.model!
+            : summary?.model ?? models.find((model) => model.isDefault)?.id
+        const model = modelId ? models.find((candidate) => candidate.id === modelId) : undefined
+        if (hasModel && !model) {
+            return { success: false, error: `Codex model '${nativeConfiguration.model}' is not available` }
+        }
+        if (hasEffort) {
+            const supported = model?.supportedReasoningEfforts
+            if (!supported || !supported.some((effort) => effort.toLowerCase() === nativeConfiguration.modelReasoningEffort!.toLowerCase())) {
+                return { success: false, error: `Reasoning effort '${nativeConfiguration.modelReasoningEffort}' is not supported by the selected Codex model` }
+            }
+        }
+        if (hasFast) {
+            const tiers = model?.serviceTiers?.map((tier) => tier.toLowerCase()) ?? []
+            if (!tiers.includes('fast') && !tiers.includes('priority')) {
+                return { success: false, error: 'Fast mode is not available for the selected Codex model' }
+            }
+        }
+        return { success: true }
     }
 
     private withNativeCodexTitle(read: NativeCodexTranscriptRead): NativeCodexTranscriptRead {
@@ -1172,14 +1748,22 @@ export class ApiMachineClient {
             : session
     }
 
+    private observeNativeCodexLifecycleEvents(
+        sessionId: string,
+        events: readonly CodexTranscriptLifecycleEvent[]
+    ): boolean {
+        const changed = this.nativeCodexTurnLifecycle.observeTranscriptEvents(sessionId, events)
+        this.nativeCodexSessionDirectSender.notifyTranscriptLifecycle(sessionId, events)
+        return changed
+    }
+
     connect(): void {
         this.socket = io(`${configuration.apiUrl}/cli`, {
             transports: ['websocket'],
-            auth: {
-                token: this.token,
+            auth: this.auth.socketAuth({
                 clientType: 'machine-scoped' as const,
                 machineId: this.machine.id
-            },
+            }),
             path: '/socket.io/',
             reconnection: true,
             reconnectionDelay: 1000,
@@ -1191,6 +1775,7 @@ export class ApiMachineClient {
         this.nativeCodexSessionWatcher.start()
 
         this.socket.on('connect', () => {
+            this.localServiceTunnels.attach(localServiceSocketWire(this.socket))
             logger.debug('[API MACHINE] Connected to bot')
             this.rpcHandlerManager.onSocketConnect(this.socket)
             this.updateRunnerState((state) => ({
@@ -1215,12 +1800,15 @@ export class ApiMachineClient {
             }
 
             this.startKeepAlive()
+            this.startCodexSshOwnershipMonitor()
         })
 
         this.socket.on('disconnect', () => {
+            this.localServiceTunnels.dispose()
             logger.debug('[API MACHINE] Disconnected from bot')
             this.rpcHandlerManager.onSocketDisconnect()
             this.stopKeepAlive()
+            this.stopCodexSshOwnershipMonitor()
         })
 
         this.socket.on('rpc-request', async (data: { method: string; params: string }, callback: (response: string) => void) => {
@@ -1271,7 +1859,10 @@ export class ApiMachineClient {
             (data: NativeKanbanFeedbackStageRequest, callback: (response: NativeKanbanFeedbackStageResponse) => void) => {
                 const sessionId = typeof data?.codexSessionId === 'string' ? data.codexSessionId.trim() : ''
                 const summary = sessionId ? this.getNativeCodexSessionSummary(sessionId) : null
-                if (!summary || isHapiInitiatedCodexSession(summary)) {
+                // Public-share feedback is restricted to original native threads.
+                // Monitor delivery is a trusted Hub workflow and may deliberately
+                // bind to a Codex thread that SHAPI created earlier.
+                if (!summary || (data.purpose !== 'monitor' && isHapiInitiatedCodexSession(summary))) {
                     callback({ success: false, error: 'Only an original native Codex session may receive feedback' })
                     return
                 }
@@ -1283,6 +1874,33 @@ export class ApiMachineClient {
             'native-kanban-feedback:delete',
             (data: NativeKanbanFeedbackDeleteRequest, callback: (response: NativeKanbanFeedbackDeleteResponse) => void) => {
                 callback(this.nativeKanbanFeedbackStore.delete(data))
+            }
+        )
+
+        this.socket.on(
+            'native-codex-attachment:stage',
+            (data: NativeCodexAttachmentStageRequest, callback: (response: NativeCodexAttachmentStageResponse) => void) => {
+                const sessionId = typeof data?.codexSessionId === 'string' ? data.codexSessionId.trim() : ''
+                const summary = sessionId ? this.getNativeCodexSessionSummary(sessionId) : null
+                if (!summary || isHapiInitiatedCodexSession(summary)) {
+                    callback({ success: false, error: 'Only an original native Codex session may receive attachments' })
+                    return
+                }
+                this.cleanupNativeCodexAttachments()
+                callback(this.nativeCodexAttachmentStore.stage({ ...data, codexSessionId: sessionId }))
+            }
+        )
+
+        this.socket.on(
+            'native-codex-attachment:delete',
+            (data: NativeCodexAttachmentDeleteRequest, callback: (response: NativeCodexAttachmentDeleteResponse) => void) => {
+                const sessionId = typeof data?.codexSessionId === 'string' ? data.codexSessionId.trim() : ''
+                const summary = sessionId ? this.getNativeCodexSessionSummary(sessionId) : null
+                if (!summary || isHapiInitiatedCodexSession(summary)) {
+                    callback({ success: false, error: 'Only an original native Codex session may delete attachments' })
+                    return
+                }
+                callback(this.nativeCodexAttachmentStore.delete({ ...data, codexSessionId: sessionId }))
             }
         )
 
@@ -1334,11 +1952,31 @@ export class ApiMachineClient {
     private startKeepAlive(): void {
         this.stopKeepAlive()
         const emitAlive = () => {
+            const time = Date.now()
+            const health = collectMachineHealth(time, this.latestShapiResources)
             this.socket.emit('machine-alive', {
                 machineId: this.machine.id,
-                time: Date.now(),
-                health: collectMachineHealth()
+                time,
+                health
             })
+            if (this.healthCollectionInFlight) return
+            this.healthCollectionInFlight = true
+            const collectionRun = ++this.healthCollectionRun
+            void collectShapiResourceUsage(this.machine.id, time)
+                .then((shapi) => {
+                    if (collectionRun !== this.healthCollectionRun || shapi === undefined) return
+                    this.latestShapiResources = shapi
+                    this.socket.emit('machine-alive', {
+                        machineId: this.machine.id,
+                        time,
+                        health: { ...health, shapi }
+                    })
+                })
+                .catch(() => {})
+                .finally(() => {
+                    if (collectionRun !== this.healthCollectionRun) return
+                    this.healthCollectionInFlight = false
+                })
         }
         // Prime CPU sampling so the first heartbeat already includes CPU %.
         collectMachineHealth()
@@ -1350,6 +1988,9 @@ export class ApiMachineClient {
     }
 
     private stopKeepAlive(): void {
+        this.healthCollectionRun += 1
+        this.healthCollectionInFlight = false
+        stopShapiResourceUsageCollection()
         if (this.keepAliveStartTimeout) {
             clearTimeout(this.keepAliveStartTimeout)
             this.keepAliveStartTimeout = null
@@ -1360,8 +2001,58 @@ export class ApiMachineClient {
         }
     }
 
+    /**
+     * The Desktop control endpoint never starts on our behalf: an absent
+     * socket is a cheap explicit release. Polling only while the runner is
+     * connected makes SSH acquire/release immediately invalidate list/detail
+     * views instead of waiting for a transcript write.
+     */
+    private startCodexSshOwnershipMonitor(): void {
+        if (this.codexSshOwnershipMonitor) return
+        const refresh = () => {
+            void this.refreshNativeCodexSshOwnership({ forceRefresh: true }).catch((error) => {
+                logger.debug('[API MACHINE] Failed to refresh Codex SSH ownership', error)
+            })
+        }
+        refresh()
+        this.codexSshOwnershipMonitor = setInterval(refresh, CODEX_SSH_OWNERSHIP_MONITOR_INTERVAL_MS)
+        this.codexSshOwnershipMonitor.unref?.()
+    }
+
+    private stopCodexSshOwnershipMonitor(): void {
+        if (!this.codexSshOwnershipMonitor) return
+        clearInterval(this.codexSshOwnershipMonitor)
+        this.codexSshOwnershipMonitor = null
+    }
+
+    private cleanupNativeCodexAttachments(): void {
+        this.nativeCodexAttachmentStore.cleanupExpired(
+            this.nativeCodexSessionDirectSender.getRetainedNativeAttachmentIds()
+        )
+    }
+
+    private startNativeCodexAttachmentCleanup(): void {
+        if (this.nativeCodexAttachmentCleanupTimer) return
+        this.cleanupNativeCodexAttachments()
+        this.nativeCodexAttachmentCleanupTimer = setInterval(
+            () => this.cleanupNativeCodexAttachments(),
+            NATIVE_CODEX_ATTACHMENT_CLEANUP_INTERVAL_MS
+        )
+        this.nativeCodexAttachmentCleanupTimer.unref?.()
+    }
+
+    private stopNativeCodexAttachmentCleanup(): void {
+        if (!this.nativeCodexAttachmentCleanupTimer) return
+        clearInterval(this.nativeCodexAttachmentCleanupTimer)
+        this.nativeCodexAttachmentCleanupTimer = null
+    }
+
     shutdown(): void {
+        this.nativeManagedSkillExpanders.clear()
+        this.localServiceTunnels.dispose()
         this.stopKeepAlive()
+        this.stopCodexSshOwnershipMonitor()
+        this.stopNativeCodexAttachmentCleanup()
         this.nativeCodexSessionWatcher.stop()
         this.nativeCodexSessionDirectSender.dispose()
         this.nativeCodexTurnLifecycle.dispose()

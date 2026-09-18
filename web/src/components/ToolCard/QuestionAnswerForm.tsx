@@ -1,0 +1,214 @@
+import { useEffect, useRef, useState } from 'react'
+import { BottomDrawer } from '@/components/ui/BottomDrawer'
+import { Button } from '@/components/ui/button'
+import { MarkdownRenderer } from '@/components/MarkdownRenderer'
+import { Spinner } from '@/components/Spinner'
+import { AskUserQuestionOptionBody, getAskUserQuestionOptionFrameClassName } from './askUserQuestionOptionCard'
+import { usePlatform } from '@/hooks/usePlatform'
+import { useTranslation } from '@/lib/use-translation'
+import { NativeQuestionSummary } from '@/components/NativeQuestionCards'
+
+export type AnswerQuestion = {
+    id: string
+    question: string
+    header?: string | null
+    multiSelect: boolean
+    options: { value: string; label: string; description: string | null }[]
+}
+export type QuestionSelection = { selected: string[]; other: boolean; text: string }
+const EMPTY_SELECTION: QuestionSelection = { selected: [], other: false, text: '' }
+
+/** Both protocols share interaction; only their wire answer formats differ. */
+export function QuestionAnswerForm(props: {
+    questions: AnswerQuestion[]
+    disabled: boolean
+    onSubmit: (answers: QuestionSelection[]) => Promise<unknown>
+    onDone: () => void
+    textPlaceholder: string
+    messageCard?: boolean
+    autoOpenKey?: string
+}) {
+    const { t } = useTranslation()
+    const { haptic } = usePlatform()
+    const [open, setOpen] = useState(!props.messageCard && !props.autoOpenKey)
+    const shownKey = useRef<string | null>(null)
+    useEffect(() => {
+        if (!props.autoOpenKey || props.disabled || shownKey.current === props.autoOpenKey) return
+        shownKey.current = props.autoOpenKey
+        const key = `hapi.question.shown:${props.autoOpenKey}`
+        try {
+            if (sessionStorage.getItem(key)) return
+            sessionStorage.setItem(key, '1')
+        } catch { /* Storage can be unavailable; still open once per mounted request. */ }
+        setOpen(true)
+    }, [props.autoOpenKey, props.disabled])
+    const [step, setStep] = useState(0)
+    const [selections, setSelections] = useState<QuestionSelection[]>([])
+    const [loading, setLoading] = useState(false)
+    const [error, setError] = useState<string | null>(null)
+    // A double tap must not approve the same request twice.
+    const submitting = useRef(false)
+    const questionRef = useRef<HTMLDivElement>(null)
+    const textInputRef = useRef<HTMLTextAreaElement>(null)
+    const previousStep = useRef(step)
+    const question = props.questions[step]
+    const selection = selections[step] ?? EMPTY_SELECTION
+    const pureText = question.options.length === 0
+    const needsSend = question.multiSelect || pureText || selection.other
+    const isLast = step === props.questions.length - 1
+
+    useEffect(() => {
+        if (previousStep.current === step) return
+        previousStep.current = step
+        // After advancing, keyboard users start at the new question, not a removed option.
+        questionRef.current?.focus({ preventScroll: true })
+        const body = questionRef.current?.closest('[data-question-drawer-body]')
+        if (body) body.scrollTop = 0
+    }, [step])
+
+    useEffect(() => {
+        if (!open || (!pureText && !selection.other)) return
+        const frame = window.requestAnimationFrame(() => textInputRef.current?.focus({ preventScroll: true }))
+        return () => window.cancelAnimationFrame(frame)
+    }, [open, pureText, selection.other, step])
+
+    const isAnswered = (answer: QuestionSelection | undefined, index: number) => {
+        if (!answer) return false
+        if ((answer.other || props.questions[index].options.length === 0) && !answer.text.trim()) return false
+        return answer.selected.length > 0 || answer.text.trim().length > 0
+    }
+
+    const continueOrSubmit = async (nextSelections: QuestionSelection[]) => {
+        if (props.disabled || submitting.current) return
+        if (!isAnswered(nextSelections[step], step)) {
+            setError(t('tool.selectOption'))
+            return
+        }
+        setError(null)
+        if (!isLast) {
+            setStep(step + 1)
+            return
+        }
+        const missing = props.questions.findIndex((_, index) => !isAnswered(nextSelections[index], index))
+        if (missing !== -1) {
+            setStep(missing)
+            return
+        }
+        submitting.current = true
+        setLoading(true)
+        try {
+            await props.onSubmit(nextSelections)
+            haptic.notification('success')
+            setOpen(false)
+            props.onDone()
+            // Keep locked after success until the permission update unmounts us.
+        } catch (cause) {
+            submitting.current = false
+            haptic.notification('error')
+            setError(cause instanceof Error ? cause.message : t('dialog.error.default'))
+            setLoading(false)
+        }
+    }
+
+    const update = (answer: QuestionSelection) => {
+        const next = [...selections]
+        next[step] = answer
+        setSelections(next)
+        setError(null)
+        return next
+    }
+
+    const chooseOption = (value: string) => {
+        if (props.disabled || submitting.current) return
+        haptic.selection()
+        if (question.multiSelect) {
+            const values = new Set(selection.selected)
+            if (values.has(value)) values.delete(value)
+            else values.add(value)
+            update({ ...selection, selected: question.options.filter((option) => values.has(option.value)).map((option) => option.value) })
+        } else {
+            void continueOrSubmit(update({ selected: [value], other: false, text: '' }))
+        }
+    }
+
+    const option = (value: string, label: string, description: string | null, other = false) => {
+        const checked = other ? selection.other : selection.selected.includes(value)
+        return (
+            <button
+                key={other ? 'other' : `option:${value}`}
+                type="button"
+                role={question.multiSelect ? 'checkbox' : 'radio'}
+                aria-checked={checked}
+                disabled={props.disabled || loading}
+                className={getAskUserQuestionOptionFrameClassName(checked, 'chat-sheet-option min-h-11 w-full text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)] disabled:pointer-events-none disabled:opacity-50', true)}
+                onClick={() => {
+                    if (!other) return chooseOption(value)
+                    haptic.selection()
+                    update(question.multiSelect
+                        ? { ...selection, other: !selection.other, text: selection.other ? '' : selection.text }
+                        : { selected: [], other: true, text: selection.text })
+                }}
+            >
+                <AskUserQuestionOptionBody checked={checked} mode={question.multiSelect ? 'multi' : 'single'} title={label} description={description} interactive />
+            </button>
+        )
+    }
+
+    return (
+        <div className={props.messageCard ? '' : 'mt-3 flex items-center justify-between gap-3 rounded-lg border border-[var(--app-border)] bg-[var(--app-bg)] p-3'}>
+            {!props.messageCard ? <span className="min-w-0 text-sm text-[var(--app-hint)]">{t('tool.waitingForAnswer')}</span> : null}
+            <BottomDrawer
+                open={open}
+                onOpenChange={setOpen}
+                busy={loading}
+                inputDialog={pureText || selection.other}
+                title={t('tool.answerQuestion')}
+                testId="question-answer-form-drawer"
+                desktopClassName="max-w-2xl"
+                trigger={props.messageCard ? (
+                    <button type="button" className="w-full min-h-11 rounded-2xl text-left focus-visible:ring-2 focus-visible:ring-[var(--app-link)] disabled:opacity-50" disabled={props.disabled || loading} aria-label={t('tool.answerQuestion')}>
+                        <NativeQuestionSummary questions={props.questions} status={t('tool.waitingForAnswer')} pending />
+                    </button>
+                ) : <Button type="button" variant="outline" size="sm" className="min-h-11" disabled={props.disabled || loading}>{t('tool.answerQuestion')}</Button>}
+                footer={step > 0 || needsSend || loading ? (
+                    <div className="flex min-h-11 items-center justify-between gap-3">
+                        {step > 0 ? <Button type="button" variant="outline" className="chat-sheet-action chat-sheet-action-secondary" disabled={props.disabled || loading} onClick={() => { setStep(step - 1); setError(null) }}>{t('tool.prev')}</Button> : <span />}
+                        {needsSend ? (
+                            <Button type="button" disabled={props.disabled || loading || !isAnswered(selection, step)} onClick={() => { void continueOrSubmit(selections) }} aria-busy={loading} className="chat-sheet-action chat-sheet-action-primary px-6">
+                                {loading ? <Spinner size="sm" label={null} /> : null}
+                                {loading ? t('tool.submitting') : isLast ? t('tool.sendAnswer') : t('tool.next')}
+                            </Button>
+                        ) : loading ? <span role="status" className="flex items-center gap-2 text-sm text-[var(--app-hint)]"><Spinner size="sm" label={null} />{t('tool.submitting')}</span> : null}
+                    </div>
+                ) : undefined}
+            >
+                <div key={question.id}>
+                    <div className="mb-3 flex items-center justify-between gap-2 text-xs text-[var(--app-hint)]">
+                        <span>{question.header || t('tool.question')}</span>
+                        <span className="tabular-nums">{step + 1} / {props.questions.length}</span>
+                    </div>
+                    <div ref={questionRef} tabIndex={-1} role="heading" aria-level={3} className="mb-4 text-base font-medium outline-none"><MarkdownRenderer standalone content={question.question} /></div>
+                    {error ? <p role="alert" className="chat-sheet-feedback mb-3">{error}</p> : null}
+                    {!pureText ? (
+                        <div className="flex flex-col gap-2" role={question.multiSelect ? 'group' : 'radiogroup'} aria-label={question.question}>
+                            {question.options.map((item) => option(item.value, item.label, item.description))}
+                            {option('', t('tool.other'), t('tool.otherDescription'), true)}
+                        </div>
+                    ) : null}
+                    {pureText || selection.other ? (
+                        <textarea
+                            ref={textInputRef}
+                            data-drawer-initial-focus
+                            aria-label={question.question || t('tool.answerQuestion')}
+                            value={selection.text}
+                            onChange={(event) => update({ ...selection, text: event.target.value })}
+                            disabled={props.disabled || loading}
+                            placeholder={props.textPlaceholder}
+                            className="ios-form-control chat-sheet-input mt-3 min-h-[96px] resize-none"
+                        />
+                    ) : null}
+                </div>
+            </BottomDrawer>
+        </div>
+    )
+}

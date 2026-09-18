@@ -1,6 +1,6 @@
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { spawn, spawnSync } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { homedir, hostname, platform } from 'node:os'
 import { AGENT_MESSAGE_PAYLOAD_TYPE } from '@hapi/protocol'
@@ -8,8 +8,11 @@ import {
     normalizeCodexUserMessageContent,
     normalizeCodexUserMessageText
 } from '@hapi/protocol/codexUserMessage'
+import { parseNativeCodexAttachmentPrompt } from '@hapi/protocol/nativeCodexAttachments'
 import {
     getLatestCodexSessionConfig,
+    MAX_NATIVE_CODEX_ATTACHMENT_BYTES,
+    NativeCodexSessionControlActionSchema,
     getCodexTranscriptUserInputState,
     isHapiInitiatedCodexSession,
     parseCodexTranscriptImportData,
@@ -19,6 +22,7 @@ import {
     type CodexLocalSessionData as RunnerCodexLocalSessionData,
     type CodexLocalSessionPlan,
     type CodexLocalSessionReadTiming,
+    type CodexLocalSessionSubagent,
     type CodexLocalSessionSnapshotReadOptions,
     type CodexLocalSessionSnapshotVersion,
     type CodexLocalSessionStatusRpcResponse,
@@ -27,9 +31,11 @@ import {
     type SendCodexLocalSessionMessageRpcResponse
 } from '@hapi/protocol/codexTranscript'
 import { Hono } from 'hono'
+import { RenameNativeCodexSessionRequestSchema } from '@hapi/protocol/apiTypes'
 import type { Machine, SyncEngine } from '../../sync/syncEngine'
 import type { Store, StoredMessage } from '../../store'
 import type { WebAppEnv } from '../middleware/auth'
+import { ensureManagedSkillCached, findManagedSkillInvocation, isManagedSkillEnabled, mergeEnabledManagedSkills } from '../../managedSkills'
 
 type ScriptLogKind = 'sync' | 'restart'
 
@@ -87,6 +93,9 @@ type CodexLocalSessionSummary = {
     modelReasoningEffort?: string | null
     runState?: 'idle' | 'processing' | 'unknown'
     waitingForUserInput?: boolean
+    controlledByCodexSsh?: boolean
+    /** Hub-resolved SHAPI owner for this native thread on the selected machine. */
+    managedSessionId?: string | null
 }
 
 type CodexTranscriptFileCandidate = {
@@ -108,9 +117,13 @@ type CodexLocalSessionContextMessage = {
 }
 
 type CodexLocalSessionContextResponse = {
+    modelProvider?: string | null
+    tokenUsage?: import('@hapi/protocol/codexUsage').CodexTokenUsage | null
     success: true
-    session: Pick<CodexLocalSessionSummary, 'id' | 'title' | 'cwd' | 'modifiedAt' | 'model' | 'modelReasoningEffort'>
+    session: Pick<CodexLocalSessionSummary, 'id' | 'title' | 'cwd' | 'modifiedAt' | 'model' | 'modelReasoningEffort' | 'controlledByCodexSsh'>
     messages: CodexLocalSessionContextMessage[]
+    /** Direct native child threads; parent pagination never includes them. */
+    subagents?: CodexLocalSessionSubagent[]
     page: {
         limit: number
         nextBefore: number | null
@@ -155,6 +168,22 @@ type DirectCodexLocalSessionTarget = {
     type: 'error'
     status: 404 | 409 | 502 | 503
     message: string
+}
+
+type RecoverCodexControlRequest = {
+    machineId: string
+    recoveryRequestId: string
+    expectedVersion: { runnerEpoch: string; revision: number }
+}
+
+function parseRecoverCodexControlRequest(value: unknown): RecoverCodexControlRequest | null {
+    const record = asRecord(value)
+    const machineId = typeof record?.machineId === 'string' ? parseCodexRunnerMachineId(record.machineId) : null
+    const recoveryRequestId = typeof record?.recoveryRequestId === 'string' ? record.recoveryRequestId.trim() : ''
+    const version = asRecord(record?.expectedVersion)
+    const revision = version?.revision
+    if (!machineId || !/^[a-zA-Z0-9:._-]{1,200}$/.test(recoveryRequestId) || typeof version?.runnerEpoch !== 'string' || !version.runnerEpoch || typeof revision !== 'number' || !Number.isInteger(revision) || revision < 1) return null
+    return { machineId, recoveryRequestId, expectedVersion: { runnerEpoch: version.runnerEpoch, revision } }
 }
 
 type CodexTranscriptImportData = CodexLocalSessionSummary & {
@@ -449,7 +478,7 @@ function getLatestCodexUserMessage(lines: string[]): string | null {
             if (!record || record.type !== 'response_item') continue
             const payload = asRecord(record.payload)
             if (payload?.type !== 'message' || payload.role !== 'user') continue
-            const text = normalizeCodexUserMessageContent(payload.content)
+            const text = getCodexUserMessageDisplayText(payload.content)
             if (text) {
                 return truncateText(text, 140)
             }
@@ -458,6 +487,13 @@ function getLatestCodexUserMessage(lines: string[]): string | null {
         }
     }
     return null
+}
+
+/** Keep a native Runner's attachment path out of Hub-side list metadata. */
+function getCodexUserMessageDisplayText(content: unknown): string | null {
+    const text = normalizeCodexUserMessageContent(content)
+    if (!text) return null
+    return parseNativeCodexAttachmentPrompt(text)?.text ?? text
 }
 
 function getCodexSessionTitle(
@@ -547,7 +583,7 @@ function parseCodexLocalSession(
         if (!firstUserMessage && type === 'response_item') {
             const payload = asRecord(record?.payload)
             if (payload?.type === 'message' && payload.role === 'user') {
-                const text = normalizeCodexUserMessageContent(payload.content)
+                const text = getCodexUserMessageDisplayText(payload.content)
                 if (text) {
                     firstUserMessage = text
                 }
@@ -646,11 +682,14 @@ function createRunnerCodexSessionContextResponse(
     revision: number,
     version?: CodexLocalSessionSnapshotVersion
 ): CodexLocalSessionContextResponse & { revision: number; version?: CodexLocalSessionSnapshotVersion } {
-    const { session, importedMessages } = data
+    const { session, importedMessages, subagents } = data
     return {
         success: true,
+        tokenUsage: data.tokenUsage ?? null,
+        modelProvider: data.modelProvider ?? null,
         session: createRunnerCodexSessionDisplaySummary(session),
         messages: createCodexTranscriptContextMessages(session.id, importedMessages, data.startIndex, session.modifiedAt),
+        subagents,
         page: data.page,
         revision,
         ...(version === undefined ? {} : { version })
@@ -660,7 +699,7 @@ function createRunnerCodexSessionContextResponse(
 function createRunnerCodexSessionDisplaySummary(
     session: Pick<
         CodexLocalSessionSummary,
-        'id' | 'title' | 'cwd' | 'modifiedAt' | 'model' | 'modelReasoningEffort'
+        'id' | 'title' | 'cwd' | 'modifiedAt' | 'model' | 'modelReasoningEffort' | 'controlledByCodexSsh'
     >
 ): CodexLocalSessionContextResponse['session'] {
     return {
@@ -669,7 +708,8 @@ function createRunnerCodexSessionDisplaySummary(
         cwd: session.cwd,
         modifiedAt: session.modifiedAt,
         model: session.model,
-        modelReasoningEffort: session.modelReasoningEffort
+        modelReasoningEffort: session.modelReasoningEffort,
+        controlledByCodexSsh: session.controlledByCodexSsh ?? false
     }
 }
 
@@ -770,12 +810,26 @@ function parseSendCodexLocalSessionMessageRequest(value: unknown): {
     displayMessage?: string
     clientMessageId?: string
     forceRecovery?: boolean
+    attachmentIds?: string[]
 } | null {
     const record = asRecord(value)
     if (!record) return null
     const machineId = typeof record.machineId === 'string' ? record.machineId.trim() : ''
-    const message = typeof record.message === 'string' ? record.message.trim() : ''
-    if (!machineId || !message) return null
+    const attachmentIds = record.attachmentIds === undefined
+        ? []
+        : Array.isArray(record.attachmentIds)
+            ? record.attachmentIds.map((value) => typeof value === 'string' ? value.trim() : '')
+            : null
+    if (
+        !machineId
+        || attachmentIds === null
+        || attachmentIds.length > 10
+        || attachmentIds.some((attachmentId) => !/^[a-f0-9]{32}$/.test(attachmentId))
+        || new Set(attachmentIds).size !== attachmentIds.length
+    ) return null
+    const suppliedMessage = typeof record.message === 'string' ? record.message.trim() : ''
+    const message = suppliedMessage || (attachmentIds.length > 0 ? 'Please review the attached file.' : '')
+    if (!message) return null
     const displayMessage = typeof record.displayMessage === 'string' ? record.displayMessage.trim() : ''
     const clientMessageId = typeof record.clientMessageId === 'string' ? record.clientMessageId.trim() : ''
     if (record.forceRecovery !== undefined && typeof record.forceRecovery !== 'boolean') return null
@@ -784,8 +838,22 @@ function parseSendCodexLocalSessionMessageRequest(value: unknown): {
         message,
         ...(displayMessage ? { displayMessage } : {}),
         ...(clientMessageId ? { clientMessageId } : {}),
-        ...(record.forceRecovery === true ? { forceRecovery: true } : {})
+        ...(record.forceRecovery === true ? { forceRecovery: true } : {}),
+        ...(attachmentIds.length > 0 ? { attachmentIds } : {})
     }
+}
+
+type FormFileLike = {
+    name?: string
+    type?: string
+    size?: number
+    arrayBuffer: () => Promise<ArrayBuffer>
+}
+
+function isFormFileLike(value: unknown): value is FormFileLike {
+    return value !== null
+        && typeof value === 'object'
+        && typeof (value as { arrayBuffer?: unknown }).arrayBuffer === 'function'
 }
 
 function parseDiscardCodexLocalSessionMessageRequest(value: unknown): {
@@ -890,13 +958,63 @@ function findHapiManagedCodexSession(
     machineId: string,
     codexSessionId: string
 ) {
-    return engine.getSessionsByNamespace(namespace).find((session) => (
-        session.metadata?.machineId === machineId
+    return engine.getSessionsByNamespace(namespace)
+        .filter((session) => (
+            session.metadata?.flavor === 'codex'
+            && session.metadata.machineId === machineId
+            && session.metadata.controlOwner !== 'external'
+            && (
+                session.id === codexSessionId
+                || session.metadata.codexSessionId === codexSessionId
+            )
+        ))
+        .sort((left, right) => (
+            Number(right.active) - Number(left.active)
+            || right.updatedAt - left.updatedAt
+            || left.id.localeCompare(right.id)
+        ))[0]
+}
+
+function findActiveHapiManagedCodexSession(
+    engine: SyncEngine,
+    namespace: string,
+    machineId: string,
+    codexSessionId: string
+) {
+    const session = findHapiManagedCodexSession(engine, namespace, machineId, codexSessionId)
+    return session?.active ? session : undefined
+}
+
+function hasReleasedHapiManagedCodexSession(
+    engine: SyncEngine,
+    namespace: string,
+    machineId: string,
+    codexSessionId: string
+): boolean {
+    return engine.getSessionsByNamespace(namespace).some((session) => (
+        session.metadata?.flavor === 'codex'
+        && session.metadata.machineId === machineId
+        && session.metadata.controlOwner === 'external'
         && (
             session.id === codexSessionId
-            || session.metadata?.codexSessionId === codexSessionId
+            || session.metadata.codexSessionId === codexSessionId
         )
     ))
+}
+
+function resolveRecoveredManagedSession(
+    engine: SyncEngine,
+    namespace: string,
+    machineId: string,
+    codexSessionId: string,
+    managedSessionId: string | undefined
+) {
+    if (!managedSessionId) return null
+    const session = engine.getSession(managedSessionId)
+    if (!session || session.namespace !== namespace || !session.active) return null
+    if (session.metadata?.flavor !== 'codex' || session.metadata?.machineId !== machineId) return null
+    if (session.id !== codexSessionId && session.metadata?.codexSessionId !== codexSessionId) return null
+    return session
 }
 
 function resolveImportMachineId(
@@ -1863,18 +1981,30 @@ export function createCodexDesktopRoutes(options: {
     getSyncEngine: () => SyncEngine | null
 }): Hono<WebAppEnv> {
     const app = new Hono<WebAppEnv>()
+    const managedSessionReopens = new Map<string, ReturnType<SyncEngine['reopenSession']>>()
 
-    app.use('/codex/*', async (c, next) => {
-        if (c.get('namespace') !== 'default') {
-            return c.json({
-                success: false,
-                error: CODEX_TRANSCRIPT_IMPORT_NAMESPACE_ERROR
-            }, 403)
+    const reopenManagedSession = (
+        engine: SyncEngine,
+        namespace: string,
+        sessionId: string
+    ): ReturnType<SyncEngine['reopenSession']> => {
+        const key = `${namespace}:${sessionId}`
+        const existing = managedSessionReopens.get(key)
+        if (existing) return existing
+
+        const pending = engine.reopenSession(sessionId, namespace)
+        managedSessionReopens.set(key, pending)
+        const clear = () => {
+            if (managedSessionReopens.get(key) === pending) managedSessionReopens.delete(key)
         }
-        return next()
-    })
+        pending.then(clear, clear)
+        return pending
+    }
 
     app.get('/codex/status', (c) => {
+        if (c.get('namespace') !== 'default') {
+            return c.json({ success: false, error: CODEX_TRANSCRIPT_IMPORT_NAMESPACE_ERROR }, 403)
+        }
         const codexStatus = getCodexDesktopStatus()
         return c.json({
             success: true,
@@ -1898,6 +2028,9 @@ export function createCodexDesktopRoutes(options: {
         }
         const machineId = parseCodexRunnerMachineId(c.req.query('machineId'))
         if (!machineId) {
+            if (c.get('namespace') !== 'default') {
+                return c.json({ success: false, error: CODEX_TRANSCRIPT_IMPORT_NAMESPACE_ERROR }, 403)
+            }
             return c.json({
                 success: true,
                 sessions: listLocalCodexSessions(limit ?? DEFAULT_CODEX_SESSION_SCAN_LIMIT, { excludeHapiInitiated })
@@ -1935,15 +2068,21 @@ export function createCodexDesktopRoutes(options: {
             // older SHAPI Codex launches used Codex's desktop originator, so
             // originator alone is not enough to keep a regular SHAPI session
             // out of this native-session list.
-            const managedHapiSessionIds = new Set(engine.getSessionsByNamespace(c.get('namespace'))
-                .filter((session) => session.metadata?.machineId === machineId)
-                .map((session) => session.id))
+            const sessionsWithManagedTargets = result.sessions.map((session) => {
+                const managedSession = findHapiManagedCodexSession(
+                    engine,
+                    c.get('namespace'),
+                    machineId,
+                    session.id
+                )
+                return { ...session, managedSessionId: managedSession?.id ?? null }
+            })
             const sessions = excludeHapiInitiated
-                ? result.sessions.filter((session) => (
+                ? sessionsWithManagedTargets.filter((session) => (
                     !isHapiInitiatedCodexSession(session)
-                    && !managedHapiSessionIds.has(session.id)
+                    && !session.managedSessionId
                 ))
-                : result.sessions
+                : sessionsWithManagedTargets
             return c.json({ success: true, sessions } satisfies CodexLocalSessionsResponse)
         } catch (error) {
             return c.json({
@@ -1951,6 +2090,24 @@ export function createCodexDesktopRoutes(options: {
                 error: error instanceof Error ? error.message : 'Failed to list Codex sessions on the selected runner'
             }, 502)
         }
+    })
+
+    app.get('/codex/sessions/:id/managed-session', (c) => {
+        const machineId = parseCodexRunnerMachineId(c.req.query('machineId'))
+        if (!machineId) {
+            return c.json({ success: false, error: 'machineId is required' }, 400)
+        }
+        const engine = options.getSyncEngine()
+        if (!engine) {
+            return c.json({ success: false, error: 'SHAPI hub is not connected' }, 503)
+        }
+        const managedSession = findHapiManagedCodexSession(
+            engine,
+            c.get('namespace'),
+            machineId,
+            c.req.param('id')
+        )
+        return c.json({ success: true, sessionId: managedSession?.id ?? null })
     })
 
     app.get('/codex/sessions/:id/context', async (c) => {
@@ -1964,6 +2121,9 @@ export function createCodexDesktopRoutes(options: {
         }
         const machineId = parseCodexRunnerMachineId(c.req.query('machineId'))
         if (!machineId) {
+            if (c.get('namespace') !== 'default') {
+                return c.json({ success: false, error: CODEX_TRANSCRIPT_IMPORT_NAMESPACE_ERROR }, 403)
+            }
             const summary = findLocalCodexSession(c.req.param('id'))
             if (!summary) {
                 return c.json({ success: false, error: 'Codex session not found' }, 404)
@@ -1977,7 +2137,8 @@ export function createCodexDesktopRoutes(options: {
                     cwd: summary.cwd,
                     modifiedAt: summary.modifiedAt,
                     model: summary.model,
-                    modelReasoningEffort: summary.modelReasoningEffort
+                    modelReasoningEffort: summary.modelReasoningEffort,
+                    controlledByCodexSsh: false
                 },
                 messages: contextPage.messages,
                 page: contextPage.page
@@ -2011,9 +2172,11 @@ export function createCodexDesktopRoutes(options: {
                     cwd: session.cwd,
                     modifiedAt: session.modifiedAt,
                     model: session.model,
-                    modelReasoningEffort: session.modelReasoningEffort
+                    modelReasoningEffort: session.modelReasoningEffort,
+                    controlledByCodexSsh: session.controlledByCodexSsh ?? false
                 },
                 messages: createCodexTranscriptContextMessages(session.id, importedMessages, result.data.startIndex, session.modifiedAt),
+                subagents: result.data.subagents,
                 page: result.data.page
             } satisfies CodexLocalSessionContextResponse)
         } catch (error) {
@@ -2021,6 +2184,26 @@ export function createCodexDesktopRoutes(options: {
                 success: false,
                 error: error instanceof Error ? error.message : 'Failed to read Codex session on the selected runner'
             }, 502)
+        }
+    })
+
+    app.post('/codex/sessions/:id/files', async (c) => {
+        const { SessionFileBrowserRequestSchema } = await import('@hapi/protocol/apiTypes')
+        const parsed = SessionFileBrowserRequestSchema.safeParse(await c.req.json().catch(() => null))
+        if (!parsed.success) return c.json({ success: false, error: 'Invalid file browser request' }, 400)
+        const machineId = parseCodexRunnerMachineId(c.req.query('machineId'))
+        if (!machineId) return c.json({ success: false, error: 'machineId is required' }, 400)
+        const engine = options.getSyncEngine()
+        const target = resolveDirectCodexLocalSessionTarget({ engine, namespace: c.get('namespace'), machineId })
+        if (target.type === 'error') return c.json({ success: false, error: target.message }, target.status)
+        try {
+            const session = await engine!.readCodexLocalSession(target.machine.id, c.req.param('id'), { limit: 1 })
+            if (!session.success) return c.json({ success: false, error: 'Codex session not found' }, 404)
+            const cwd = session.data.session.cwd?.trim()
+            if (!cwd) return c.json({ success: false, error: 'Codex session path is unavailable' }, 400)
+            return c.json(await engine!.browseSessionFiles(target.machine.id, cwd, parsed.data))
+        } catch {
+            return c.json({ success: false, error: 'File browser unavailable' }, 502)
         }
     })
 
@@ -2100,6 +2283,68 @@ export function createCodexDesktopRoutes(options: {
         }
     })
 
+    app.post('/codex/sessions/:id/control', async (c) => {
+        const body: unknown = await c.req.json().catch(() => null)
+        if (!body || typeof body !== 'object' || Array.isArray(body)) {
+            return c.json({ success: false, code: 'invalid_request', error: 'Invalid control request' }, 400)
+        }
+        const { machineId: rawMachineId, ...rawAction } = body as Record<string, unknown>
+        const machineId = typeof rawMachineId === 'string' ? parseCodexRunnerMachineId(rawMachineId) : null
+        const action = NativeCodexSessionControlActionSchema.safeParse(rawAction)
+        if (!machineId || !action.success) {
+            return c.json({ success: false, code: 'invalid_request', error: 'A runner and valid control action are required' }, 400)
+        }
+        const engine = options.getSyncEngine()
+        const target = resolveDirectCodexLocalSessionTarget({ engine, namespace: c.get('namespace'), machineId })
+        if (target.type === 'error') {
+            return c.json({ success: false, error: target.message }, target.status)
+        }
+        if (findHapiManagedCodexSession(engine!, c.get('namespace'), target.machine.id, c.req.param('id'))) {
+            return c.json({ success: false, code: 'not_native_session', error: 'Open the SHAPI-managed session to control it' }, 409)
+        }
+        try {
+            const result = await engine!.controlCodexLocalSession(target.machine.id, c.req.param('id'), action.data)
+            if (result.success) return c.json(result)
+            const status = result.code === 'session_not_found' ? 404
+                : result.code === 'invalid_request' ? 400
+                    : result.code === 'unsupported' || result.code === 'configuration_unsupported' ? 501
+                        : result.code === 'control_failed' || result.code === 'control_unconfirmed' ? 502 : 409
+            return c.json(result, status)
+        } catch {
+            // A lost ACK cannot tell us whether a stop was accepted. Never retry automatically.
+            return c.json({ success: false, code: 'control_unconfirmed', error: 'Could not confirm the control request. Refresh the session status before trying again.' }, 502)
+        }
+    })
+
+    app.patch('/codex/sessions/:id', async (c) => {
+        const body: unknown = await c.req.json().catch(() => null)
+        const request = RenameNativeCodexSessionRequestSchema.safeParse(body)
+        const record = asRecord(body)
+        const machineId = typeof record?.machineId === 'string' ? parseCodexRunnerMachineId(record.machineId) : null
+        if (!machineId || !request.success) {
+            return c.json({ success: false, code: 'invalid_request', error: 'A runner and a name of 1–255 characters are required' }, 400)
+        }
+        const engine = options.getSyncEngine()
+        const target = resolveDirectCodexLocalSessionTarget({ engine, namespace: c.get('namespace'), machineId })
+        if (target.type === 'error') {
+            return c.json({ success: false, error: target.message }, target.status)
+        }
+        if (findHapiManagedCodexSession(engine!, c.get('namespace'), target.machine.id, c.req.param('id'))) {
+            return c.json({ success: false, code: 'not_native_session', error: 'Rename this session from its SHAPI session page' }, 409)
+        }
+        try {
+            const result = await engine!.renameCodexLocalSession(target.machine.id, c.req.param('id'), request.data.name)
+            if (result.success) return c.json(result)
+            const status = result.code === 'session_not_found' ? 404
+                : result.code === 'invalid_request' ? 400
+                    : result.code === 'not_native_session' ? 409
+                        : result.code === 'rename_unsupported' ? 501 : 502
+            return c.json(result, status)
+        } catch {
+            return c.json({ success: false, code: 'rename_failed', error: 'Could not confirm the new name. Refresh the session and try again.' }, 502)
+        }
+    })
+
     app.post('/codex/sessions/:id/archive', async (c) => {
         const request = parseArchiveCodexLocalSessionRequest(await c.req.json().catch(() => null))
         if (!request) {
@@ -2175,7 +2420,10 @@ export function createCodexDesktopRoutes(options: {
             if (result.success !== true) {
                 return c.json(result, 404)
             }
-            return c.json(result satisfies CodexLocalSessionComposerCapabilitiesRpcResponse)
+            return c.json({
+                ...result,
+                skills: mergeEnabledManagedSkills(result.skills, options.store, c.get('namespace'))
+            } satisfies CodexLocalSessionComposerCapabilitiesRpcResponse)
         } catch (error) {
             return c.json({
                 success: false,
@@ -2266,10 +2514,157 @@ export function createCodexDesktopRoutes(options: {
         }
     })
 
+    app.post('/codex/sessions/:id/uploads', async (c) => {
+        const form = await c.req.formData().catch(() => null)
+        const machineId = typeof form?.get('machineId') === 'string'
+            ? parseCodexRunnerMachineId(form.get('machineId') as string)
+            : null
+        const file = form?.get('file')
+        if (!machineId || !isFormFileLike(file)) {
+            return c.json({ success: false, error: 'machineId and file are required' }, 400)
+        }
+        if (typeof file.size === 'number' && file.size > MAX_NATIVE_CODEX_ATTACHMENT_BYTES) {
+            return c.json({ success: false, error: 'Native attachments must be at most 10 MiB' }, 413)
+        }
+
+        const engine = options.getSyncEngine()
+        const target = resolveDirectCodexLocalSessionTarget({
+            engine,
+            namespace: c.get('namespace'),
+            machineId
+        })
+        if (target.type === 'error') {
+            return c.json({ success: false, error: target.message }, target.status)
+        }
+        if (findHapiManagedCodexSession(engine!, c.get('namespace'), target.machine.id, c.req.param('id'))) {
+            return c.json({
+                success: false,
+                error: 'Open the SHAPI-managed session to attach files.'
+            }, 409)
+        }
+
+        try {
+            const bytes = new Uint8Array(await file.arrayBuffer())
+            if (bytes.byteLength > MAX_NATIVE_CODEX_ATTACHMENT_BYTES) {
+                return c.json({ success: false, error: 'Native attachments must be at most 10 MiB' }, 413)
+            }
+            const filenameField = form?.get('filename')
+            const mimeTypeField = form?.get('mimeType')
+            const filename = typeof filenameField === 'string' && filenameField.trim()
+                ? filenameField.trim()
+                : file.name || 'attachment'
+            const mimeType = typeof mimeTypeField === 'string' && mimeTypeField.trim()
+                ? mimeTypeField.trim()
+                : file.type || 'application/octet-stream'
+            const result = await engine!.stageNativeCodexAttachment(target.machine.id, {
+                attachmentId: randomUUID().replaceAll('-', ''),
+                codexSessionId: c.req.param('id'),
+                filename,
+                mimeType,
+                size: bytes.byteLength,
+                sha256: createHash('sha256').update(bytes).digest('hex'),
+                bytes
+            })
+            if (result.success) return c.json(result, 201)
+            return c.json(result, 422)
+        } catch (error) {
+            return c.json({
+                success: false,
+                error: error instanceof Error ? error.message : 'Could not stage native attachment'
+            }, 502)
+        }
+    })
+
+    app.post('/codex/sessions/:id/uploads/:attachmentId/delete', async (c) => {
+        const body = asRecord(await c.req.json().catch(() => null))
+        const machineId = typeof body?.machineId === 'string' ? parseCodexRunnerMachineId(body.machineId) : null
+        const attachmentId = c.req.param('attachmentId').trim()
+        if (!machineId || !/^[a-f0-9]{32}$/.test(attachmentId)) {
+            return c.json({ success: false, error: 'machineId and attachment id are required' }, 400)
+        }
+
+        const engine = options.getSyncEngine()
+        const target = resolveDirectCodexLocalSessionTarget({
+            engine,
+            namespace: c.get('namespace'),
+            machineId
+        })
+        if (target.type === 'error') {
+            return c.json({ success: false, error: target.message }, target.status)
+        }
+        try {
+            const result = await engine!.deleteNativeCodexAttachment(target.machine.id, {
+                attachmentId,
+                codexSessionId: c.req.param('id')
+            })
+            return c.json(result, result.success ? 200 : 422)
+        } catch (error) {
+            return c.json({
+                success: false,
+                error: error instanceof Error ? error.message : 'Could not delete native attachment'
+            }, 502)
+        }
+    })
+
+    app.post('/codex/sessions/:id/recover-control', async (c) => {
+        const request = parseRecoverCodexControlRequest(await c.req.json().catch(() => null))
+        if (!request) return c.json({ success: false, error: 'machineId, recoveryRequestId, and expectedVersion are required' }, 400)
+        const engine = options.getSyncEngine()
+        const target = resolveDirectCodexLocalSessionTarget({ engine, namespace: c.get('namespace'), machineId: request.machineId })
+        if (target.type === 'error') return c.json({ success: false, error: target.message }, target.status)
+        const existingManaged = findActiveHapiManagedCodexSession(engine!, c.get('namespace'), target.machine.id, c.req.param('id'))
+        if (existingManaged) {
+            return c.json({ success: true, status: 'ready', recoveryRequestId: request.recoveryRequestId, sessionId: existingManaged.id })
+        }
+        try {
+            const result = await engine!.recoverCodexLocalSessionControl(target.machine.id, {
+                sessionId: c.req.param('id'), recoveryRequestId: request.recoveryRequestId, expectedVersion: request.expectedVersion
+            })
+            if (!result.success) {
+                const status = result.code === 'stale_snapshot' ? 412 : result.code === 'invalid_request' ? 400 : result.code === 'launch_failed' ? 502 : 409
+                return c.json(result, status)
+            }
+            const managed = resolveRecoveredManagedSession(
+                engine!,
+                c.get('namespace'),
+                target.machine.id,
+                c.req.param('id'),
+                result.sessionId
+            )
+            if (result.status === 'ready' && managed) return c.json({ ...result, sessionId: managed.id })
+            return c.json(result, 202)
+        } catch (error) {
+            return c.json({ success: false, error: error instanceof Error ? error.message : 'Failed to recover native control' }, 502)
+        }
+    })
+
+    app.get('/codex/sessions/:id/recover-control', async (c) => {
+        const machineId = parseCodexRunnerMachineId(c.req.query('machineId') ?? '')
+        if (!machineId) return c.json({ success: false, error: 'machineId is required' }, 400)
+        const engine = options.getSyncEngine()
+        const target = resolveDirectCodexLocalSessionTarget({ engine, namespace: c.get('namespace'), machineId })
+        if (target.type === 'error') return c.json({ success: false, error: target.message }, target.status)
+        try {
+            const result = await engine!.getCodexLocalSessionRecovery(target.machine.id, c.req.param('id'))
+            if (!result.success) return c.json(result, 404)
+            const managed = resolveRecoveredManagedSession(
+                engine!,
+                c.get('namespace'),
+                target.machine.id,
+                c.req.param('id'),
+                result.sessionId
+            )
+            if (result.status === 'ready' && managed) return c.json({ ...result, sessionId: managed.id })
+            return c.json(result, result.status === 'ready' ? 202 : 200)
+        } catch (error) {
+            return c.json({ success: false, error: error instanceof Error ? error.message : 'Failed to read native control recovery' }, 502)
+        }
+    })
+
     app.post('/codex/sessions/:id/messages', async (c) => {
         const request = parseSendCodexLocalSessionMessageRequest(await c.req.json().catch(() => null))
         if (!request) {
-            return c.json({ success: false, error: 'machineId and message are required' }, 400)
+            return c.json({ success: false, error: 'machineId and a message or attachment are required' }, 400)
         }
 
         const engine = options.getSyncEngine()
@@ -2283,6 +2678,13 @@ export function createCodexDesktopRoutes(options: {
         }
 
         try {
+            const managedSkillId = findManagedSkillInvocation(request.message, options.store, c.get('namespace'))
+            if (managedSkillId) {
+                if (!isManagedSkillEnabled(options.store, c.get('namespace'), managedSkillId)) {
+                    return c.json({ success: false, error: `SHAPI skill ${managedSkillId} is disabled` }, 409)
+                }
+                await ensureManagedSkillCached(engine!, target.machine, managedSkillId, options.store, c.get('namespace'))
+            }
             // A SHAPI session from an older runner can have a Codex Desktop
             // originator and therefore appear in the native transcript list.
             // Its app-server is already connected to SHAPI; sending through
@@ -2296,24 +2698,61 @@ export function createCodexDesktopRoutes(options: {
                 c.req.param('id')
             )
             if (managedSession) {
-                if (!managedSession.active) {
+                if (request.attachmentIds?.length) {
                     return c.json({
                         success: false,
                         code: 'not_native_session',
-                        error: 'This Codex session is managed by SHAPI. Open it from the SHAPI session list before sending a message.'
+                        error: 'Open the SHAPI-managed session to send attachments.'
                     } satisfies SendCodexLocalSessionMessageRpcResponse, 409)
                 }
-                await engine!.sendMessage(managedSession.id, {
+                let managedSessionId = managedSession.id
+                if (!managedSession.active) {
+                    const reopened = await reopenManagedSession(engine!, c.get('namespace'), managedSession.id)
+                    if (reopened.type !== 'success') {
+                        return c.json({
+                            success: false,
+                            code: 'launch_failed',
+                            error: reopened.message
+                        } satisfies SendCodexLocalSessionMessageRpcResponse, 502)
+                    }
+                    managedSessionId = reopened.sessionId
+                }
+                await engine!.sendMessage(managedSessionId, {
                     text: request.message,
+                    ...(request.clientMessageId ? { localId: request.clientMessageId } : {}),
                     sentFrom: 'webapp'
                 })
                 return c.json({
                     success: true,
-                    status: 'processing'
+                    status: 'processing',
+                    managedSessionId
                 } satisfies SendCodexLocalSessionMessageRpcResponse, 202)
             }
 
-            const result = request.displayMessage === undefined && request.clientMessageId === undefined && request.forceRecovery === undefined
+            // A locally handed-off SHAPI thread remains identifiable by its
+            // transcript originator. Authorize this exact external-owned row
+            // instead of making the Runner mistake it for an active SHAPI owner.
+            const allowHapiInitiated = hasReleasedHapiManagedCodexSession(
+                engine!,
+                c.get('namespace'),
+                target.machine.id,
+                c.req.param('id')
+            )
+
+            const result = allowHapiInitiated
+                ? await engine!.sendCodexLocalSessionMessage(
+                    target.machine.id,
+                    c.req.param('id'),
+                    request.message,
+                    request.displayMessage,
+                    request.clientMessageId,
+                    request.forceRecovery,
+                    undefined,
+                    undefined,
+                    request.attachmentIds,
+                    true
+                )
+                : request.displayMessage === undefined && request.clientMessageId === undefined && request.forceRecovery === undefined && request.attachmentIds === undefined
                 ? await engine!.sendCodexLocalSessionMessage(
                     target.machine.id,
                     c.req.param('id'),
@@ -2325,7 +2764,10 @@ export function createCodexDesktopRoutes(options: {
                     request.message,
                     request.displayMessage,
                     request.clientMessageId,
-                    request.forceRecovery
+                    request.forceRecovery,
+                    undefined,
+                    undefined,
+                    request.attachmentIds
                 )
             if (result.success === true) {
                 return c.json(result satisfies SendCodexLocalSessionMessageRpcResponse, 202)
@@ -2493,6 +2935,9 @@ export function createCodexDesktopRoutes(options: {
     })
 
     app.post('/codex/sync-session', async (c) => {
+        if (c.get('namespace') !== 'default') {
+            return c.json({ success: false, error: CODEX_TRANSCRIPT_IMPORT_NAMESPACE_ERROR }, 403)
+        }
         const codexStatus = getCodexDesktopStatus()
         const body = await c.req.json().catch(() => null)
         const parsed = parseSyncSessionRequest(body)
@@ -2523,6 +2968,9 @@ export function createCodexDesktopRoutes(options: {
     })
 
     app.post('/codex/duplicate-sessions', async (c) => {
+        if (c.get('namespace') !== 'default') {
+            return c.json({ success: false, error: CODEX_TRANSCRIPT_IMPORT_NAMESPACE_ERROR }, 403)
+        }
         const body = await c.req.json().catch(() => null)
         const parsed = parseSyncSessionRequest(body)
         if (parsed.error) {
@@ -2557,6 +3005,9 @@ export function createCodexDesktopRoutes(options: {
     })
 
     app.post('/codex/merge-duplicate-sessions', async (c) => {
+        if (c.get('namespace') !== 'default') {
+            return c.json({ success: false, error: CODEX_TRANSCRIPT_IMPORT_NAMESPACE_ERROR }, 403)
+        }
         const body = await c.req.json().catch(() => null)
         const parsed = parseSyncSessionRequest(body)
         if (parsed.error) {
@@ -2603,6 +3054,9 @@ export function createCodexDesktopRoutes(options: {
     })
 
     app.post('/codex/restart-desktop', async (c) => {
+        if (c.get('namespace') !== 'default') {
+            return c.json({ success: false, error: CODEX_TRANSCRIPT_IMPORT_NAMESPACE_ERROR }, 403)
+        }
         const codexStatus = getCodexDesktopStatus()
         if (!codexStatus.clientAvailable) {
             const scriptPath = getRestartScriptPath()

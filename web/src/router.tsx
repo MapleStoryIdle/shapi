@@ -28,6 +28,7 @@ import { isTelegramApp } from '@/hooks/useTelegram'
 import { useSidebarResize } from '@/hooks/useSidebarResize'
 import { useRecentPaths } from '@/hooks/useRecentPaths'
 import { useSessionListViewMode } from '@/hooks/useSessionListViewMode'
+import { useKanbanRecentPreferences } from '@/hooks/useKanbanRecentPreferences'
 import { useMessages } from '@/hooks/queries/useMessages'
 import { useMachines } from '@/hooks/queries/useMachines'
 import { useSession } from '@/hooks/queries/useSession'
@@ -51,6 +52,7 @@ import { deleteShareTransfer } from '@/lib/shareTransfer'
 import { presentMachineHealth, formatMachineUptimeSeconds } from '@/lib/machineHealth'
 import { getLanNetworkInterfaces } from '@/lib/networkInterfaces'
 import { loadDefaultNewSessionAgentConfig } from '@/components/NewSession/preferences'
+import { RunnerUpdateNotice } from '@/components/RunnerUpdateNotice'
 
 const SessionChat = lazy(() => import('@/components/SessionChat').then((module) => ({ default: module.SessionChat })))
 const NewSession = lazy(() => import('@/components/NewSession').then((module) => ({ default: module.NewSession })))
@@ -60,10 +62,21 @@ const FilePage = lazy(() => import('@/routes/sessions/file'))
 const CodexFilePage = lazy(() => import('@/routes/sessions/codex-file'))
 const TerminalPage = lazy(() => import('@/routes/sessions/terminal'))
 const OpenVikingPage = lazy(() => import('@/routes/memory'))
+const PluginsPage = lazy(() => import('@/routes/plugins'))
+const VoicePluginPage = lazy(() => import('@/routes/plugins/voice'))
+const NotificationsPluginPage = lazy(() => import('@/routes/plugins/notifications'))
+const TerminalPluginPage = lazy(() => import('@/routes/plugins/terminal'))
 const SettingsPage = lazy(() => import('@/routes/settings'))
 const SharePage = lazy(() => import('@/routes/share'))
 const SharesPage = lazy(() => import('@/routes/shares'))
+const SkillsPage = lazy(() => import('@/routes/skills'))
+const MonitorsPage = lazy(() => import('@/routes/monitors'))
+const MonitorCreatePage = lazy(() => import('@/routes/monitors').then((module) => ({ default: module.MonitorCreatePage })))
+const MonitorPage = lazy(() => import('@/routes/monitor'))
 const KanbanTaskPage = lazy(() => import('@/routes/kanban-task'))
+const LocalServicePage = lazy(() => import('@/routes/local-service'))
+const PairRunnerPage = lazy(() => import('@/routes/pair'))
+const RunnerInstallPage = lazy(() => import('@/routes/install'))
 
 type ComposerSendError = {
     id: number
@@ -94,6 +107,10 @@ function BackIcon(props: { className?: string }) {
             <polyline points="15 18 9 12 15 6" />
         </svg>
     )
+}
+
+function getMachineRunnerVersion(machine: Machine): string | undefined {
+    return machine.metadata?.runnerVersion ?? machine.metadata?.happyCliVersion
 }
 
 function CodexImportIcon(props: { className?: string }) {
@@ -270,6 +287,10 @@ function formatRunnerTime(value: number | null | undefined): string | null {
     return date.toLocaleString()
 }
 
+function formatPercent(value: number): string {
+    return `${Number.isInteger(value) ? value.toFixed(0) : value.toFixed(1)}%`
+}
+
 function RunnerMetricCard(props: { label: string; value: string; detail?: string; tone?: 'default' | 'ok' | 'warn' }) {
     const toneClass = props.tone === 'ok'
         ? 'text-green-600 dark:text-green-400'
@@ -285,7 +306,8 @@ function RunnerMetricCard(props: { label: string; value: string; detail?: string
     )
 }
 
-function RunnerDetailsPanel(props: { machine: Machine }) {
+export function RunnerDetailsPanel(props: { machine: Machine }) {
+    const [tab, setTab] = useState<'overview' | 'details'>('overview')
     const machine = props.machine
     const health = machine.health ?? null
     const presentation = presentMachineHealth(health, machine.metadata?.platform)
@@ -300,80 +322,120 @@ function RunnerDetailsPanel(props: { machine: Machine }) {
     const runnerStartedAt = formatRunnerTime(machine.runnerState?.startedAt)
     const lastSeenAt = formatRunnerTime(machine.activeAt)
     const uptimeText = health?.uptimeSeconds !== undefined ? formatMachineUptimeSeconds(health.uptimeSeconds) : null
+    const shapi = health?.shapi
 
     return (
-        <div role="dialog" aria-label="Runner 状态" className="absolute left-1/2 top-full z-50 mt-3 w-[min(24rem,calc(100vw-2rem))] -translate-x-1/2 rounded-[24px] border border-[var(--app-border)] bg-[var(--app-bg)] p-3 text-left shadow-[0_20px_60px_rgba(15,23,42,0.20)]">
+        <div role="dialog" aria-label="Runner 状态" className="absolute left-1/2 top-full z-50 mt-3 max-h-[calc(100dvh-7rem)] w-[min(24rem,calc(100vw-2rem))] -translate-x-1/2 overflow-y-auto overscroll-contain rounded-[24px] border border-[var(--app-border)] bg-[var(--app-bg)] p-3 text-left shadow-[0_20px_60px_rgba(15,23,42,0.20)]">
             <div className="flex items-start gap-3 px-1 pb-3">
                 <span className={`mt-1 h-2.5 w-2.5 shrink-0 rounded-full ${machine.active ? 'bg-[#22c55e]' : 'bg-[#a3a3a3]'}`} aria-hidden="true" />
                 <div className="min-w-0 flex-1">
                     <div className="truncate text-base font-semibold text-[var(--app-fg)]">{getMachineTitle(machine)}</div>
-                    <div className="mt-0.5 truncate text-xs text-[var(--app-hint)]" title={machine.id}>{machine.id}</div>
+                    <div className="mt-0.5 truncate text-xs text-[var(--app-hint)]">
+                        Runner {getMachineRunnerVersion(machine) ?? '—'} · {uptimeText ? `已运行 ${uptimeText}` : machine.metadata?.platform ?? 'unknown'}
+                    </div>
                 </div>
                 <div className="rounded-full border border-[var(--app-border)] px-2 py-1 text-[11px] font-medium text-[var(--app-hint)]">
                     {machine.runnerState?.status ?? (machine.active ? 'online' : 'offline')}
                 </div>
             </div>
 
-            <div className="grid grid-cols-3 gap-2">
-                <RunnerMetricCard label="CPU" value={cpuMetric ? `${cpuMetric.percent}%` : '—'} detail={presentation?.loadDetail ? `load ${presentation.loadDetail}` : undefined} />
-                <RunnerMetricCard label="内存" value={ramMetric ? `${ramMetric.percent}%` : '—'} />
-                <RunnerMetricCard label="磁盘" value={diskMetric ? `${diskMetric.percent}%` : '—'} detail={diskDetail} />
+            <div role="tablist" aria-label="Runner 信息" className="mb-3 grid grid-cols-2 rounded-xl bg-[var(--app-subtle-bg)] p-1">
+                {(['overview', 'details'] as const).map((value) => (
+                    <button
+                        key={value}
+                        type="button"
+                        role="tab"
+                        aria-selected={tab === value}
+                        onClick={() => setTab(value)}
+                        className={`min-h-9 rounded-lg px-3 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)] ${tab === value ? 'bg-[var(--app-bg)] text-[var(--app-fg)] shadow-sm' : 'text-[var(--app-hint)]'}`}
+                    >
+                        {value === 'overview' ? '概览' : '详情'}
+                    </button>
+                ))}
             </div>
 
-            <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
-                <div className="rounded-2xl border border-[var(--app-border)] bg-[var(--app-subtle-bg)] px-3 py-2">
-                    <div className="font-medium text-[var(--app-hint)]">Runner</div>
-                    <div className="mt-1 space-y-1 text-[var(--app-fg)]">
-                        <div>PID: {machine.runnerState?.pid ?? '—'}</div>
-                        <div>端口: {machine.runnerState?.httpPort ?? '—'}</div>
-                        <div>运行: {uptimeText ?? '—'}</div>
+            {tab === 'overview' ? (
+                <>
+                    <div className="grid grid-cols-3 gap-2">
+                        <RunnerMetricCard label="CPU" value={cpuMetric ? `${cpuMetric.percent}%` : '—'} detail={presentation?.loadDetail ? `load ${presentation.loadDetail}` : undefined} />
+                        <RunnerMetricCard label="内存" value={ramMetric ? `${ramMetric.percent}%` : '—'} />
+                        <RunnerMetricCard label="磁盘" value={diskMetric ? `${diskMetric.percent}%` : '—'} detail={diskDetail} />
                     </div>
-                </div>
-                <div className="rounded-2xl border border-[var(--app-border)] bg-[var(--app-subtle-bg)] px-3 py-2">
-                    <div className="font-medium text-[var(--app-hint)]">系统</div>
-                    <div className="mt-1 space-y-1 text-[var(--app-fg)]">
-                        <div>{machine.metadata?.platform ?? 'unknown'}</div>
-                        <div>SHAPI {machine.metadata?.happyCliVersion ?? '—'}</div>
-                        <div title={lastSeenAt ?? undefined}>心跳: {lastSeenAt ?? '—'}</div>
-                    </div>
-                </div>
-            </div>
-
-            <div className="mt-3 rounded-2xl border border-[var(--app-border)] bg-[var(--app-subtle-bg)] px-3 py-2">
-                <div className="mb-2 flex items-center justify-between gap-2">
-                    <div className="text-xs font-medium text-[var(--app-hint)]">局域网 IP</div>
-                    <div className="text-[11px] text-[var(--app-hint)]">{networkList.length > 0 ? `${networkList.length} 个地址` : '暂无数据'}</div>
-                </div>
-                {networkList.length > 0 ? (
-                    <div className="flex flex-wrap gap-1.5">
-                        {networkList.map((item) => (
-                            <span key={`${item.name}-${item.address}`} className="rounded-full border border-[var(--app-border)] bg-[var(--app-bg)] px-2 py-1 text-[11px] text-[var(--app-fg)]">
-                                {item.name} · {item.address}
-                            </span>
-                        ))}
-                    </div>
-                ) : <div className="text-xs text-[var(--app-hint)]">未发现可直接访问的局域网 IPv4。</div>}
-            </div>
-
-            <div className="mt-3 rounded-2xl border border-[var(--app-border)] bg-[var(--app-subtle-bg)] px-3 py-2">
-                <div className="mb-2 text-xs font-medium text-[var(--app-hint)]">Agent CLI</div>
-                {cliList.length > 0 ? (
-                    <div className="grid grid-cols-2 gap-1.5">
-                        {cliList.map((cli) => (
-                            <div key={cli.id} className="flex items-center justify-between gap-2 rounded-xl border border-[var(--app-border)] bg-[var(--app-bg)] px-2 py-1.5">
-                                <span className="truncate text-xs font-medium text-[var(--app-fg)]">{cli.label}</span>
-                                <span className={`shrink-0 text-[11px] font-semibold ${cli.available ? 'text-green-600 dark:text-green-400' : 'text-[var(--app-hint)]'}`}>
-                                    {cli.available ? '可用' : '未安装'}
-                                </span>
+                    {shapi ? (
+                        <div className="mt-3 rounded-2xl border border-[var(--app-border)] bg-[var(--app-subtle-bg)] p-2.5">
+                            <div className="mb-2 flex items-center justify-between gap-2 px-0.5">
+                                <div className="text-xs font-semibold text-[var(--app-fg)]">Runner 占用</div>
+                                <div className="text-[10px] text-[var(--app-hint)]">仅统计 Runner 管理的资源</div>
+                            </div>
+                            <div className="grid grid-cols-3 gap-2">
+                                <RunnerMetricCard label="CPU" value={formatPercent(shapi.cpuPercent)} />
+                                <RunnerMetricCard label="内存" value={formatBytes(shapi.memoryBytes)} />
+                                <RunnerMetricCard label="磁盘" value={formatBytes(shapi.diskBytes)} />
+                            </div>
+                            <div className="mt-2 grid grid-cols-4 divide-x divide-[var(--app-divider)] rounded-xl border border-[var(--app-border)] bg-[var(--app-bg)] py-2 text-center">
+                                {[
+                                    ['进程', shapi.processes.total],
+                                    ['活跃', shapi.processes.active],
+                                    ['睡眠', shapi.processes.sleeping],
+                                    ['其他', shapi.processes.other]
+                                ].map(([label, value]) => (
+                                    <div key={label} className="min-w-0 px-1">
+                                        <div className="text-sm font-semibold text-[var(--app-fg)]">{value}</div>
+                                        <div className="truncate text-[10px] text-[var(--app-hint)]">{label}</div>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    ) : null}
+                    <RunnerUpdateNotice currentVersion={getMachineRunnerVersion(machine)} />
+                </>
+            ) : (
+                <div className="space-y-3">
+                    <div className="overflow-hidden rounded-2xl border border-[var(--app-border)] bg-[var(--app-subtle-bg)] text-xs">
+                        {[
+                            ['机器 ID', machine.id],
+                            ['系统', machine.metadata?.platform ?? 'unknown'],
+                            ['PID / 端口', `${machine.runnerState?.pid ?? '—'} / ${machine.runnerState?.httpPort ?? '—'}`],
+                            ['最近心跳', lastSeenAt ?? '—'],
+                            ['启动时间', runnerStartedAt ?? '—']
+                        ].map(([label, value], index) => (
+                            <div key={label} className={`flex min-h-10 items-center gap-3 px-3 py-2 ${index > 0 ? 'border-t border-[var(--app-divider)]' : ''}`}>
+                                <span className="shrink-0 text-[var(--app-hint)]">{label}</span>
+                                <span className="min-w-0 flex-1 truncate text-right text-[var(--app-fg)]" title={value}>{value}</span>
                             </div>
                         ))}
                     </div>
-                ) : <div className="text-xs text-[var(--app-hint)]">runner 重启后会开始上报 Agent CLI 探测结果。</div>}
-            </div>
 
-            <div className="mt-3 truncate px-1 text-[11px] text-[var(--app-hint)]" title={runnerStartedAt ?? undefined}>
-                启动时间: {runnerStartedAt ?? '—'}
-            </div>
+                    <div className="rounded-2xl border border-[var(--app-border)] bg-[var(--app-subtle-bg)] px-3 py-2">
+                        <div className="mb-2 flex items-center justify-between gap-2">
+                            <div className="text-xs font-medium text-[var(--app-hint)]">局域网 IP</div>
+                            <div className="text-[11px] text-[var(--app-hint)]">{networkList.length > 0 ? `${networkList.length} 个地址` : '暂无数据'}</div>
+                        </div>
+                        {networkList.length > 0 ? (
+                            <div className="flex flex-wrap gap-1.5">
+                                {networkList.map((item) => (
+                                    <span key={`${item.name}-${item.address}`} className="rounded-full border border-[var(--app-border)] bg-[var(--app-bg)] px-2 py-1 text-[11px] text-[var(--app-fg)]">
+                                        {item.name} · {item.address}
+                                    </span>
+                                ))}
+                            </div>
+                        ) : <div className="text-xs text-[var(--app-hint)]">未发现局域网 IPv4。</div>}
+                    </div>
+
+                    <div className="rounded-2xl border border-[var(--app-border)] bg-[var(--app-subtle-bg)] px-3 py-2">
+                        <div className="mb-2 text-xs font-medium text-[var(--app-hint)]">Agent CLI</div>
+                        {cliList.length > 0 ? (
+                            <div className="flex flex-wrap gap-1.5">
+                                {cliList.map((cli) => (
+                                    <span key={cli.id} className={`rounded-full border border-[var(--app-border)] bg-[var(--app-bg)] px-2.5 py-1 text-xs ${cli.available ? 'text-green-600 dark:text-green-400' : 'text-[var(--app-hint)]'}`}>
+                                        {cli.label} · {cli.available ? '可用' : '未安装'}
+                                    </span>
+                                ))}
+                            </div>
+                        ) : <div className="text-xs text-[var(--app-hint)]">暂无探测结果。</div>}
+                    </div>
+                </div>
+            )}
         </div>
     )
 }
@@ -400,7 +462,7 @@ function RunnerSwitcherPanel(props: {
                         <LaptopIcon className="h-4 w-4 shrink-0 text-[var(--app-hint)]" />
                         <span className="min-w-0 flex-1">
                             <span className="block truncate text-sm font-semibold text-[var(--app-fg)]">{getMachineTitle(machine)}</span>
-                            <span className="block truncate text-[11px] text-[var(--app-hint)]">{machine.metadata?.platform ?? 'unknown'} · SHAPI {machine.metadata?.happyCliVersion ?? '—'}</span>
+                            <span className="block truncate text-[11px] text-[var(--app-hint)]">{machine.metadata?.platform ?? 'unknown'} · Runner {getMachineRunnerVersion(machine) ?? '—'}</span>
                         </span>
                         {selected ? <span className="text-xs font-semibold text-[var(--app-link)]">当前</span> : null}
                     </button>
@@ -450,9 +512,7 @@ function SessionsPage() {
     const { addRecentPath, setLastUsedMachineId } = useRecentPaths()
     const {
         sessionListViewMode,
-        setSessionListViewMode,
-        pinnedSessionKeys,
-        togglePinnedSessionKey
+        setSessionListViewMode
     } = useSessionListViewMode()
     const { machines } = useMachines(api, true)
     const [isSyncingCodexSession, setIsSyncingCodexSession] = useState(false)
@@ -591,11 +651,17 @@ function SessionsPage() {
             case 'browse':
                 navigate({ to: '/browse' })
                 return
-            case 'memory':
-                navigate({ to: '/memory' })
+            case 'plugins':
+                navigate({ to: '/plugins' })
                 return
             case 'shares':
                 navigate({ to: '/shares' })
+                return
+            case 'skills':
+                navigate({ to: '/skills' })
+                return
+            case 'monitors':
+                navigate({ to: '/monitors' })
                 return
             case 'settings':
                 navigate({ to: '/settings' })
@@ -614,6 +680,13 @@ function SessionsPage() {
 
     const handleOpenCodexSession = useCallback((session: CodexLocalSessionSummary) => {
         if (!selectedRunnerMachine) return
+        if (session.managedSessionId) {
+            navigate({
+                to: '/sessions/$sessionId',
+                params: { sessionId: session.managedSessionId }
+            })
+            return
+        }
         navigate({
             to: '/sessions/codex/$codexSessionId',
             params: { codexSessionId: session.id },
@@ -901,8 +974,10 @@ function SessionsPage() {
                                 <option value="" disabled>{t('session.more')}</option>
                                 <option value="new">{t('sessions.new')}</option>
                                 <option value="browse">{t('browse.nav')}</option>
-                                <option value="memory">{t('openViking.nav')}</option>
+                                <option value="plugins">{t('plugins.title')}</option>
+                                <option value="skills">{t('skills.nav')}</option>
                                 <option value="shares">{t('shares.nav')}</option>
+                                <option value="monitors">{t('monitors.nav')}</option>
                                 <option value="settings">{t('settings.title')}</option>
                             </select>
                         </div>
@@ -994,8 +1069,6 @@ function SessionsPage() {
                             onNewSessionInDirectory={selectedRunnerMachine ? createSessionInDirectory : undefined}
                             isNewSessionPending={isQuickSessionPending}
                             viewMode={sessionListViewMode}
-                            pinnedSessionKeys={pinnedSessionKeys}
-                            onTogglePin={togglePinnedSessionKey}
                             realtimeAvailable={selectedRunnerMachine?.active === true
                                 && selectedRunnerMachine.metadata?.nativeCodexRealtime === true}
                         />
@@ -1089,8 +1162,11 @@ function SessionPage() {
         warning: messagesWarning,
         isLoading: messagesLoading,
         isLoadingMore: messagesLoadingMore,
+        isLoadingNewer: messagesLoadingNewer,
         hasMore: messagesHasMore,
+        hasNewer: messagesHasNewer,
         loadMore: loadMoreMessages,
+        loadNewer: loadNewerMessages,
         refetch: refetchMessages,
         pendingCount,
         messagesVersion,
@@ -1392,14 +1468,17 @@ function SessionPage() {
                 pendingMessages={pendingMessages}
                 messagesWarning={messagesWarning}
                 hasMoreMessages={messagesHasMore}
+                hasNewerMessages={messagesHasNewer}
                 isLoadingMessages={messagesLoading}
                 isLoadingMoreMessages={messagesLoadingMore}
+                isLoadingNewerMessages={messagesLoadingNewer}
                 isSending={isSending}
                 pendingCount={pendingCount}
                 messagesVersion={messagesVersion}
                 onBack={goBack}
                 onRefresh={refreshSelectedSession}
                 onLoadMore={loadMoreMessages}
+                onLoadNewer={loadNewerMessages}
                 onSend={sendMessage}
                 onFlushPending={flushPending}
                 onAtBottomChange={setAtBottom}
@@ -1423,10 +1502,56 @@ function CodexSessionContextRoute() {
     const navigate = useNavigate()
     const { codexSessionId } = useParams({ from: '/sessions/codex/$codexSessionId' })
     const { machineId } = useSearch({ from: '/sessions/codex/$codexSessionId' })
+    const resolutionKey = `${machineId ?? ''}:${codexSessionId}`
+    const latestResolutionKeyRef = useRef(resolutionKey)
+    latestResolutionKeyRef.current = resolutionKey
+    const [managedResolution, setManagedResolution] = useState<{
+        key: string
+        sessionId: string | null
+    } | null>(null)
     const { machines } = useMachines(api, Boolean(machineId))
     const selectedMachine = machines.find((machine) => machine.id === machineId)
     const realtimeAvailable = selectedMachine?.active === true
         && selectedMachine.metadata?.nativeCodexRealtime === true
+
+    useEffect(() => {
+        let cancelled = false
+        if (!machineId) {
+            setManagedResolution({ key: resolutionKey, sessionId: null })
+            return () => {
+                cancelled = true
+            }
+        }
+
+        setManagedResolution(null)
+        void api.getCodexManagedSessionTarget(codexSessionId, machineId)
+            .then((result) => {
+                if (cancelled || latestResolutionKeyRef.current !== resolutionKey) return
+                setManagedResolution({ key: resolutionKey, sessionId: result.sessionId })
+                if (result.sessionId) {
+                    navigate({
+                        to: '/sessions/$sessionId',
+                        params: { sessionId: result.sessionId },
+                        replace: true
+                    })
+                }
+            })
+            .catch(() => {
+                if (cancelled || latestResolutionKeyRef.current !== resolutionKey) return
+                setManagedResolution({ key: resolutionKey, sessionId: null })
+            })
+
+        return () => {
+            cancelled = true
+        }
+    }, [api, codexSessionId, machineId, navigate, resolutionKey])
+
+    if (machineId && (
+        managedResolution?.key !== resolutionKey
+        || managedResolution.sessionId !== null
+    )) {
+        return <SessionEntryLoading onBack={() => navigate({ to: '/sessions' })} />
+    }
 
     return (
         <CodexSessionContextPage
@@ -1440,6 +1565,19 @@ function CodexSessionContextRoute() {
                 to: '/sessions/$sessionId',
                 params: { sessionId }
             })}
+            onRecovered={(sessionId) => navigate({
+                to: '/sessions/$sessionId',
+                params: { sessionId },
+                replace: true
+            })}
+            onCreateMonitor={machineId ? () => navigate({
+                to: '/monitors/new',
+                search: {
+                    type: 'native-codex',
+                    sessionId: codexSessionId,
+                    machineId
+                }
+            }) : undefined}
         />
     )
 }
@@ -1452,13 +1590,14 @@ function SessionDetailRoute() {
     const { session, notFound: sessionNotFound } = useSession(api, sessionId)
     const basePath = `/sessions/${sessionId}`
     const isChat = pathname === basePath || pathname === `${basePath}/`
+    const { autoRemoveOnOpen } = useKanbanRecentPreferences()
 
     useEffect(() => {
-        if (!session) {
+        if (!session || !autoRemoveOnOpen) {
             return
         }
         markSessionSeen(session.id, session.updatedAt)
-    }, [session?.id, session?.updatedAt])
+    }, [autoRemoveOnOpen, session?.id, session?.updatedAt])
 
     useEffect(() => {
         if (!sessionNotFound) {
@@ -1510,18 +1649,6 @@ function NewSessionPage() {
         })
     }, [navigate, queryClient, shareTransferId])
 
-    const handleChooseFolder = useCallback((args: { machineId: string | null; directory: string }) => {
-        // Forward the currently-selected machine so /browse opens scoped to
-        // it rather than falling back to `hapi:lastMachineId`, which can
-        // disagree if the user changed machines without yet creating a
-        // session. Preserve shareTransferId so a share-target spawn that
-        // detours through /browse still seeds the composer after success.
-        const search: { machineId?: string; shareTransferId?: string } = {}
-        if (args.machineId) search.machineId = args.machineId
-        if (shareTransferId) search.shareTransferId = shareTransferId
-        navigate({ to: '/browse', search })
-    }, [navigate, shareTransferId])
-
     return (
         <div className="flex h-full min-h-0 flex-col">
             <div className="bg-[var(--app-bg)] pt-[var(--app-safe-area-top)]">
@@ -1555,7 +1682,6 @@ function NewSessionPage() {
                     isLoading={machinesLoading}
                     onCancel={handleCancel}
                     onSuccess={handleSuccess}
-                    onChooseFolder={handleChooseFolder}
                     initialDirectory={initialDirectory}
                     initialMachineId={initialMachineId}
                 />
@@ -1617,6 +1743,18 @@ const indexRoute = createRoute({
     getParentRoute: () => rootRoute,
     path: '/',
     component: () => <Navigate to="/sessions" replace />,
+})
+
+const installRoute = createRoute({
+    getParentRoute: () => rootRoute,
+    path: '/install',
+    component: RunnerInstallPage,
+})
+
+const pairRoute = createRoute({
+    getParentRoute: () => rootRoute,
+    path: '/pair',
+    component: PairRunnerPage,
 })
 
 const sessionsRoute = createRoute({
@@ -1826,9 +1964,15 @@ const browseRoute = createRoute({
     component: BrowsePage,
 })
 
-const memoryRoute = createRoute({
+const pluginsRoute = createRoute({
     getParentRoute: () => rootRoute,
-    path: '/memory',
+    path: '/plugins',
+    component: PluginsPage,
+})
+
+const openVikingPluginRoute = createRoute({
+    getParentRoute: () => rootRoute,
+    path: '/plugins/openviking',
     validateSearch: (search: Record<string, unknown>): { machineId?: string } => {
         const machineId = typeof search.machineId === 'string' && search.machineId.trim().length > 0
             ? search.machineId
@@ -1838,16 +1982,87 @@ const memoryRoute = createRoute({
     component: OpenVikingPage,
 })
 
+const voicePluginRoute = createRoute({
+    getParentRoute: () => rootRoute,
+    path: '/plugins/voice',
+    component: VoicePluginPage,
+})
+
+const notificationsPluginRoute = createRoute({
+    getParentRoute: () => rootRoute,
+    path: '/plugins/notifications',
+    component: NotificationsPluginPage,
+})
+
+const terminalPluginRoute = createRoute({
+    getParentRoute: () => rootRoute,
+    path: '/plugins/terminal',
+    component: TerminalPluginPage,
+})
+
 const settingsRoute = createRoute({
     getParentRoute: () => rootRoute,
     path: '/settings',
     component: SettingsPage,
 })
 
+const localServiceRoute = createRoute({
+    getParentRoute: () => rootRoute,
+    path: '/local-service',
+    component: LocalServicePage,
+})
+
 const sharesRoute = createRoute({
     getParentRoute: () => rootRoute,
     path: '/shares',
     component: Outlet,
+})
+
+const skillsRoute = createRoute({
+    getParentRoute: () => rootRoute,
+    path: '/skills',
+    component: SkillsPage,
+})
+
+const monitorsRoute = createRoute({
+    getParentRoute: () => rootRoute,
+    path: '/monitors',
+    component: Outlet,
+})
+
+const monitorsIndexRoute = createRoute({
+    getParentRoute: () => monitorsRoute,
+    path: '/',
+    component: MonitorsPage,
+})
+
+const monitorCreateRoute = createRoute({
+    getParentRoute: () => monitorsRoute,
+    path: 'new',
+    validateSearch: (search: Record<string, unknown>): {
+        type?: 'managed' | 'native-codex'
+        sessionId?: string
+        machineId?: string
+    } => {
+        const type = search.type === 'managed' || search.type === 'native-codex'
+            ? search.type
+            : undefined
+        const sessionId = typeof search.sessionId === 'string' && search.sessionId.trim().length > 0
+            ? search.sessionId.trim()
+            : undefined
+        const machineId = typeof search.machineId === 'string' && search.machineId.trim().length > 0
+            ? search.machineId.trim()
+            : undefined
+        if (!type || !sessionId || type === 'native-codex' && !machineId) return {}
+        return { type, sessionId, ...(machineId ? { machineId } : {}) }
+    },
+    component: MonitorCreatePage,
+})
+
+const monitorDetailRoute = createRoute({
+    getParentRoute: () => monitorsRoute,
+    path: '$monitorId',
+    component: MonitorPage,
 })
 
 const sharesIndexRoute = createRoute({
@@ -1883,6 +2098,8 @@ const shareRoute = createRoute({
 
 export const routeTree = rootRoute.addChildren([
     indexRoute,
+    installRoute,
+    pairRoute,
     sessionsRoute.addChildren([
         sessionsIndexRoute,
         newSessionRoute,
@@ -1895,13 +2112,24 @@ export const routeTree = rootRoute.addChildren([
         ]),
     ]),
     browseRoute,
-    memoryRoute,
+    pluginsRoute,
+    openVikingPluginRoute,
+    voicePluginRoute,
+    notificationsPluginRoute,
+    terminalPluginRoute,
+    skillsRoute,
     sharesRoute.addChildren([
         sharesIndexRoute,
         kanbanTaskRoute,
     ]),
+    monitorsRoute.addChildren([
+        monitorsIndexRoute,
+        monitorCreateRoute,
+        monitorDetailRoute,
+    ]),
     settingsRoute,
     shareRoute,
+    localServiceRoute,
 ])
 
 type RouterHistory = Parameters<typeof createRouter>[0]['history']

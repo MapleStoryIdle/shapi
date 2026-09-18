@@ -1,5 +1,8 @@
 import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
+import type { CodexTokenUsage, CodexUsageAccount } from '@hapi/protocol/codexUsage'
+import { CodexUsageDrawer } from './CodexUsageDrawer'
 import { RefreshCw as RefreshIconNode, Wifi as WifiIconNode, WifiOff as WifiOffIconNode } from 'lucide'
+import { Bot, ChevronRight, Clock3, Folder, Hash, Pencil, Tag, UsersRound, X } from 'lucide-react'
 import type { CodexSubscriptionLimits, CodexSubscriptionLimitWindow, Session } from '@/types/api'
 import type { ApiClient } from '@/api/client'
 import { isTelegramApp } from '@/hooks/useTelegram'
@@ -11,6 +14,12 @@ import {
     type SessionConnectionHealth
 } from '@/lib/session-connection-context'
 import { SessionActionMenu } from '@/components/SessionActionMenu'
+import { SessionGroupDrawer } from '@/components/SessionGroupDrawer'
+import { SessionLabelDialog } from '@/components/SessionLabelDialog'
+import { resolveSessionGroup, useSessionGroups } from '@/hooks/useSessionGroups'
+import { resolveSessionLabel, useSessionLabels } from '@/hooks/useSessionLabels'
+import type { SessionGroup } from '@hapi/protocol/sessionGroups'
+import { GitBranchesDrawer } from '@/components/GitBranchesDrawer'
 import { SessionExportDialog } from '@/components/SessionExportDialog'
 import { RenameSessionDialog } from '@/components/RenameSessionDialog'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
@@ -22,82 +31,95 @@ import type { StatusBarProps } from '@/components/AssistantChat/StatusBar'
 import { CheckIcon, CopyIcon } from '@/components/icons'
 import { MotionIcon, toMotionIcon } from '@/components/MotionIcon'
 import { SESSION_DETAIL_HEADER_ROW_CLASS, SESSION_DETAIL_HEADER_SAFE_AREA_CLASS } from '@/components/SessionDetailHeader'
+import { useMachineGitBranch } from '@/hooks/queries/useGitBranch'
+import { getSessionDisplayTitle } from '@/lib/session-title'
 
 type Translator = (key: string, params?: Record<string, string | number>) => string
-
-function getSessionTitle(session: Session): string {
-    if (session.metadata?.name) {
-        return session.metadata.name
-    }
-    if (session.metadata?.summary?.text) {
-        return session.metadata.summary.text
-    }
-    if (session.metadata?.path) {
-        const parts = session.metadata.path.split('/').filter(Boolean)
-        return parts.length > 0 ? parts[parts.length - 1] : session.id.slice(0, 8)
-    }
-    return session.id.slice(0, 8)
-}
 
 function getSessionProjectPath(session: Session): string | null {
     return session.metadata?.worktree?.basePath ?? session.metadata?.path ?? null
 }
 
 function SessionHeaderDetailRow(props: {
-    label: string
-    value: string
+    detail: SessionHeaderDetail
     copied: boolean
     onCopy: () => void
-    isAgentInfo?: boolean
+    divided?: boolean
 }) {
     const { t } = useTranslation()
-    const agentParts = props.isAgentInfo
-        ? props.value.split(' · ').map((part) => part.trim()).filter(Boolean)
+    const { detail } = props
+    const agentParts = detail.isAgentInfo
+        ? detail.value.split(' · ').map((part) => part.trim()).filter(Boolean)
         : []
+    const Icon = detail.key === 'group'
+        ? UsersRound
+        : detail.key === 'label'
+            ? Tag
+            : detail.key === 'path'
+                ? Folder
+                : detail.key === 'last-activity'
+                    ? Clock3
+                    : detail.key === 'agent'
+                        ? Bot
+                        : Hash
+
+    const content = (
+        <>
+            <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[9px] bg-[var(--app-subtle-bg)] text-[var(--app-hint)]">
+                <Icon className="h-[17px] w-[17px]" strokeWidth={1.8} aria-hidden="true" />
+            </span>
+            <span className="min-w-0 flex-1 py-2.5">
+                <span className="block text-[11px] font-medium leading-4 text-[var(--app-hint)]">{detail.label}</span>
+                {agentParts.length > 0 ? (
+                    <span className="mt-0.5 block">
+                        <span className="block truncate text-sm font-semibold leading-5 text-[var(--app-fg)]">{agentParts[0]}</span>
+                        {agentParts.length > 1 ? (
+                            <span className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5">
+                                {agentParts.slice(1).map((part, index) => {
+                                    const [rawKey, ...rest] = part.split(':')
+                                    const hasValue = rest.length > 0
+                                    return (
+                                        <span key={`${part}-${index}`} className="min-w-0 text-xs leading-4 text-[var(--app-hint)]">
+                                            {hasValue ? <><span>{rawKey.trim()}:</span> <span className="font-medium text-[var(--app-fg)]">{rest.join(':').trim()}</span></> : <span className="font-medium text-[var(--app-fg)]">{part}</span>}
+                                        </span>
+                                    )
+                                })}
+                            </span>
+                        ) : null}
+                    </span>
+                ) : (
+                    <span className={`mt-0.5 block text-sm font-medium leading-5 text-[var(--app-fg)] ${detail.key === 'session-id' || detail.key === 'codex-session-id' ? 'break-all font-mono text-xs' : 'line-clamp-2 break-words'}`} title={detail.value}>{detail.value}</span>
+                )}
+            </span>
+        </>
+    )
+
+    if (detail.onSelect) return (
+        <button
+            type="button"
+            aria-label={detail.value}
+            onClick={detail.onSelect}
+            className={`flex min-h-[58px] w-full items-center gap-3 px-3 text-left transition-colors active:bg-[var(--app-subtle-bg)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--app-link)] ${props.divided ? 'border-t border-[var(--app-divider)]' : ''}`}
+        >
+            {content}
+            <ChevronRight className="h-4 w-4 shrink-0 text-[var(--app-hint)]" strokeWidth={1.8} aria-hidden="true" />
+        </button>
+    )
 
     return (
-        <div className="min-w-0 rounded-[16px] border border-[var(--app-border)] bg-[var(--app-subtle-bg)] px-3 py-2.5">
-            <div className="mb-1.5 flex items-center justify-between gap-3">
-                <div className="text-[11px] font-semibold leading-4 tracking-wide text-[var(--app-hint)]">{props.label}</div>
-                <button
-                    type="button"
-                    onClick={props.onCopy}
-                    className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[var(--app-hint)] transition-colors hover:bg-[var(--app-bg)] hover:text-[var(--app-fg)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)]"
-                    aria-label={t('session.header.details.copy', { label: props.label })}
-                    title={t('session.header.details.copy', { label: props.label })}
-                >
-                    {props.copied
-                        ? <CheckIcon className="h-4 w-4 text-green-500" />
-                        : <CopyIcon className="h-4 w-4" />}
-                </button>
-            </div>
-
-            {agentParts.length > 0 ? (
-                <div className="flex flex-wrap gap-1.5">
-                    {agentParts.map((part, index) => {
-                        const [rawKey, ...rest] = part.split(':')
-                        const hasValue = rest.length > 0
-                        const isAgentFlavor = !hasValue && index === 0
-                        const key = hasValue ? rawKey.trim() : isAgentFlavor ? 'agent' : ''
-                        const value = hasValue ? rest.join(':').trim() : part
-                        return (
-                            <span
-                                // The agent info string is derived from session metadata;
-                                // index keeps duplicate keys copy-safe without changing text.
-                                key={`${part}-${index}`}
-                                className="inline-flex min-w-0 max-w-full items-center gap-1 rounded-full border border-[var(--app-border)] bg-[var(--app-bg)] px-2 py-1 text-xs leading-4 text-[var(--app-fg)]"
-                            >
-                                {key ? (
-                                    <span className="shrink-0 font-medium text-[var(--app-hint)]">{key}:</span>
-                                ) : null}
-                                <span className="min-w-0 truncate font-semibold">{value}</span>
-                            </span>
-                        )
-                    })}
-                </div>
-            ) : (
-                <div className="break-words text-sm font-medium leading-5 text-[var(--app-fg)]">{props.value}</div>
-            )}
+        <div className={`flex min-h-[58px] items-center gap-3 px-3 ${props.divided ? 'border-t border-[var(--app-divider)]' : ''}`}>
+            {content}
+            <button
+                type="button"
+                onClick={props.onCopy}
+                className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-[var(--app-hint)] transition-colors active:bg-[var(--app-subtle-bg)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)]"
+                aria-label={t('session.header.details.copy', { label: detail.label })}
+                title={t('session.header.details.copy', { label: detail.label })}
+            >
+                {props.copied
+                    ? <CheckIcon className="h-4 w-4 text-green-500" />
+                    : <CopyIcon className="h-4 w-4" />}
+            </button>
         </div>
     )
 }
@@ -107,6 +129,7 @@ export type SessionHeaderDetail = {
     label: string
     value: string
     isAgentInfo?: boolean
+    onSelect?: () => void
 }
 
 type SessionHeaderDetailsRef = {
@@ -121,8 +144,13 @@ const EMPTY_SESSION_HEADER_DETAILS: readonly SessionHeaderDetail[] = []
  * operator should see the same rows in the same order.
  */
 export function buildSessionHeaderDetails(input: {
+    group?: SessionGroup
+    onSetGroup?: () => void
+    label?: string
+    onSetLabel?: () => void
     title: string
     sessionId: string
+    codexSessionId?: string | null
     projectPath?: string | null
     lastActivityAt?: number | null
     agentFlavor?: string | null
@@ -149,7 +177,12 @@ export function buildSessionHeaderDetails(input: {
 
     return [
         { key: 'title', label: t('session.header.details.fullName'), value: input.title },
+        ...(input.onSetGroup ? [{ key: 'group', label: t('session.groups.title'), value: input.group ? `${input.group.emoji} ${input.group.name}` : t('session.groups.none'), onSelect: input.onSetGroup }] : []),
+        ...(input.onSetLabel ? [{ key: 'label', label: t('session.labels.title'), value: input.label ?? t('session.labels.none'), onSelect: input.onSetLabel }] : []),
         { key: 'session-id', label: t('session.header.details.sessionId'), value: input.sessionId },
+        ...(input.codexSessionId && input.codexSessionId !== input.sessionId
+            ? [{ key: 'codex-session-id', label: t('session.header.details.codexSessionId'), value: input.codexSessionId }]
+            : []),
         {
             key: 'path',
             label: t('session.header.details.projectPath'),
@@ -179,6 +212,7 @@ function formatHeaderDateTime(value: number): string {
 export const SessionTitleDetails = memo(function SessionTitleDetails(props: {
     title: string
     sessionId?: string
+    onRename?: () => void
     details?: readonly SessionHeaderDetail[]
     /**
      * Normal SHAPI chats keep their latest details in this stable ref. A token
@@ -191,6 +225,7 @@ export const SessionTitleDetails = memo(function SessionTitleDetails(props: {
 }) {
     const { t } = useTranslation()
     const [detailsOpen, setDetailsOpen] = useState(false)
+    const [detailsTab, setDetailsTab] = useState<'overview' | 'technical'>('overview')
     const detailsId = useId()
     const titleDetailsRef = useRef<HTMLDivElement | null>(null)
     const copyResetTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined)
@@ -238,22 +273,39 @@ export const SessionTitleDetails = memo(function SessionTitleDetails(props: {
     useEffect(() => () => clearTimeout(copyResetTimerRef.current), [])
 
     useEffect(() => {
+        if (!detailsOpen) setDetailsTab('overview')
+    }, [detailsOpen])
+
+    useEffect(() => {
         setDetailsOpen(false)
+        setDetailsTab('overview')
         setCopiedDetailKey(null)
     }, [props.sessionId])
+
+    const titleDetail = details.find((detail) => detail.key === 'title')
+    const detailGroups = detailsTab === 'overview'
+        ? [
+            details.filter((detail) => detail.key === 'group' || detail.key === 'label'),
+            details.filter((detail) => detail.key === 'path'),
+            details.filter((detail) => detail.key === 'agent')
+        ].filter((group) => group.length > 0)
+        : [
+            details.filter((detail) => detail.key === 'last-activity'),
+            details.filter((detail) => detail.key === 'session-id' || detail.key === 'codex-session-id')
+        ].filter((group) => group.length > 0)
 
     return (
         <div ref={titleDetailsRef} className="relative min-w-0 max-w-[min(58vw,22rem)]">
             <button
                 type="button"
                 onClick={toggleDetails}
-                className="pointer-events-auto touch-manipulation flex h-11 max-w-full items-center truncate rounded-full pl-1 pr-2 text-left text-[15px] font-medium leading-5 tracking-[-0.01em] text-[var(--app-fg)] transition-colors hover:text-[var(--app-link)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)]"
+                className="pointer-events-auto touch-manipulation flex h-11 w-full min-w-0 items-center rounded-full px-1 text-left text-[15px] font-medium leading-5 tracking-[-0.01em] text-[var(--app-fg)] transition-colors hover:text-[var(--app-link)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)]"
                 aria-haspopup="dialog"
                 aria-expanded={detailsOpen}
                 aria-controls={detailsOpen ? detailsId : undefined}
                 title={props.title}
             >
-                {props.title}
+                <span className="min-w-0 flex-1 truncate">{props.title}</span>
             </button>
 
             {detailsOpen ? (
@@ -261,19 +313,72 @@ export const SessionTitleDetails = memo(function SessionTitleDetails(props: {
                     id={detailsId}
                     role="dialog"
                     aria-label={t('session.header.details.title')}
-                    className="pointer-events-auto fixed left-3 top-[calc(var(--app-safe-area-top)+4.25rem)] z-50 w-[min(calc(100vw-1.5rem),22rem)] rounded-[20px] border border-[var(--app-border)] bg-[var(--app-bg)] p-3 text-left shadow-[0_18px_48px_rgba(15,23,42,0.18)]"
+                    data-testid="session-title-details-popover"
+                    className="session-title-popover pointer-events-auto fixed z-50 overflow-y-auto overscroll-contain rounded-[22px] border border-[var(--app-border)] bg-[var(--app-secondary-bg)] p-2.5 text-left shadow-[0_20px_56px_rgba(15,23,42,0.2)]"
                 >
-                    <div className="mb-2 px-1 text-sm font-semibold text-[var(--app-fg)]">{t('session.header.details.title')}</div>
-                    <div className="flex flex-col gap-2">
-                        {details.map((row) => (
-                            <SessionHeaderDetailRow
-                                key={row.key}
-                                label={row.label}
-                                value={row.value}
-                                copied={copiedDetailKey === row.key}
-                                onCopy={() => copyDetail(row.key, row.value)}
-                                isAgentInfo={row.isAgentInfo}
-                            />
+                    <div className="flex min-h-11 items-center justify-between gap-3 px-1.5">
+                        <div className="min-w-0 text-[13px] font-semibold text-[var(--app-hint)]">{t('session.header.details.title')}</div>
+                        <button
+                            type="button"
+                            onClick={() => setDetailsOpen(false)}
+                            className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-[var(--app-hint)] transition-colors active:bg-[var(--app-subtle-bg)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)]"
+                            aria-label={t('button.close')}
+                        >
+                            <X className="h-[18px] w-[18px]" strokeWidth={2} aria-hidden="true" />
+                        </button>
+                    </div>
+
+                    <div role="tablist" aria-label={t('session.header.details.title')} className="mb-2.5 grid grid-cols-2 rounded-xl bg-[var(--app-subtle-bg)] p-1">
+                        {(['overview', 'technical'] as const).map((tab) => (
+                            <button
+                                key={tab}
+                                type="button"
+                                role="tab"
+                                aria-selected={detailsTab === tab}
+                                onClick={() => setDetailsTab(tab)}
+                                className={`min-h-9 rounded-lg px-3 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)] ${detailsTab === tab ? 'bg-[var(--app-bg)] text-[var(--app-fg)] shadow-sm' : 'text-[var(--app-hint)]'}`}
+                            >
+                                {t(tab === 'overview' ? 'session.header.details.overview' : 'session.header.details.technical')}
+                            </button>
+                        ))}
+                    </div>
+
+                    <div className="flex flex-col gap-2.5">
+                        <div className="flex min-h-[68px] items-center gap-3 rounded-[16px] border border-[var(--app-border)] bg-[var(--app-bg)] px-3 py-2.5" data-session-detail-group="title">
+                            <span className="min-w-0 flex-1">
+                                <span className="block text-[11px] font-medium leading-4 text-[var(--app-hint)]">{titleDetail?.label ?? t('session.header.details.fullName')}</span>
+                                <span className="mt-0.5 line-clamp-3 block break-words text-[15px] font-semibold leading-5 text-[var(--app-fg)]" title={titleDetail?.value ?? props.title}>
+                                    {titleDetail?.value ?? props.title}
+                                </span>
+                            </span>
+                            {props.onRename ? <button
+                                type="button"
+                                onClick={() => { setDetailsOpen(false); props.onRename?.() }}
+                                className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-[var(--app-hint)] transition-colors active:bg-[var(--app-subtle-bg)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)]"
+                                aria-label={t('session.action.rename')}
+                            >
+                                <Pencil className="h-4 w-4" aria-hidden="true" />
+                            </button> : null}
+                        </div>
+
+                        {detailGroups.map((group, groupIndex) => (
+                            <div
+                                key={group.map((detail) => detail.key).join('-')}
+                                data-session-detail-group={`${detailsTab}-${groupIndex}`}
+                                className="overflow-hidden rounded-[16px] border border-[var(--app-border)] bg-[var(--app-bg)]"
+                            >
+                                {group.map((detail, rowIndex) => (
+                                    <SessionHeaderDetailRow
+                                        key={detail.key}
+                                        detail={detail.onSelect
+                                            ? { ...detail, onSelect: () => { setDetailsOpen(false); detail.onSelect?.() } }
+                                            : detail}
+                                        copied={copiedDetailKey === detail.key}
+                                        onCopy={() => copyDetail(detail.key, detail.value)}
+                                        divided={rowIndex > 0}
+                                    />
+                                ))}
+                            </div>
                         ))}
                     </div>
                 </div>
@@ -465,6 +570,7 @@ export function FloatingSessionHeader(props: {
     details?: readonly SessionHeaderDetail[]
     detailsRef?: SessionHeaderDetailsRef
     detailsRevision?: string
+    onRename?: () => void
     actions?: ReactNode
     floating?: boolean
 }) {
@@ -498,7 +604,7 @@ export function FloatingSessionHeader(props: {
             <div className={SESSION_DETAIL_HEADER_ROW_CLASS} data-testid="session-header-row">
                 <div
                     data-testid="session-header-controls"
-                    className={`pointer-events-auto flex h-11 min-w-0 items-center gap-0 rounded-full border px-1 ${headerSurfaceClass} ${headerElevationClass}`}
+                    className={`pointer-events-auto flex h-11 min-w-0 items-center gap-0 rounded-full border pl-1 pr-5 ${headerSurfaceClass} ${headerElevationClass}`}
                 >
                     <SessionHeaderBackButton onBack={props.onBack} label={props.backLabel} />
                     <SessionTitleDetails
@@ -507,6 +613,7 @@ export function FloatingSessionHeader(props: {
                         details={props.details}
                         detailsRef={props.detailsRef}
                         detailsRevision={props.detailsRevision}
+                        onRename={props.onRename}
                     />
                 </div>
 
@@ -631,34 +738,23 @@ function formatResetAt(resetsAt: number | null, locale: string): string | null {
     if (Number.isNaN(date.getTime())) {
         return null
     }
-    return date.toLocaleString(locale === 'zh-CN' ? 'zh-CN' : 'en-US')
+    return date.toLocaleString(locale === 'zh-CN' ? 'zh-CN' : 'en-US', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
 }
 
-function QuotaProgressBar(props: { remainingPercent: number | null }) {
-    const remaining = props.remainingPercent === null ? 0 : clampPercent(props.remainingPercent)
-    const fillStyle = {
-        clipPath: `inset(0 ${100 - remaining}% 0 0)`,
-        background: 'linear-gradient(90deg, #ef4444 0%, #ef4444 8%, #f97316 22%, #f97316 32%, #38bdf8 48%, #38bdf8 62%, #22c55e 78%, #22c55e 100%)'
-    } satisfies CSSProperties
-
-    return (
-        <div className="relative h-1.5 overflow-hidden rounded-full bg-[var(--app-border)]">
-            <div className="absolute inset-0" style={fillStyle} />
-        </div>
-    )
-}
 
 export function CodexSubscriptionLimitsBadge(props: {
     limits: CodexSubscriptionLimits | null
     isFetching: boolean
     error: string | null
+    account?: CodexUsageAccount | null
+    usage?: CodexTokenUsage | null
+    onRefresh?: () => void
 }) {
     const { t, locale } = useTranslation()
     const [open, setOpen] = useState(false)
     const toggleOpen = useCallback(() => {
         setOpen((value) => !value)
     }, [])
-    const rootRef = useRef<HTMLDivElement | null>(null)
     const windows = getDisplayLimitWindows(props.limits)
     const text = windows.map((window) => formatLimitWindow(window, t)).filter(Boolean).join(' · ')
     const rows = windows.map((window) => ({
@@ -683,39 +779,14 @@ export function CodexSubscriptionLimitsBadge(props: {
         .filter(Boolean)
         .join('\n')
     const title = props.error
-        ? t('session.header.codexLimits.unavailable', { error: props.error })
+        ? t('usage.refreshFailed')
         : resetDetails || t('session.header.codexLimits.title')
     const updatedAt = formatLimitUpdatedAt(props.limits?.updatedAt, locale)
 
-    useEffect(() => {
-        if (!open) return
-
-        const handlePointerDown = (event: PointerEvent) => {
-            const target = event.target as Node
-            if (rootRef.current?.contains(target)) return
-            setOpen(false)
-        }
-
-        const handleKeyDown = (event: KeyboardEvent) => {
-            if (event.key === 'Escape') {
-                setOpen(false)
-            }
-        }
-
-        document.addEventListener('pointerdown', handlePointerDown)
-        document.addEventListener('keydown', handleKeyDown)
-        return () => {
-            document.removeEventListener('pointerdown', handlePointerDown)
-            document.removeEventListener('keydown', handleKeyDown)
-        }
-    }, [open])
-
-    if (windows.length === 0) {
-        return null
-    }
+    if (!props.limits || rows.length === 0) return null
 
     return (
-        <div ref={rootRef} className="pointer-events-auto relative shrink-0">
+        <div className="pointer-events-auto relative shrink-0">
             <button
                 type="button"
                 onClick={toggleOpen}
@@ -728,6 +799,7 @@ export function CodexSubscriptionLimitsBadge(props: {
                 aria-haspopup="dialog"
                 aria-expanded={open}
             >
+                {rows.length === 0 ? <span>{t('session.header.codexLimits.title')}</span> : null}
                 {rows.map((row) => (
                     <span key={row.label} className="grid grid-cols-[auto_auto] items-center gap-x-1.5">
                         <span className="text-[var(--app-fg)]">{row.label}</span>
@@ -738,45 +810,9 @@ export function CodexSubscriptionLimitsBadge(props: {
                 ))}
             </button>
 
-            {open ? (
-                <div
-                    role="dialog"
-                    aria-label={t('session.header.codexLimits.title')}
-                    className="absolute right-0 top-full z-50 mt-2 w-[248px] rounded-[18px] border border-[var(--app-border)] bg-[var(--app-bg)] p-3 text-left shadow-[0_18px_48px_rgba(15,23,42,0.18)]"
-                >
-                    <div className="mb-2 flex items-center justify-between gap-3 px-0.5">
-                        <div className="text-sm font-semibold text-[var(--app-fg)]">{t('session.header.codexLimits.title')}</div>
-                        <div className="text-[11px] text-[var(--app-hint)]">
-                            {props.isFetching
-                                ? t('session.header.codexLimits.updating')
-                                : updatedAt
-                                    ? t('session.header.codexLimits.updatedAt', { time: updatedAt })
-                                    : t('session.header.codexLimits.updated')}
-                        </div>
-                    </div>
-
-                    <div className="flex flex-col gap-2">
-                        {rows.map((row) => (
-                            <div key={row.label} className="rounded-[13px] border border-[var(--app-border)] bg-[var(--app-subtle-bg)] p-2.5">
-                                <div className="mb-2 flex items-baseline justify-between gap-3 tabular-nums">
-                                    <div className="text-sm font-semibold text-[var(--app-fg)]">
-                                        {t('session.header.codexLimits.windowLabel', { window: row.label })}
-                                    </div>
-                                    <div className={['text-lg font-bold', getLimitPercentClass(row.remaining)].join(' ')}>
-                                        {row.remaining === null ? '--' : `${row.remaining}%`}
-                                    </div>
-                                </div>
-                                <QuotaProgressBar remainingPercent={row.remaining} />
-                                <div className="mt-2 truncate text-[11px] text-[var(--app-hint)]">
-                                    {row.resetAt
-                                        ? t('session.header.codexLimits.resetAt', { time: row.resetAt })
-                                        : t('session.header.codexLimits.resetUnknown')}
-                                </div>
-                            </div>
-                        ))}
-                    </div>
-                </div>
-            ) : null}
+            <CodexUsageDrawer open={open} onOpenChange={setOpen} account={props.account} usage={props.usage}
+                rows={rows} updatedAt={updatedAt} isFetching={props.isFetching} error={props.error}
+                onRefresh={props.onRefresh} />
         </div>
     )
 }
@@ -795,16 +831,45 @@ export const SessionHeader = memo(function SessionHeader(props: {
     onSessionReopened?: (newSessionId: string) => void
     onCreateSideSession?: () => void
     sideSessionPending?: boolean
+    onCreateMonitor?: () => void
     status?: SessionHeaderStatus
     floating?: boolean
 }) {
     const { t } = useTranslation()
     const { session, api, onSessionDeleted, onSessionReopened } = props
-    const title = useMemo(() => getSessionTitle(session), [session])
+    const groupsQuery = useSessionGroups(api)
+    const labelsQuery = useSessionLabels(api)
+    const groupSource = useMemo(() => ({ type: 'managed' as const, sessionId: session.id }), [session.id])
+    const nativeGroupAlias = useMemo(() => session.metadata?.machineId && session.metadata?.codexSessionId
+        ? { type: 'native-codex' as const, machineId: session.metadata.machineId, codexSessionId: session.metadata.codexSessionId }
+        : null, [session.metadata?.machineId, session.metadata?.codexSessionId])
+    const sessionGroup = resolveSessionGroup(groupsQuery.data, groupSource, nativeGroupAlias)
+    const sessionLabel = resolveSessionLabel(labelsQuery.data, groupSource, nativeGroupAlias)
+    const [groupOpen, setGroupOpen] = useState(false)
+    const [labelOpen, setLabelOpen] = useState(false)
+    const openGroup = useCallback(() => setGroupOpen(true), [])
+    const openLabel = useCallback(() => setLabelOpen(true), [])
+    const title = useMemo(() => getSessionDisplayTitle(session), [session])
     const projectPath = useMemo(() => getSessionProjectPath(session), [session])
+    // A worktree session must act on its actual checkout, while the title
+    // details may still show the stable project base path.
+    const gitProjectPath = session.metadata?.path ?? projectPath
+    const machineId = session.metadata?.machineId ?? null
+    const { isGitRepository } = useMachineGitBranch(
+        api,
+        machineId,
+        gitProjectPath,
+        true,
+        { refetchInterval: false }
+    )
     const sessionDetails = useMemo(() => buildSessionHeaderDetails({
+        group: sessionGroup,
+        onSetGroup: api ? openGroup : undefined,
+        label: sessionLabel,
+        onSetLabel: api ? openLabel : undefined,
         title,
         sessionId: session.id,
+        codexSessionId: session.metadata?.codexSessionId,
         projectPath,
         lastActivityAt: session.updatedAt,
         agentFlavor: session.metadata?.flavor,
@@ -815,10 +880,12 @@ export const SessionHeader = memo(function SessionHeader(props: {
         permissionMode: session.permissionMode,
         collaborationMode: session.collaborationMode
     }, t), [
+        sessionGroup, sessionLabel, api, openGroup, openLabel,
         projectPath,
         session.collaborationMode,
         session.effort,
         session.id,
+        session.metadata?.codexSessionId,
         session.metadata?.flavor,
         session.model,
         session.modelReasoningEffort,
@@ -835,7 +902,9 @@ export const SessionHeader = memo(function SessionHeader(props: {
     const sessionDetailsRef = useRef<readonly SessionHeaderDetail[]>(sessionDetails)
     sessionDetailsRef.current = sessionDetails
     const sessionDetailsRevision = [
+        sessionGroup?.id ?? '', sessionGroup?.name ?? '', sessionGroup?.emoji ?? '', sessionLabel ?? '',
         session.id,
+        session.metadata?.codexSessionId ?? '',
         projectPath ?? '',
         session.metadata?.flavor ?? '',
         session.model ?? '',
@@ -853,9 +922,11 @@ export const SessionHeader = memo(function SessionHeader(props: {
     const [renameOpen, setRenameOpen] = useState(false)
     const [exportOpen, setExportOpen] = useState(false)
     const [archiveOpen, setArchiveOpen] = useState(false)
+    const [releaseControlOpen, setReleaseControlOpen] = useState(false)
     const [deleteOpen, setDeleteOpen] = useState(false)
+    const [gitBranchesOpen, setGitBranchesOpen] = useState(false)
 
-    const { archiveSession, reopenSession, renameSession, deleteSession, isPending } = useSessionActions(
+    const { archiveSession, releaseSessionControl, reopenSession, renameSession, deleteSession, isPending } = useSessionActions(
         api,
         session.id,
         session.metadata?.flavor ?? null
@@ -864,6 +935,7 @@ export const SessionHeader = memo(function SessionHeader(props: {
         api,
         sessionId: session.id,
         model: session.model ?? null,
+        provider: session.metadata?.codexModelProvider,
         enabled: session.active && session.metadata?.flavor === 'codex',
         thinking: props.status?.thinking ?? session.thinking
     })
@@ -886,6 +958,12 @@ export const SessionHeader = memo(function SessionHeader(props: {
         }
     }
 
+    const canReleaseControl = session.active
+        && session.metadata?.flavor === 'codex'
+        && session.metadata.startedFromRunner === true
+        && session.metadata.controlOwner !== 'external'
+        && session.agentState?.controlledByUser !== true
+
     const handleMenuToggle = () => {
         if (!menuOpen && menuAnchorRef.current) {
             const rect = menuAnchorRef.current.getBoundingClientRect()
@@ -907,12 +985,16 @@ export const SessionHeader = memo(function SessionHeader(props: {
                 sessionId={session.id}
                 detailsRef={sessionDetailsRef}
                 detailsRevision={sessionDetailsRevision}
+                onRename={() => setRenameOpen(true)}
                 floating={props.floating}
                 actions={(
                     <>
                         {session.metadata?.flavor === 'codex' ? (
                             <CodexSubscriptionLimitsBadge
                                 limits={codexLimitsState.limits}
+                                account={codexLimitsState.account}
+                                usage={session.metadata?.codexTokenUsage}
+                                onRefresh={() => { codexLimitsState.refresh(); props.onRefresh?.() }}
                                 isFetching={codexLimitsState.isFetching}
                                 error={codexLimitsState.error}
                             />
@@ -941,25 +1023,32 @@ export const SessionHeader = memo(function SessionHeader(props: {
                 )}
             />
 
+            <SessionGroupDrawer key={session.id} api={api} source={groupSource} nativeAlias={nativeGroupAlias} open={groupOpen} onOpenChange={setGroupOpen} />
+            <SessionLabelDialog api={api} source={groupSource} nativeAlias={nativeGroupAlias} currentLabel={sessionLabel} open={labelOpen} onOpenChange={setLabelOpen} />
             <SessionActionMenu
                 isOpen={menuOpen}
                 onClose={() => setMenuOpen(false)}
                 sessionActive={session.active}
-                onRefresh={props.onRefresh}
-                refreshPending={props.refreshPending}
-                onRename={() => setRenameOpen(true)}
-                onExport={() => setExportOpen(true)}
+                onGitBranches={isGitRepository ? () => setGitBranchesOpen(true) : undefined}
                 onArchive={() => setArchiveOpen(true)}
+                onReleaseControl={canReleaseControl ? () => setReleaseControlOpen(true) : undefined}
                 onReopen={handleReopen}
                 onDelete={() => setDeleteOpen(true)}
                 onToggleFiles={props.onToggleFiles}
                 filesActive={props.filesActive}
-                onToggleOutline={props.onToggleOutline}
-                outlineActive={props.outlineActive}
                 onCreateSideSession={props.onCreateSideSession}
                 sideSessionPending={props.sideSessionPending}
+                onCreateMonitor={props.onCreateMonitor}
                 anchorPoint={menuAnchorPoint}
                 menuId={menuId}
+            />
+
+            <GitBranchesDrawer
+                api={api}
+                machineId={machineId}
+                cwd={gitProjectPath}
+                open={gitBranchesOpen}
+                onOpenChange={setGitBranchesOpen}
             />
 
             {reopenError ? (
@@ -1000,6 +1089,17 @@ export const SessionHeader = memo(function SessionHeader(props: {
                 onConfirm={archiveSession}
                 isPending={isPending}
                 destructive
+            />
+
+            <ConfirmDialog
+                isOpen={releaseControlOpen}
+                onClose={() => setReleaseControlOpen(false)}
+                title={t('dialog.releaseControl.title')}
+                description={t('dialog.releaseControl.description')}
+                confirmLabel={t('dialog.releaseControl.confirm')}
+                confirmingLabel={t('dialog.releaseControl.confirming')}
+                onConfirm={releaseSessionControl}
+                isPending={isPending}
             />
 
             <ConfirmDialog

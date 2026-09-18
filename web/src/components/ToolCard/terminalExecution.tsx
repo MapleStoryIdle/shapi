@@ -1,8 +1,12 @@
+import { useLayoutEffect, useRef } from 'react'
+import { TerminalTranscript } from './TerminalTranscript'
 import type { ToolCallBlock } from '@/chat/types'
 import { isObject } from '@hapi/protocol'
 import { CodeBlock } from '@/components/CodeBlock'
 import { cn } from '@/lib/utils'
 import { useTranslation } from '@/lib/use-translation'
+import { stripAnsiTerminalSequences } from './AnsiTerminalText'
+import { getTerminalCommandForDetail } from './terminalCommandIntent'
 
 const TERMINAL_EXECUTION_TOOL_NAMES = new Set(['Bash', 'CodexBash', 'shell_command', 'run_shell_command'])
 
@@ -18,7 +22,72 @@ export type TerminalExecutionDetails = {
 
 export type TerminalExecutionState = 'pending' | 'running' | 'completed' | 'failed'
 
-export type TerminalExecutionDrawerTab = 'output' | 'input' | 'environment'
+const EXEC_OUTPUT_ENVELOPE_KEYS = new Set([
+    'chunk_id',
+    'exit_code',
+    'original_token_count',
+    'output',
+    'session_id',
+    'wall_time_seconds'
+])
+
+function unwrapExecOutputEnvelope(value: string | null): string | null {
+    if (value === null) return null
+    const trimmed = value.trim()
+    if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return value
+
+    try {
+        const parsed: unknown = JSON.parse(trimmed)
+        if (!isObject(parsed) || typeof parsed.output !== 'string') return value
+        const keys = Object.keys(parsed)
+        return keys.length > 0 && keys.every((key) => EXEC_OUTPUT_ENVELOPE_KEYS.has(key))
+            ? parsed.output
+            : value
+    } catch {
+        return value
+    }
+}
+
+export function formatTerminalOutput(value: string): { text: string; language: 'json' | 'text' } {
+    const withoutAnsi = stripAnsiTerminalSequences(value).trim()
+    const fenced = withoutAnsi.match(/^```(?:json)?\s*\n?([\s\S]*?)\n?```$/i)?.[1]?.trim() ?? withoutAnsi
+    let candidate = fenced
+
+    // Some command wrappers serialize stdout once more, producing a JSON
+    // string whose contents are the actual object. Unwrap at most two layers.
+    for (let depth = 0; depth < 3; depth += 1) {
+        try {
+            const parsed: unknown = JSON.parse(candidate)
+            if (parsed !== null && typeof parsed === 'object') {
+                return { text: JSON.stringify(parsed, null, 2), language: 'json' }
+            }
+            if (typeof parsed !== 'string') break
+            candidate = parsed.trim()
+        } catch {
+            break
+        }
+    }
+
+    // JSON Lines is common for CLI output. Keep record boundaries instead of
+    // inventing an array, while making every record readable.
+    const lines = fenced.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+    if (lines.length > 1) {
+        try {
+            const records = lines.map((line) => JSON.parse(line) as unknown)
+            if (records.every((record) => record !== null && typeof record === 'object')) {
+                return {
+                    text: records.map((record) => JSON.stringify(record, null, 2)).join('\n\n'),
+                    language: 'json'
+                }
+            }
+        } catch {
+            // Ordinary terminal text; preserve it exactly below.
+        }
+    }
+
+    return { text: value, language: 'text' }
+}
+
 
 export function isTerminalExecutionTool(toolName: string): boolean {
     return TERMINAL_EXECUTION_TOOL_NAMES.has(toolName)
@@ -56,7 +125,8 @@ function getCommandFromInput(input: unknown): string | null {
         if (parts.length > 0) return parts.join(' ')
     }
 
-    return firstString(record, ['command', 'cmd'])
+    const commandText = firstString(record, ['command', 'cmd'])
+    return commandText ? getTerminalCommandForDetail({ command: commandText }) : null
 }
 
 function getLegacyCommandOutput(result: unknown): { stdout: string | null; exitCode: number | null } | null {
@@ -83,12 +153,13 @@ export function getTerminalExecutionDetails(block: ToolCallBlock): TerminalExecu
         : typeof block.durationMs === 'number' && Number.isFinite(block.durationMs)
             ? Math.max(0, block.durationMs)
             : null
+    const stdout = firstString(result, ['stdout', 'output']) ?? legacy?.stdout ?? null
 
     return {
-        command: firstString(result, ['command', 'cmd']) ?? getCommandFromInput(block.tool.input),
+        command: getCommandFromInput(result) ?? getCommandFromInput(block.tool.input),
         cwd: firstString(result, ['cwd', 'workingDirectory', 'working_directory'])
             ?? firstString(input, ['cwd', 'workingDirectory', 'working_directory']),
-        stdout: firstString(result, ['stdout', 'output']) ?? legacy?.stdout ?? null,
+        stdout: unwrapExecOutputEnvelope(stdout),
         stderr: firstString(result, ['stderr', 'error']),
         exitCode: firstNumber(result, ['exit_code', 'exitCode', 'exitcode']) ?? legacy?.exitCode ?? null,
         status: firstString(result, ['status']),
@@ -135,9 +206,9 @@ export function formatTerminalExecutionDuration(durationMs: number | null): stri
 }
 
 function terminalStateColorClass(state: TerminalExecutionState): string {
-    if (state === 'failed') return 'text-red-600'
-    if (state === 'completed') return 'text-emerald-600'
-    if (state === 'pending') return 'text-amber-600'
+    if (state === 'failed') return 'text-[var(--app-badge-error-text)]'
+    if (state === 'completed') return 'text-[var(--app-badge-success-text)]'
+    if (state === 'pending') return 'text-[var(--app-badge-warning-text)]'
     return 'text-[var(--app-hint)]'
 }
 
@@ -167,97 +238,45 @@ function terminalOutputFallback(
 type TerminalExecutionDetailProps = {
     block: ToolCallBlock
     surface?: 'dialog' | 'drawer'
-    drawerTab?: TerminalExecutionDrawerTab
-    panelId?: string
-    labelledBy?: string
-    hidden?: boolean
 }
 
 function TerminalExecutionDrawerPanel(props: {
     details: TerminalExecutionDetails
     state: TerminalExecutionState
-    duration: string | null
-    tab: TerminalExecutionDrawerTab
-    panelId?: string
-    labelledBy?: string
-    hidden?: boolean
-    t: (key: string, params?: Record<string, string | number>) => string
 }) {
-    const hasOutput = Boolean(props.details.stdout || props.details.stderr)
+    const rootRef = useRef<HTMLDivElement>(null)
+    const savedScroll = useRef(0)
+    const followOutput = useRef(false)
+    useLayoutEffect(() => {
+        const root = rootRef.current
+        const body = root?.closest<HTMLElement>('[data-chat-drawer-body]')
+        if (!root || !body) return
+        body.scrollTop = savedScroll.current
+        const onScroll = () => {
+            savedScroll.current = body.scrollTop
+            followOutput.current = body.scrollHeight - body.clientHeight - body.scrollTop <= 32
+        }
+        onScroll()
+        body.addEventListener('scroll', onScroll, { passive: true })
+        // Observe only the active panel. Keep reading position unless the user is at the bottom.
+        const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(() => {
+            if (followOutput.current) body.scrollTop = body.scrollHeight
+        })
+        observer?.observe(root)
+        return () => { body.removeEventListener('scroll', onScroll); observer?.disconnect() }
+    }, [])
+
+    useLayoutEffect(() => {
+        if (!followOutput.current) return
+        const body = rootRef.current?.closest<HTMLElement>('[data-chat-drawer-body]')
+        // Update before the browser delivers queued scroll events for the old
+        // content height, which would otherwise incorrectly disable following.
+        if (body) body.scrollTop = body.scrollHeight
+    }, [props.details.command, props.details.stdout, props.details.stderr, props.details.exitCode])
 
     return (
-        <div
-            aria-labelledby={props.labelledBy}
-            className="relative isolate min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 pb-[max(var(--app-safe-area-bottom),1.25rem)] pt-4 sm:px-6 sm:pb-6"
-            data-terminal-execution-detail
-            data-terminal-execution-panel={props.tab}
-            hidden={props.hidden}
-            id={props.panelId}
-            role="tabpanel"
-            tabIndex={props.hidden ? -1 : 0}
-        >
-            {props.tab === 'output' ? (
-                <section className="flex flex-col gap-3" data-terminal-execution-output>
-                    <h3 className="text-sm font-semibold text-[var(--app-fg)]">{props.t('terminal.execution.output')}</h3>
-                    {props.details.stderr ? (
-                        <CodeBlock code={props.details.stderr} language="text" title={props.t('terminal.stderr')} size="comfortable" />
-                    ) : null}
-                    {props.details.stdout ? (
-                        <CodeBlock code={props.details.stdout} language="text" title={props.t('terminal.stdout')} size="comfortable" />
-                    ) : null}
-                    {!hasOutput ? (
-                        <p className="rounded-xl border border-dashed border-[var(--app-border)] bg-[var(--app-subtle-bg)] px-3 py-3 text-sm leading-6 text-[var(--app-hint)]">
-                            {terminalOutputFallback(props.state, props.t)}
-                        </p>
-                    ) : null}
-                </section>
-            ) : null}
-
-            {props.tab === 'input' ? (
-                <section className="flex flex-col gap-3" data-terminal-execution-input>
-                    <h3 className="text-sm font-semibold text-[var(--app-fg)]">{props.t('terminal.execution.input')}</h3>
-                    {props.details.command ? (
-                        <CodeBlock code={props.details.command} language="bash" title={props.t('terminal.execution.command')} size="comfortable" />
-                    ) : (
-                        <p className="text-sm text-[var(--app-hint)]">{props.t('terminal.execution.commandUnavailable')}</p>
-                    )}
-                </section>
-            ) : null}
-
-            {props.tab === 'environment' ? (
-                <section className="flex flex-col gap-3" data-terminal-execution-environment>
-                    <h3 className="text-sm font-semibold text-[var(--app-fg)]">{props.t('terminal.execution.environment')}</h3>
-                    <dl className="grid gap-2">
-                        <div className="rounded-xl border border-[var(--app-border)] bg-[var(--app-subtle-bg)] px-3 py-2.5">
-                            <dt className="text-xs font-medium text-[var(--app-hint)]">{props.t('terminal.execution.status')}</dt>
-                            <dd className={cn('mt-1 flex items-center gap-2 text-sm font-medium', terminalStateColorClass(props.state))}>
-                                <span className={cn('h-2 w-2 shrink-0 rounded-full', terminalStateDotClass(props.state))} aria-hidden="true" />
-                                {terminalStateLabel(props.state, props.t)}
-                            </dd>
-                        </div>
-                        {props.details.cwd ? (
-                            <div className="rounded-xl border border-[var(--app-border)] bg-[var(--app-subtle-bg)] px-3 py-2.5">
-                                <dt className="text-xs font-medium text-[var(--app-hint)]">{props.t('terminal.execution.workingDirectory')}</dt>
-                                <dd className="mt-1 break-all font-mono text-xs leading-5 text-[var(--app-fg)]">{props.details.cwd}</dd>
-                            </div>
-                        ) : null}
-                        {props.duration ? (
-                            <div className="rounded-xl border border-[var(--app-border)] bg-[var(--app-subtle-bg)] px-3 py-2.5">
-                                <dt className="text-xs font-medium text-[var(--app-hint)]">{props.t('terminal.execution.duration')}</dt>
-                                <dd className="mt-1 font-mono text-sm font-medium text-[var(--app-fg)]">{props.duration}</dd>
-                            </div>
-                        ) : null}
-                        {props.details.exitCode !== null ? (
-                            <div className="rounded-xl border border-[var(--app-border)] bg-[var(--app-subtle-bg)] px-3 py-2.5" data-terminal-execution-exit-code>
-                                <dt className="text-xs font-medium text-[var(--app-hint)]">{props.t('terminal.execution.exitCodeLabel')}</dt>
-                                <dd className="mt-1 font-mono text-sm font-medium text-[var(--app-fg)]">
-                                    {props.t('terminal.execution.exitCode', { code: props.details.exitCode })}
-                                </dd>
-                            </div>
-                        ) : null}
-                    </dl>
-                </section>
-            ) : null}
+        <div ref={rootRef} className="relative isolate pb-1" data-terminal-execution-detail data-terminal-execution-panel="transcript">
+            <TerminalTranscript details={props.details} state={props.state} />
         </div>
     )
 }
@@ -268,18 +287,14 @@ export function TerminalExecutionDetail(props: TerminalExecutionDetailProps) {
     const state = getTerminalExecutionState(props.block, details)
     const duration = formatTerminalExecutionDuration(details.durationMs)
     const hasOutput = Boolean(details.stdout || details.stderr)
+    const stdoutDisplay = details.stdout ? formatTerminalOutput(details.stdout) : null
+    const stderrDisplay = details.stderr ? formatTerminalOutput(details.stderr) : null
 
     if (props.surface === 'drawer') {
         return (
             <TerminalExecutionDrawerPanel
                 details={details}
                 state={state}
-                duration={duration}
-                tab={props.drawerTab ?? 'output'}
-                panelId={props.panelId}
-                labelledBy={props.labelledBy}
-                hidden={props.hidden}
-                t={t}
             />
         )
     }
@@ -324,11 +339,11 @@ export function TerminalExecutionDetail(props: TerminalExecutionDetailProps) {
 
             <section className="flex shrink-0 flex-col gap-2" data-terminal-execution-output>
                 <h3 className="text-sm font-semibold text-[var(--app-fg)]">{t('terminal.execution.output')}</h3>
-                {details.stderr ? (
-                    <CodeBlock code={details.stderr} language="text" title={t('terminal.stderr')} scrollY maxHeight={420} size="comfortable" />
+                {stderrDisplay ? (
+                    <CodeBlock code={stderrDisplay.text} language={stderrDisplay.language} title={t('terminal.stderr')} scrollY maxHeight={420} size="comfortable" />
                 ) : null}
-                {details.stdout ? (
-                    <CodeBlock code={details.stdout} language="text" title={t('terminal.stdout')} scrollY maxHeight={420} size="comfortable" />
+                {stdoutDisplay ? (
+                    <CodeBlock code={stdoutDisplay.text} language={stdoutDisplay.language} title={t('terminal.stdout')} scrollY maxHeight={420} size="comfortable" />
                 ) : null}
                 {!hasOutput ? (
                     <p className="rounded-xl border border-dashed border-[var(--app-border)] bg-[var(--app-subtle-bg)] px-3 py-3 text-sm leading-6 text-[var(--app-hint)]">

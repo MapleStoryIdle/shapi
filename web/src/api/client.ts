@@ -1,77 +1,37 @@
-import type {
-    AttachmentMetadata,
-    AuthResponse,
-    CodexLocalSessionsResponse,
-    CodexLocalSessionContextResponse,
-    CodexLocalSessionComposerCapabilitiesResponse,
-    CodexLocalSessionSnapshotReadResponse,
-    CodexLocalSessionSnapshotVersion,
-    CodexLocalSessionStatusResponse,
-    ArchiveCodexLocalSessionResponse,
-    DiscardCodexLocalSessionMessageResponse,
-    ForkCodexLocalSessionResponse,
-    SendCodexLocalSessionMessageResponse,
-    CodexDuplicateSessionsResponse,
-    CodexMergeDuplicateSessionsResponse,
-    CodexDesktopScriptResponse,
-    CodexDesktopSyncRequest,
-    CodexDesktopStatusResponse,
-    CodexCollaborationMode,
-    FileSearchResponse,
-    MachinesResponse,
-    MessagesResponse,
-    OpenVikingContextListResponse,
-    OpenVikingContextReadResponse,
-    OpenVikingStatusResponse,
-    PermissionMode,
-    PushSubscriptionPayload,
-    PushUnsubscribePayload,
-    PushVapidPublicKeyResponse,
-    DeliverShareFeedbackResponse,
-    RevokeShareResponse,
-    ShareContentResponse,
-    ShareFeedbackResponse,
-    ShareResponse,
-    SharesResponse,
-    SlashCommandsResponse,
-    SkillsResponse,
-    SpawnResponse,
-    VisibilityPayload,
-    HapiSessionExport,
-    SessionResponse,
-    SessionsResponse
-} from '@/types/api'
-import type {
-    CodexSubscriptionLimitsResponse,
-    CodexModelsResponse,
-    CursorMigrateOutcome,
-    CursorMigrateToAcpRequest,
-    CursorModelsResponse,
-    DeleteUploadResponse,
-    FileReadResponse,
-    GitBranchResponse,
-    GitCommandResponse,
-    ListDirectoryResponse,
-    MachineListDirectoryResponse,
-    MachinePathsExistsResponse,
-    OpencodeModelsResponse,
-    OpencodeReasoningEffortResponse,
-    CreateSideSessionResponse,
-    ReopenSessionResponse,
-    UploadFileResponse
-} from '@hapi/protocol/apiTypes'
-import type { AgentFlavor } from '@hapi/protocol'
+import type { OpenLocalServiceRequest, OpenLocalServiceResponse } from '@hapi/protocol/localServices'
+import type { NativeCodexSessionControlAction, NativeCodexSessionControlResponse } from '@hapi/protocol/codexSessionControl'
+import type { Monitor, MonitorConfig, MonitorDetail, MonitorRequest } from '@hapi/protocol/monitoring'
+import type { SessionGroup, SessionGroupInput, SessionGroupSource, SessionGroupsResponse } from '@hapi/protocol/sessionGroups'
+import type { SessionLabelSource, SessionLabelsResponse } from '@hapi/protocol/sessionLabels'
+import type { SessionPinSource, SessionPinsResponse } from '@hapi/protocol/sessionPins'
+import type { KanbanOrder, KanbanOrderInput } from '@hapi/protocol/kanbanOrder'
+import type { AttachmentMetadata, AuthResponse, CodexLocalSessionsResponse, CodexLocalSessionContextResponse, CodexLocalSessionComposerCapabilitiesResponse, CodexLocalSessionSnapshotReadResponse, CodexLocalSessionSnapshotVersion, CodexLocalSessionStatusResponse, CodexManagedSessionTargetResponse, ArchiveCodexLocalSessionResponse, DiscardCodexLocalSessionMessageResponse, ForkCodexLocalSessionResponse, SendCodexLocalSessionMessageResponse, CodexDuplicateSessionsResponse, CodexMergeDuplicateSessionsResponse, CodexDesktopScriptResponse, CodexDesktopSyncRequest, CodexDesktopStatusResponse, CodexControlRecoveryResponse, CodexCollaborationMode, FileSearchResponse, MachinesResponse, MessagesResponse, OpenVikingContextListResponse, OpenVikingContextReadResponse, OpenVikingStatusResponse, OpenVikingMetricsResponse, OpenVikingQualityResponse, OpenVikingSearchResponse, PermissionMode, PushSubscriptionPayload, PushUnsubscribePayload, PushVapidPublicKeyResponse, DeliverShareFeedbackResponse, RevokeShareResponse, ShareContentResponse, ShareFeedbackResponse, ShareResponse, SharesResponse, SlashCommandsResponse, SkillsResponse, SpawnResponse, VisibilityPayload, HapiSessionExport, SessionResponse, SessionsResponse } from '@/types/api'
+import type { CodexSubscriptionLimitsResponse, CodexModelsResponse, CursorMigrateOutcome, CursorMigrateToAcpRequest, CursorModelsResponse, DeleteUploadResponse, FileReadResponse, GitBranchResponse, GitBranchesResponse, GitCommandResponse, ListDirectoryResponse, MachineListDirectoryResponse, MachinePathsExistsResponse, MachineGitBranchCreateRequest, MachineGitBranchCommitRequest, MachineGitBranchFetchRequest, MachineGitBranchPushRequest, MachineGitBranchSwitchRequest, MachineGitBranchUpdateRequest, OpencodeModelsResponse, OpencodeReasoningEffortResponse, CreateSideSessionResponse, ReopenSessionResponse, RenameNativeCodexSessionResponse, UploadFileResponse } from '@hapi/protocol/apiTypes'
+import type { AgentFlavor, ManagedSkillControlResponse, NativeCodexAttachmentDeleteResponse, NativeCodexAttachmentStageResponse } from '@hapi/protocol'
 import type { CancelMessageResponse } from '@hapi/protocol/schemas'
+import { CodexManagedSessionTargetResponseSchema } from '@hapi/protocol/schemas'
 
 type ApiClientOptions = {
     baseUrl?: string
     getToken?: () => string | null
     onUnauthorized?: () => Promise<string | null>
     requestTimeoutMs?: number
+    useCookieSession?: boolean
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000
 const UPLOAD_REQUEST_TIMEOUT_MS = 5 * 60 * 1000
+
+type MonitorsResponse = { monitors: Monitor[] }
+type MonitorResponse = { monitor: MonitorDetail }
+type CreateMonitorResponse = MonitorResponse & { token: string | null }
+type RotateMonitorTokenResponse = { token: string }
+type MonitorAcceptedResponse = { accepted: true; deferred?: boolean }
+type ParseMonitorCurlResponse = { request: MonitorRequest }
+export type MonitorSessionTargetResponse = {
+    config: MonitorConfig
+    target: { type: 'managed' | 'native-codex'; sessionId: string; title: string }
+}
 
 type ErrorPayload = {
     error?: unknown
@@ -113,11 +73,30 @@ export class ApiError extends Error {
 }
 
 export class ApiClient {
+    async readWebPage(url: string): Promise<import('@hapi/protocol/webReader').WebReaderResponse> {
+        return this.request('/api/web-reader', {
+            method: 'POST',
+            body: JSON.stringify({ url })
+        })
+    }
+    async openLocalService(request: OpenLocalServiceRequest): Promise<OpenLocalServiceResponse> {
+        return await this.request(
+            '/api/local-services/open',
+            {
+                method: 'POST',
+                body: JSON.stringify(request)
+            },
+            0,
+            undefined,
+            60_000
+        )
+    }
     private token: string
     private readonly baseUrl: string | null
     private readonly getToken: (() => string | null) | null
     private readonly onUnauthorized: (() => Promise<string | null>) | null
     private readonly requestTimeoutMs: number
+    private readonly useCookieSession: boolean
 
     constructor(token: string, options?: ApiClientOptions) {
         this.token = token
@@ -125,6 +104,7 @@ export class ApiClient {
         this.getToken = options?.getToken ?? null
         this.onUnauthorized = options?.onUnauthorized ?? null
         this.requestTimeoutMs = options?.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
+        this.useCookieSession = options?.useCookieSession ?? false
     }
 
     private buildUrl(path: string): string {
@@ -138,20 +118,19 @@ export class ApiClient {
         }
     }
 
-    private async request<T>(
-        path: string,
-        init?: RequestInit,
-        attempt: number = 0,
-        overrideToken?: string | null,
-        timeoutMs: number = this.requestTimeoutMs
-    ): Promise<T> {
+    private async request<T>(path: string, init?: RequestInit, attempt: number = 0, overrideToken?: string | null, timeoutMs: number = this.requestTimeoutMs): Promise<T> {
         const headers = new Headers(init?.headers)
         const liveToken = this.getToken ? this.getToken() : null
-        const authToken = overrideToken !== undefined
-            ? (overrideToken ?? (liveToken ?? this.token))
-            : (liveToken ?? this.token)
-        if (authToken) {
+        const authToken = overrideToken !== undefined ? (overrideToken ?? liveToken ?? this.token) : (liveToken ?? this.token)
+        if (authToken && !this.useCookieSession) {
             headers.set('authorization', `Bearer ${authToken}`)
+        }
+        if (this.useCookieSession && init?.method && !['GET', 'HEAD', 'OPTIONS'].includes(init.method.toUpperCase())) {
+            const csrfToken = document.cookie
+                .split('; ')
+                .find((part) => part.startsWith('shapi_csrf='))
+                ?.slice('shapi_csrf='.length)
+            if (csrfToken) headers.set('x-csrf-token', decodeURIComponent(csrfToken))
         }
         const isFormDataBody = typeof FormData !== 'undefined' && init?.body instanceof FormData
         if (init?.body !== undefined && !headers.has('content-type') && !isFormDataBody) {
@@ -178,6 +157,7 @@ export class ApiClient {
             const res = await fetch(this.buildUrl(path), {
                 ...init,
                 headers,
+                credentials: this.useCookieSession ? 'include' : init?.credentials,
                 signal: controller.signal
             })
 
@@ -199,15 +179,10 @@ export class ApiClient {
             if (!res.ok) {
                 const body = await res.text().catch(() => '')
                 const code = parseErrorCode(body)
-                throw new ApiError(
-                    parseErrorMessage(body) ?? 'Request could not be completed.',
-                    res.status,
-                    code,
-                    body || undefined
-                )
+                throw new ApiError(parseErrorMessage(body) ?? 'Request could not be completed.', res.status, code, body || undefined)
             }
 
-            return await res.json() as T
+            return (await res.json()) as T
         } catch (error) {
             if (timedOut) {
                 throw new ApiError('Request timed out. Please try again.', 408, 'request_timeout')
@@ -233,7 +208,32 @@ export class ApiClient {
             throw new ApiError(`Auth failed: HTTP ${res.status} ${res.statusText}${detail}`, res.status, code, body || undefined)
         }
 
-        return await res.json() as AuthResponse
+        return (await res.json()) as AuthResponse
+    }
+
+    async authenticateWebSession(): Promise<AuthResponse> {
+        const res = await fetch(this.buildUrl('/api/v2/web-sessions/current'), {
+            credentials: 'include',
+            headers: { accept: 'application/json' }
+        })
+        if (!res.ok) throw new ApiError('No active web session', res.status)
+        return {
+            token: '__cookie_session__',
+            user: { id: 1, firstName: 'Web User' }
+        }
+    }
+
+    async createWebSession(webToken: string): Promise<void> {
+        const res = await fetch(this.buildUrl('/api/v2/web-sessions'), {
+            method: 'POST',
+            credentials: 'include',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ webToken })
+        })
+        if (!res.ok) {
+            const body = await res.text().catch(() => '')
+            throw new ApiError(parseErrorMessage(body) ?? 'Unable to sign in', res.status, parseErrorCode(body), body || undefined)
+        }
     }
 
     async bind(auth: { initData: string; accessToken: string }): Promise<AuthResponse> {
@@ -250,7 +250,7 @@ export class ApiClient {
             throw new ApiError(`Bind failed: HTTP ${res.status} ${res.statusText}${detail}`, res.status, code, body || undefined)
         }
 
-        return await res.json() as AuthResponse
+        return (await res.json()) as AuthResponse
     }
 
     async getSessions(): Promise<SessionsResponse> {
@@ -259,6 +259,21 @@ export class ApiClient {
 
     async getPushVapidPublicKey(): Promise<PushVapidPublicKeyResponse> {
         return await this.request<PushVapidPublicKeyResponse>('/api/push/vapid-public-key')
+    }
+
+    async getBarkSettings(): Promise<{ configured: boolean; enabled: boolean }> {
+        return this.request('/api/push/bark')
+    }
+
+    async testBarkPush(): Promise<{ ok: boolean }> {
+        return this.request('/api/push/bark/test', { method: 'POST' })
+    }
+
+    async saveBarkSettings(url?: string, enabled?: boolean): Promise<{ configured: boolean; enabled: boolean }> {
+        return this.request('/api/push/bark', {
+            method: 'PUT',
+            body: JSON.stringify({ url, enabled })
+        })
     }
 
     async subscribePushNotifications(payload: PushSubscriptionPayload): Promise<void> {
@@ -276,12 +291,7 @@ export class ApiClient {
         })
     }
 
-    async getCodexSessions(options?: {
-        limit?: number
-        machineId?: string
-        excludeHapiInitiated?: boolean
-        forceRefresh?: boolean
-    }): Promise<CodexLocalSessionsResponse> {
+    async getCodexSessions(options?: { limit?: number; machineId?: string; excludeHapiInitiated?: boolean; forceRefresh?: boolean }): Promise<CodexLocalSessionsResponse> {
         const queryParams = new URLSearchParams()
         if (options?.machineId) queryParams.set('machineId', options.machineId)
         if (options?.limit) queryParams.set('limit', String(options.limit))
@@ -291,24 +301,31 @@ export class ApiClient {
         return await this.request<CodexLocalSessionsResponse>(`/api/codex/sessions${query}`)
     }
 
-    async getCodexSessionContext(
-        sessionId: string,
-        machineId: string,
-        options: { before?: number; limit?: number } = {}
-    ): Promise<CodexLocalSessionContextResponse> {
+    async getCodexManagedSessionTarget(sessionId: string, machineId: string): Promise<CodexManagedSessionTargetResponse> {
+        const query = new URLSearchParams({ machineId })
+        const response = await this.request<unknown>(
+            `/api/codex/sessions/${encodeURIComponent(sessionId)}/managed-session?${query.toString()}`
+        )
+        return CodexManagedSessionTargetResponseSchema.parse(response)
+    }
+
+    async getCodexSessionContext(sessionId: string, machineId: string, options: { before?: number; limit?: number } = {}): Promise<CodexLocalSessionContextResponse> {
         const queryParams = new URLSearchParams({ machineId })
         if (options.before !== undefined) queryParams.set('before', String(options.before))
         if (options.limit !== undefined) queryParams.set('limit', String(options.limit))
-        return await this.request<CodexLocalSessionContextResponse>(
-            `/api/codex/sessions/${encodeURIComponent(sessionId)}/context?${queryParams.toString()}`
-        )
+        return await this.request<CodexLocalSessionContextResponse>(`/api/codex/sessions/${encodeURIComponent(sessionId)}/context?${queryParams.toString()}`)
     }
 
     async readCodexSessionFile(sessionId: string, machineId: string, path: string): Promise<FileReadResponse> {
         const queryParams = new URLSearchParams({ machineId, path })
-        return await this.request<FileReadResponse>(
-            `/api/codex/sessions/${encodeURIComponent(sessionId)}/file?${queryParams.toString()}`
-        )
+        return await this.request<FileReadResponse>(`/api/codex/sessions/${encodeURIComponent(sessionId)}/file?${queryParams.toString()}`)
+    }
+
+    async browseCodexSessionFiles(sessionId: string, machineId: string, request: import('@hapi/protocol/apiTypes').SessionFileBrowserRequest): Promise<import('@hapi/protocol/apiTypes').SessionFileBrowserResponse> {
+        return this.request(`/api/codex/sessions/${encodeURIComponent(sessionId)}/files?machineId=${encodeURIComponent(machineId)}`, {
+            method: 'POST',
+            body: JSON.stringify(request)
+        })
     }
 
     async getCodexSessionSnapshot(
@@ -327,42 +344,32 @@ export class ApiClient {
             queryParams.set('knownRunnerEpoch', options.knownVersion.runnerEpoch)
             queryParams.set('knownRevision', String(options.knownVersion.revision))
         }
-        return await this.request<CodexLocalSessionSnapshotReadResponse>(
-            `/api/codex/sessions/${encodeURIComponent(sessionId)}/snapshot?${queryParams.toString()}`
-        )
+        return await this.request<CodexLocalSessionSnapshotReadResponse>(`/api/codex/sessions/${encodeURIComponent(sessionId)}/snapshot?${queryParams.toString()}`)
     }
 
-    async getCodexSessionStatus(
-        sessionId: string,
-        machineId: string
-    ): Promise<CodexLocalSessionStatusResponse> {
+    async getCodexSessionStatus(sessionId: string, machineId: string): Promise<CodexLocalSessionStatusResponse> {
         const queryParams = new URLSearchParams({ machineId })
-        return await this.request<CodexLocalSessionStatusResponse>(
-            `/api/codex/sessions/${encodeURIComponent(sessionId)}/status?${queryParams.toString()}`
-        )
+        return await this.request<CodexLocalSessionStatusResponse>(`/api/codex/sessions/${encodeURIComponent(sessionId)}/status?${queryParams.toString()}`)
     }
 
-    async archiveCodexSession(
-        sessionId: string,
-        payload: { machineId: string }
-    ): Promise<ArchiveCodexLocalSessionResponse> {
-        return await this.request<ArchiveCodexLocalSessionResponse>(
-            `/api/codex/sessions/${encodeURIComponent(sessionId)}/archive`,
-            {
-                method: 'POST',
-                body: JSON.stringify(payload)
-            }
-        )
+    async renameCodexSession(sessionId: string, machineId: string, name: string): Promise<RenameNativeCodexSessionResponse> {
+        return await this.request<RenameNativeCodexSessionResponse>(`/api/codex/sessions/${encodeURIComponent(sessionId)}`, { method: 'PATCH', body: JSON.stringify({ machineId, name }) }, 0, undefined, 65_000)
     }
 
-    async getCodexSessionComposerCapabilities(
-        sessionId: string,
-        machineId: string
-    ): Promise<CodexLocalSessionComposerCapabilitiesResponse> {
+    async archiveCodexSession(sessionId: string, payload: { machineId: string }): Promise<ArchiveCodexLocalSessionResponse> {
+        return await this.request<ArchiveCodexLocalSessionResponse>(`/api/codex/sessions/${encodeURIComponent(sessionId)}/archive`, {
+            method: 'POST',
+            body: JSON.stringify(payload)
+        })
+    }
+
+    async controlCodexSession(sessionId: string, machineId: string, action: NativeCodexSessionControlAction): Promise<NativeCodexSessionControlResponse> {
+        return await this.request<NativeCodexSessionControlResponse>(`/api/codex/sessions/${encodeURIComponent(sessionId)}/control`, { method: 'POST', body: JSON.stringify({ machineId, ...action }) })
+    }
+
+    async getCodexSessionComposerCapabilities(sessionId: string, machineId: string): Promise<CodexLocalSessionComposerCapabilitiesResponse> {
         const queryParams = new URLSearchParams({ machineId })
-        return await this.request<CodexLocalSessionComposerCapabilitiesResponse>(
-            `/api/codex/sessions/${encodeURIComponent(sessionId)}/composer-capabilities?${queryParams.toString()}`
-        )
+        return await this.request<CodexLocalSessionComposerCapabilitiesResponse>(`/api/codex/sessions/${encodeURIComponent(sessionId)}/composer-capabilities?${queryParams.toString()}`)
     }
 
     async sendCodexSessionMessage(
@@ -374,17 +381,16 @@ export class ApiClient {
             clientMessageId?: string
             /** Explicit user-confirmed retry after a stale/uncertain native hand-off. */
             forceRecovery?: boolean
+            /** Opaque Runner-local attachment references. */
+            attachmentIds?: string[]
         },
         options?: { signal?: AbortSignal }
     ): Promise<SendCodexLocalSessionMessageResponse> {
-        return await this.request<SendCodexLocalSessionMessageResponse>(
-            `/api/codex/sessions/${encodeURIComponent(sessionId)}/messages`,
-            {
-                method: 'POST',
-                body: JSON.stringify(payload),
-                signal: options?.signal
-            }
-        )
+        return await this.request<SendCodexLocalSessionMessageResponse>(`/api/codex/sessions/${encodeURIComponent(sessionId)}/messages`, {
+            method: 'POST',
+            body: JSON.stringify(payload),
+            signal: options?.signal
+        })
     }
 
     async discardCodexSessionMessage(
@@ -394,13 +400,23 @@ export class ApiClient {
             clientMessageId: string
         }
     ): Promise<DiscardCodexLocalSessionMessageResponse> {
-        return await this.request<DiscardCodexLocalSessionMessageResponse>(
-            `/api/codex/sessions/${encodeURIComponent(sessionId)}/messages/discard`,
-            {
-                method: 'POST',
-                body: JSON.stringify(payload)
-            }
-        )
+        return await this.request<DiscardCodexLocalSessionMessageResponse>(`/api/codex/sessions/${encodeURIComponent(sessionId)}/messages/discard`, {
+            method: 'POST',
+            body: JSON.stringify(payload)
+        })
+    }
+
+    async uploadCodexSessionAttachment(sessionId: string, machineId: string, filename: string, file: Blob, mimeType: string): Promise<NativeCodexAttachmentStageResponse> {
+        const form = new FormData()
+        form.set('machineId', machineId)
+        form.set('file', file, filename)
+        form.set('filename', filename)
+        form.set('mimeType', mimeType)
+        return await this.request<NativeCodexAttachmentStageResponse>(`/api/codex/sessions/${encodeURIComponent(sessionId)}/uploads`, { method: 'POST', body: form }, 0, undefined, UPLOAD_REQUEST_TIMEOUT_MS)
+    }
+
+    async deleteCodexSessionAttachment(sessionId: string, machineId: string, attachmentId: string): Promise<NativeCodexAttachmentDeleteResponse> {
+        return await this.request<NativeCodexAttachmentDeleteResponse>(`/api/codex/sessions/${encodeURIComponent(sessionId)}/uploads/${encodeURIComponent(attachmentId)}/delete`, { method: 'POST', body: JSON.stringify({ machineId }) })
     }
 
     async forkCodexSession(sessionId: string, payload?: { machineId?: string }): Promise<ForkCodexLocalSessionResponse> {
@@ -408,6 +424,21 @@ export class ApiClient {
             method: 'POST',
             body: JSON.stringify(payload ?? {})
         })
+    }
+
+    async recoverCodexSessionControl(
+        sessionId: string,
+        payload: {
+            machineId: string
+            recoveryRequestId: string
+            expectedVersion: CodexLocalSessionSnapshotVersion
+        }
+    ): Promise<CodexControlRecoveryResponse> {
+        return await this.request<CodexControlRecoveryResponse>(`/api/codex/sessions/${encodeURIComponent(sessionId)}/recover-control`, { method: 'POST', body: JSON.stringify(payload) })
+    }
+
+    async getCodexSessionControlRecovery(sessionId: string, machineId: string): Promise<CodexControlRecoveryResponse> {
+        return await this.request<CodexControlRecoveryResponse>(`/api/codex/sessions/${encodeURIComponent(sessionId)}/recover-control?machineId=${encodeURIComponent(machineId)}`)
     }
 
     async getCodexDesktopStatus(): Promise<CodexDesktopStatusResponse> {
@@ -455,10 +486,7 @@ export class ApiClient {
     }
 
     async getSessionExport(sessionId: string, options?: { signal?: AbortSignal }): Promise<HapiSessionExport> {
-        return await this.request<HapiSessionExport>(
-            `/api/sessions/${encodeURIComponent(sessionId)}/export`,
-            { signal: options?.signal }
-        )
+        return await this.request<HapiSessionExport>(`/api/sessions/${encodeURIComponent(sessionId)}/export`, { signal: options?.signal })
     }
 
     async getMessages(
@@ -466,6 +494,8 @@ export class ApiClient {
         options: {
             beforeSeq?: number | null
             beforeAt?: number | null
+            afterSeq?: number | null
+            afterAt?: number | null
             limit?: number
         }
     ): Promise<MessagesResponse> {
@@ -475,6 +505,12 @@ export class ApiClient {
         }
         if (options.beforeSeq !== undefined && options.beforeSeq !== null) {
             params.set('beforeSeq', `${options.beforeSeq}`)
+        }
+        if (options.afterAt !== undefined && options.afterAt !== null) {
+            params.set('afterAt', `${options.afterAt}`)
+        }
+        if (options.afterSeq !== undefined && options.afterSeq !== null) {
+            params.set('afterSeq', `${options.afterSeq}`)
         }
         if (options.limit !== undefined && options.limit !== null) {
             params.set('limit', `${options.limit}`)
@@ -525,9 +561,7 @@ export class ApiClient {
     async getGeneratedImageBlob(sessionId: string, imageId: string, attempt: number = 0, overrideToken?: string | null): Promise<Blob> {
         const headers = new Headers()
         const liveToken = this.getToken ? this.getToken() : null
-        const authToken = overrideToken !== undefined
-            ? (overrideToken ?? (liveToken ?? this.token))
-            : (liveToken ?? this.token)
+        const authToken = overrideToken !== undefined ? (overrideToken ?? liveToken ?? this.token) : (liveToken ?? this.token)
         if (authToken) {
             headers.set('authorization', `Bearer ${authToken}`)
         }
@@ -550,9 +584,7 @@ export class ApiClient {
     async getSessionFileBlob(sessionId: string, path: string, attempt: number = 0, overrideToken?: string | null): Promise<Blob> {
         const headers = new Headers()
         const liveToken = this.getToken ? this.getToken() : null
-        const authToken = overrideToken !== undefined
-            ? (overrideToken ?? (liveToken ?? this.token))
-            : (liveToken ?? this.token)
+        const authToken = overrideToken !== undefined ? (overrideToken ?? liveToken ?? this.token) : (liveToken ?? this.token)
         if (authToken) {
             headers.set('authorization', `Bearer ${authToken}`)
         }
@@ -577,9 +609,7 @@ export class ApiClient {
     async getUploadedFileBlob(sessionId: string, path: string, attempt: number = 0, overrideToken?: string | null): Promise<Blob> {
         const headers = new Headers()
         const liveToken = this.getToken ? this.getToken() : null
-        const authToken = overrideToken !== undefined
-            ? (overrideToken ?? (liveToken ?? this.token))
-            : (liveToken ?? this.token)
+        const authToken = overrideToken !== undefined ? (overrideToken ?? liveToken ?? this.token) : (liveToken ?? this.token)
         if (authToken) {
             headers.set('authorization', `Bearer ${authToken}`)
         }
@@ -614,9 +644,7 @@ export class ApiClient {
         }
 
         const qs = params.toString()
-        return await this.request<ListDirectoryResponse>(
-            `/api/sessions/${encodeURIComponent(sessionId)}/directory${qs ? `?${qs}` : ''}`
-        )
+        return await this.request<ListDirectoryResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/directory${qs ? `?${qs}` : ''}`)
     }
 
     async uploadFile(sessionId: string, filename: string, file: Blob, mimeType: string): Promise<UploadFileResponse> {
@@ -644,27 +672,180 @@ export class ApiClient {
     }
 
     async resumeSession(sessionId: string, opts?: { permissionMode?: string }): Promise<string> {
-        const response = await this.request<{ sessionId: string }>(
-            `/api/sessions/${encodeURIComponent(sessionId)}/resume`,
-            {
-                method: 'POST',
-                ...(opts?.permissionMode !== undefined && {
-                    body: JSON.stringify({ permissionMode: opts.permissionMode })
-                })
-            }
-        )
+        const response = await this.request<{ sessionId: string }>(`/api/sessions/${encodeURIComponent(sessionId)}/resume`, {
+            method: 'POST',
+            ...(opts?.permissionMode !== undefined && {
+                body: JSON.stringify({ permissionMode: opts.permissionMode })
+            })
+        })
         return response.sessionId
     }
 
     async createSideSession(sessionId: string): Promise<CreateSideSessionResponse> {
-        return await this.request<CreateSideSessionResponse>(
-            `/api/sessions/${encodeURIComponent(sessionId)}/side-session`,
-            { method: 'POST', body: JSON.stringify({}) }
-        )
+        return await this.request<CreateSideSessionResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/side-session`, { method: 'POST', body: JSON.stringify({}) })
+    }
+
+    async getSessionGroups(): Promise<SessionGroupsResponse> {
+        return this.request('/api/session-groups')
+    }
+
+    async getKanbanOrder(): Promise<KanbanOrder> {
+        return this.request('/api/kanban-order')
+    }
+
+    async setKanbanOrder(input: KanbanOrderInput): Promise<KanbanOrder> {
+        return this.request('/api/kanban-order', {
+            method: 'PUT',
+            body: JSON.stringify(input)
+        })
+    }
+
+    async getSessionPins(): Promise<SessionPinsResponse> {
+        return this.request('/api/session-pins')
+    }
+
+    async setSessionPin(source: SessionPinSource, pinned: boolean): Promise<SessionPinsResponse> {
+        return this.request('/api/session-pins', {
+            method: 'PUT',
+            body: JSON.stringify({ source, pinned })
+        })
+    }
+
+    async migrateSessionPins(sources: SessionPinSource[]): Promise<SessionPinsResponse> {
+        return this.request('/api/session-pins/migrate', {
+            method: 'POST',
+            body: JSON.stringify({ sources })
+        })
+    }
+
+    async createSessionGroup(input: SessionGroupInput): Promise<{ group: SessionGroup }> {
+        return this.request('/api/session-groups', {
+            method: 'POST',
+            body: JSON.stringify(input)
+        })
+    }
+
+    async updateSessionGroup(id: string, input: SessionGroupInput): Promise<{ group: SessionGroup }> {
+        return this.request(`/api/session-groups/${encodeURIComponent(id)}`, {
+            method: 'PATCH',
+            body: JSON.stringify(input)
+        })
+    }
+
+    async assignSessionGroup(source: SessionGroupSource, groupId: string | null): Promise<{ ok: true }> {
+        return this.request('/api/session-groups/assignment', {
+            method: 'PUT',
+            body: JSON.stringify({ source, groupId })
+        })
+    }
+
+    async getSessionLabels(): Promise<SessionLabelsResponse> {
+        return this.request('/api/session-labels')
+    }
+
+    async setSessionLabel(source: SessionLabelSource, label: string | null): Promise<{ ok: true }> {
+        return this.request('/api/session-labels', {
+            method: 'PUT',
+            body: JSON.stringify({ source, label })
+        })
+    }
+
+    async getMonitors(): Promise<MonitorsResponse> {
+        return await this.request<MonitorsResponse>('/api/monitors')
+    }
+
+    async getMonitor(monitorId: string): Promise<MonitorResponse> {
+        return await this.request<MonitorResponse>(`/api/monitors/${encodeURIComponent(monitorId)}`)
+    }
+
+    async getMonitorSessionTarget(target: { type: 'managed' | 'native-codex'; sessionId: string; machineId?: string }): Promise<MonitorSessionTargetResponse> {
+        const query = new URLSearchParams({
+            type: target.type,
+            sessionId: target.sessionId
+        })
+        if (target.machineId) query.set('machineId', target.machineId)
+        return await this.request<MonitorSessionTargetResponse>(`/api/monitors/session-target?${query.toString()}`)
+    }
+
+    async createMonitor(config: MonitorConfig): Promise<CreateMonitorResponse> {
+        return await this.request<CreateMonitorResponse>('/api/monitors', {
+            method: 'POST',
+            body: JSON.stringify(config)
+        })
+    }
+
+    async updateMonitor(monitorId: string, config: MonitorConfig): Promise<MonitorResponse> {
+        return await this.request<MonitorResponse>(`/api/monitors/${encodeURIComponent(monitorId)}`, {
+            method: 'PATCH',
+            body: JSON.stringify(config)
+        })
+    }
+
+    async switchMonitorTargetSession(monitorId: string, sessionId: string): Promise<MonitorResponse> {
+        return await this.request<MonitorResponse>(`/api/monitors/${encodeURIComponent(monitorId)}/target-session`, {
+            method: 'PUT',
+            body: JSON.stringify({ sessionId })
+        })
+    }
+
+    async getMonitorToken(monitorId: string): Promise<{ token: string | null }> {
+        return await this.request(`/api/monitors/${encodeURIComponent(monitorId)}/token`)
+    }
+
+    async deleteMonitor(monitorId: string): Promise<{ success: boolean }> {
+        return await this.request(`/api/monitors/${encodeURIComponent(monitorId)}`, { method: 'DELETE' })
+    }
+
+    async rotateMonitorToken(monitorId: string): Promise<RotateMonitorTokenResponse> {
+        return await this.request<RotateMonitorTokenResponse>(`/api/monitors/${encodeURIComponent(monitorId)}/token`, {
+            method: 'POST',
+            body: JSON.stringify({})
+        })
+    }
+
+    async checkMonitor(monitorId: string): Promise<MonitorAcceptedResponse> {
+        return await this.request<MonitorAcceptedResponse>(`/api/monitors/${encodeURIComponent(monitorId)}/check`, {
+            method: 'POST',
+            body: JSON.stringify({})
+        })
+    }
+
+    async retriggerMonitorActivity(monitorId: string, activityId: string): Promise<MonitorAcceptedResponse> {
+        return await this.request<MonitorAcceptedResponse>(`/api/monitors/${encodeURIComponent(monitorId)}/activities/${encodeURIComponent(activityId)}/retrigger`, { method: 'POST', body: JSON.stringify({}) })
+    }
+
+    async approveMonitorIncident(monitorId: string, incidentId: string, planHash: string): Promise<MonitorAcceptedResponse> {
+        return await this.request<MonitorAcceptedResponse>(`/api/monitors/${encodeURIComponent(monitorId)}/incidents/${encodeURIComponent(incidentId)}/approve`, { method: 'POST', body: JSON.stringify({ planHash }) })
+    }
+
+    async closeMonitorIncident(monitorId: string, incidentId: string): Promise<MonitorAcceptedResponse> {
+        return await this.request<MonitorAcceptedResponse>(`/api/monitors/${encodeURIComponent(monitorId)}/incidents/${encodeURIComponent(incidentId)}/close`, { method: 'POST', body: JSON.stringify({}) })
+    }
+
+    async parseMonitorCurl(curl: string): Promise<ParseMonitorCurlResponse> {
+        return await this.request<ParseMonitorCurlResponse>('/api/monitors/parse-curl', {
+            method: 'POST',
+            body: JSON.stringify({ curl })
+        })
     }
 
     async getShares(): Promise<SharesResponse> {
         return await this.request<SharesResponse>('/api/shares')
+    }
+
+    async getManagedSkills(): Promise<ManagedSkillControlResponse> {
+        return await this.request<ManagedSkillControlResponse>('/api/managed-skills')
+    }
+
+    async cacheManagedSkill(skillId: string, machineId: string): Promise<void> {
+        await this.request(`/api/managed-skills/${encodeURIComponent(skillId)}/machines/${encodeURIComponent(machineId)}/cache`, { method: 'POST' })
+    }
+
+    async setManagedSkillEnabled(skillId: string, enabled: boolean): Promise<void> {
+        await this.request(`/api/managed-skills/${encodeURIComponent(skillId)}`, {
+            method: 'PATCH',
+            body: JSON.stringify({ enabled })
+        })
     }
 
     async getShare(shareId: string): Promise<ShareResponse> {
@@ -691,13 +872,7 @@ export class ApiClient {
         })
     }
 
-    async sendMessage(
-        sessionId: string,
-        text: string,
-        localId?: string | null,
-        attachments?: AttachmentMetadata[],
-        scheduledAt?: number | null
-    ): Promise<void> {
+    async sendMessage(sessionId: string, text: string, localId?: string | null, attachments?: AttachmentMetadata[], scheduledAt?: number | null): Promise<void> {
         await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
             method: 'POST',
             body: JSON.stringify({
@@ -710,10 +885,7 @@ export class ApiClient {
     }
 
     async cancelMessage(sessionId: string, messageId: string): Promise<CancelMessageResponse> {
-        const response = await this.request(
-            `/api/sessions/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(messageId)}`,
-            { method: 'DELETE' }
-        )
+        const response = await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(messageId)}`, { method: 'DELETE' })
         return response as CancelMessageResponse
     }
 
@@ -731,11 +903,15 @@ export class ApiClient {
         })
     }
 
+    async releaseSessionControl(sessionId: string): Promise<void> {
+        await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/release-control`, {
+            method: 'POST',
+            body: JSON.stringify({})
+        })
+    }
+
     async reopenSession(sessionId: string): Promise<ReopenSessionResponse> {
-        return await this.request<ReopenSessionResponse>(
-            `/api/sessions/${encodeURIComponent(sessionId)}/reopen`,
-            { method: 'POST', body: JSON.stringify({}) }
-        )
+        return await this.request<ReopenSessionResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/reopen`, { method: 'POST', body: JSON.stringify({}) })
     }
 
     /**
@@ -759,7 +935,11 @@ export class ApiClient {
             if (authToken) {
                 headers.set('authorization', `Bearer ${authToken}`)
             }
-            return fetch(this.buildUrl(path), { method: 'POST', headers, body: JSON.stringify(body) })
+            return fetch(this.buildUrl(path), {
+                method: 'POST',
+                headers,
+                body: JSON.stringify(body)
+            })
         }
 
         let res = await tryOnce(null)
@@ -776,7 +956,7 @@ export class ApiClient {
         const text = await res.text()
         let parsed: CursorMigrateOutcome | null = null
         try {
-            parsed = text ? JSON.parse(text) as CursorMigrateOutcome : null
+            parsed = text ? (JSON.parse(text) as CursorMigrateOutcome) : null
         } catch {
             parsed = null
         }
@@ -838,16 +1018,20 @@ export class ApiClient {
     async approvePermission(
         sessionId: string,
         requestId: string,
-        modeOrOptions?: 'default' | 'acceptEdits' | 'auto' | 'bypassPermissions' | 'plan' | {
-            mode?: 'default' | 'acceptEdits' | 'auto' | 'bypassPermissions' | 'plan'
-            allowTools?: string[]
-            decision?: 'approved' | 'approved_for_session' | 'denied' | 'abort'
-            answers?: Record<string, string[]> | Record<string, { answers: string[] }>
-        }
+        modeOrOptions?:
+            | 'default'
+            | 'acceptEdits'
+            | 'auto'
+            | 'bypassPermissions'
+            | 'plan'
+            | {
+                  mode?: 'default' | 'acceptEdits' | 'auto' | 'bypassPermissions' | 'plan'
+                  allowTools?: string[]
+                  decision?: 'approved' | 'approved_for_session' | 'denied' | 'abort'
+                  answers?: Record<string, string[]> | Record<string, { answers: string[] }>
+              }
     ): Promise<void> {
-        const body = typeof modeOrOptions === 'string' || modeOrOptions === undefined
-            ? { mode: modeOrOptions }
-            : modeOrOptions
+        const body = typeof modeOrOptions === 'string' || modeOrOptions === undefined ? { mode: modeOrOptions } : modeOrOptions
         await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/permissions/${encodeURIComponent(requestId)}/approve`, {
             method: 'POST',
             body: JSON.stringify(body)
@@ -872,149 +1056,156 @@ export class ApiClient {
     }
 
     async getOpenVikingStatus(machineId: string): Promise<OpenVikingStatusResponse> {
-        return await this.request<OpenVikingStatusResponse>(
-            `/api/openviking/machines/${encodeURIComponent(machineId)}/status`
-        )
+        return await this.request<OpenVikingStatusResponse>(`/api/openviking/machines/${encodeURIComponent(machineId)}/status`)
+    }
+
+    async getOpenVikingPluginSettings(): Promise<{ enabled: boolean }> {
+        return await this.request<{ enabled: boolean }>('/api/plugins/openviking')
+    }
+
+    async setOpenVikingPluginEnabled(enabled: boolean): Promise<{ enabled: boolean }> {
+        return await this.request<{ enabled: boolean }>('/api/plugins/openviking', {
+            method: 'PUT',
+            body: JSON.stringify({ enabled })
+        })
     }
 
     async listOpenVikingContext(machineId: string, uri = 'viking://'): Promise<OpenVikingContextListResponse> {
-        return await this.request<OpenVikingContextListResponse>(
-            `/api/openviking/machines/${encodeURIComponent(machineId)}/context?uri=${encodeURIComponent(uri)}`
-        )
+        return await this.request<OpenVikingContextListResponse>(`/api/openviking/machines/${encodeURIComponent(machineId)}/context?uri=${encodeURIComponent(uri)}`)
     }
 
     async readOpenVikingContext(machineId: string, uri: string): Promise<OpenVikingContextReadResponse> {
-        return await this.request<OpenVikingContextReadResponse>(
-            `/api/openviking/machines/${encodeURIComponent(machineId)}/context/read?uri=${encodeURIComponent(uri)}`
-        )
+        return await this.request<OpenVikingContextReadResponse>(`/api/openviking/machines/${encodeURIComponent(machineId)}/context/read?uri=${encodeURIComponent(uri)}`)
     }
 
-    async listMachineDirectory(
-        machineId: string,
-        path: string
-    ): Promise<MachineListDirectoryResponse> {
-        return await this.request<MachineListDirectoryResponse>(
-            `/api/machines/${encodeURIComponent(machineId)}/list-directory`,
-            {
-                method: 'POST',
-                body: JSON.stringify({ path })
-            }
-        )
+    async getOpenVikingMetrics(machineId: string): Promise<OpenVikingMetricsResponse> {
+        return await this.request<OpenVikingMetricsResponse>(`/api/openviking/machines/${encodeURIComponent(machineId)}/metrics`)
     }
 
-    async checkMachinePathsExists(
-        machineId: string,
-        paths: string[]
-    ): Promise<MachinePathsExistsResponse> {
-        return await this.request<MachinePathsExistsResponse>(
-            `/api/machines/${encodeURIComponent(machineId)}/paths/exists`,
-            {
-                method: 'POST',
-                body: JSON.stringify({ paths })
-            }
-        )
+    async searchOpenViking(machineId: string, query: string, limit = 8): Promise<OpenVikingSearchResponse> {
+        return await this.request<OpenVikingSearchResponse>(`/api/openviking/machines/${encodeURIComponent(machineId)}/search`, { method: 'POST', body: JSON.stringify({ query, limit }) })
     }
 
-    async spawnSession(
-        machineId: string,
-        directory: string,
-        agent?: AgentFlavor,
-        model?: string,
-        modelReasoningEffort?: string,
-        yolo?: boolean,
-        sessionType?: 'simple' | 'worktree',
-        worktreeName?: string,
-        effort?: string
-    ): Promise<SpawnResponse> {
+    async getOpenVikingQuality(machineId: string): Promise<OpenVikingQualityResponse> {
+        return await this.request<OpenVikingQualityResponse>(`/api/openviking/machines/${encodeURIComponent(machineId)}/quality`, { method: 'POST' })
+    }
+
+    async listMachineDirectory(machineId: string, path: string): Promise<MachineListDirectoryResponse> {
+        return await this.request<MachineListDirectoryResponse>(`/api/machines/${encodeURIComponent(machineId)}/list-directory`, {
+            method: 'POST',
+            body: JSON.stringify({ path })
+        })
+    }
+
+    async checkMachinePathsExists(machineId: string, paths: string[]): Promise<MachinePathsExistsResponse> {
+        return await this.request<MachinePathsExistsResponse>(`/api/machines/${encodeURIComponent(machineId)}/paths/exists`, {
+            method: 'POST',
+            body: JSON.stringify({ paths })
+        })
+    }
+
+    async spawnSession(machineId: string, directory: string, agent?: AgentFlavor, model?: string, modelReasoningEffort?: string, yolo?: boolean, sessionType?: 'simple' | 'worktree', worktreeName?: string, effort?: string, requestId?: string): Promise<SpawnResponse> {
         return await this.request<SpawnResponse>(`/api/machines/${encodeURIComponent(machineId)}/spawn`, {
             method: 'POST',
-            body: JSON.stringify({ directory, agent, model, modelReasoningEffort, yolo, sessionType, worktreeName, effort })
+            body: JSON.stringify({
+                requestId: requestId ?? crypto.randomUUID(),
+                directory,
+                agent,
+                model,
+                modelReasoningEffort,
+                yolo,
+                sessionType,
+                worktreeName,
+                effort
+            })
         })
     }
 
     async getMachineCodexModels(machineId: string): Promise<CodexModelsResponse> {
-        return await this.request<CodexModelsResponse>(
-            `/api/machines/${encodeURIComponent(machineId)}/codex-models`
-        )
+        return await this.request<CodexModelsResponse>(`/api/machines/${encodeURIComponent(machineId)}/codex-models`)
     }
 
-    async getMachineCodexSubscriptionLimits(
-        machineId: string,
-        model?: string | null
-    ): Promise<CodexSubscriptionLimitsResponse> {
+    async getMachineCodexSubscriptionLimits(machineId: string, model?: string | null, cwd?: string | null, provider?: string | null): Promise<CodexSubscriptionLimitsResponse> {
         const normalizedModel = model?.trim()
-        const query = normalizedModel ? `?model=${encodeURIComponent(normalizedModel)}` : ''
-        return await this.request<CodexSubscriptionLimitsResponse>(
-            `/api/machines/${encodeURIComponent(machineId)}/codex-subscription-limits${query}`
-        )
+        const params = new URLSearchParams()
+        if (normalizedModel) params.set('model', normalizedModel)
+        if (cwd) params.set('cwd', cwd)
+        if (provider) params.set('provider', provider)
+        const query = params.size ? `?${params}` : ''
+        return await this.request<CodexSubscriptionLimitsResponse>(`/api/machines/${encodeURIComponent(machineId)}/codex-subscription-limits${query}`)
     }
 
     async getSessionCodexModels(sessionId: string): Promise<CodexModelsResponse> {
-        return await this.request<CodexModelsResponse>(
-            `/api/sessions/${encodeURIComponent(sessionId)}/codex-models`
-        )
+        return await this.request<CodexModelsResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/codex-models`)
     }
 
     async getSessionCodexSubscriptionLimits(sessionId: string): Promise<CodexSubscriptionLimitsResponse> {
-        return await this.request<CodexSubscriptionLimitsResponse>(
-            `/api/sessions/${encodeURIComponent(sessionId)}/codex-subscription-limits`
-        )
+        return await this.request<CodexSubscriptionLimitsResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/codex-subscription-limits`)
     }
 
     async getSessionOpencodeModels(sessionId: string): Promise<OpencodeModelsResponse> {
-        return await this.request<OpencodeModelsResponse>(
-            `/api/sessions/${encodeURIComponent(sessionId)}/opencode-models`
-        )
+        return await this.request<OpencodeModelsResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/opencode-models`)
     }
 
     async getSessionOpencodeReasoningEffortOptions(sessionId: string): Promise<OpencodeReasoningEffortResponse> {
-        return await this.request<OpencodeReasoningEffortResponse>(
-            `/api/sessions/${encodeURIComponent(sessionId)}/opencode-reasoning-effort-options`
-        )
+        return await this.request<OpencodeReasoningEffortResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/opencode-reasoning-effort-options`)
     }
 
     async getSessionCursorModels(sessionId: string): Promise<CursorModelsResponse> {
-        return await this.request<CursorModelsResponse>(
-            `/api/sessions/${encodeURIComponent(sessionId)}/cursor-models`
-        )
+        return await this.request<CursorModelsResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/cursor-models`)
     }
 
     /** Generic Pi session endpoint — replaces per-method wrappers. */
     async callPiEndpoint<T = unknown>(sessionId: string, path: string, init?: RequestInit): Promise<T> {
-        return await this.request<T>(
-            `/api/sessions/${encodeURIComponent(sessionId)}/pi-${path}`,
-            init
-        )
+        return await this.request<T>(`/api/sessions/${encodeURIComponent(sessionId)}/pi-${path}`, init)
     }
 
     async getMachineCursorModels(machineId: string): Promise<CursorModelsResponse> {
-        return await this.request<CursorModelsResponse>(
-            `/api/machines/${encodeURIComponent(machineId)}/cursor-models`
-        )
+        return await this.request<CursorModelsResponse>(`/api/machines/${encodeURIComponent(machineId)}/cursor-models`)
     }
 
     async getMachineOpencodeModelsForCwd(machineId: string, cwd: string): Promise<OpencodeModelsResponse> {
-        return await this.request<OpencodeModelsResponse>(
-            `/api/machines/${encodeURIComponent(machineId)}/opencode-models?cwd=${encodeURIComponent(cwd)}`
-        )
+        return await this.request<OpencodeModelsResponse>(`/api/machines/${encodeURIComponent(machineId)}/opencode-models?cwd=${encodeURIComponent(cwd)}`)
     }
 
     async getMachineGitBranch(machineId: string, cwd: string): Promise<GitBranchResponse> {
-        return await this.request<GitBranchResponse>(
-            `/api/machines/${encodeURIComponent(machineId)}/git-branch?cwd=${encodeURIComponent(cwd)}`
-        )
+        return await this.request<GitBranchResponse>(`/api/machines/${encodeURIComponent(machineId)}/git-branch?cwd=${encodeURIComponent(cwd)}`)
+    }
+
+    async getMachineGitBranches(machineId: string, cwd: string): Promise<GitBranchesResponse> {
+        return await this.request<GitBranchesResponse>(`/api/machines/${encodeURIComponent(machineId)}/git-branches?cwd=${encodeURIComponent(cwd)}`)
+    }
+
+    async switchMachineGitBranch(machineId: string, request: MachineGitBranchSwitchRequest): Promise<GitBranchesResponse> {
+        return await this.request<GitBranchesResponse>(`/api/machines/${encodeURIComponent(machineId)}/git-branches/switch`, { method: 'POST', body: JSON.stringify(request) })
+    }
+
+    async createMachineGitBranch(machineId: string, request: MachineGitBranchCreateRequest): Promise<GitBranchesResponse> {
+        return await this.request<GitBranchesResponse>(`/api/machines/${encodeURIComponent(machineId)}/git-branches`, { method: 'POST', body: JSON.stringify(request) })
+    }
+
+    async commitMachineGitChanges(machineId: string, request: MachineGitBranchCommitRequest): Promise<GitBranchesResponse> {
+        return await this.request<GitBranchesResponse>(`/api/machines/${encodeURIComponent(machineId)}/git-branches/commit`, { method: 'POST', body: JSON.stringify(request) }, 0, undefined, 75_000)
+    }
+
+    async pushMachineGitBranch(machineId: string, request: MachineGitBranchPushRequest): Promise<GitBranchesResponse> {
+        return await this.request<GitBranchesResponse>(`/api/machines/${encodeURIComponent(machineId)}/git-branches/push`, { method: 'POST', body: JSON.stringify(request) }, 0, undefined, 75_000)
+    }
+
+    async fetchMachineGitBranches(machineId: string, request: MachineGitBranchFetchRequest): Promise<GitBranchesResponse> {
+        return await this.request<GitBranchesResponse>(`/api/machines/${encodeURIComponent(machineId)}/git-branches/fetch`, { method: 'POST', body: JSON.stringify(request) }, 0, undefined, 75_000)
+    }
+
+    async updateMachineGitBranch(machineId: string, request: MachineGitBranchUpdateRequest): Promise<GitBranchesResponse> {
+        return await this.request<GitBranchesResponse>(`/api/machines/${encodeURIComponent(machineId)}/git-branches/update`, { method: 'POST', body: JSON.stringify(request) }, 0, undefined, 75_000)
     }
 
     async getSlashCommands(sessionId: string): Promise<SlashCommandsResponse> {
-        return await this.request<SlashCommandsResponse>(
-            `/api/sessions/${encodeURIComponent(sessionId)}/slash-commands`
-        )
+        return await this.request<SlashCommandsResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/slash-commands`)
     }
 
     async getSkills(sessionId: string): Promise<SkillsResponse> {
-        return await this.request<SkillsResponse>(
-            `/api/sessions/${encodeURIComponent(sessionId)}/skills`
-        )
+        return await this.request<SkillsResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/skills`)
     }
 
     async renameSession(sessionId: string, name: string): Promise<void> {
@@ -1042,18 +1233,18 @@ export class ApiClient {
         })
     }
 
-    async fetchVoices(): Promise<{ voices: Array<{ id: string; name: string; previewUrl: string; category: string }> }> {
+    async fetchVoices(): Promise<{
+        voices: Array<{
+            id: string
+            name: string
+            previewUrl: string
+            category: string
+        }>
+    }> {
         return await this.request('/api/voice/voices')
     }
 
-    async sendVoiceTelemetry(event: {
-        stage: string
-        message: string
-        sessionId?: string
-        voiceId?: string
-        language?: string
-        details?: Record<string, unknown>
-    }): Promise<void> {
+    async sendVoiceTelemetry(event: { stage: string; message: string; sessionId?: string; voiceId?: string; language?: string; details?: Record<string, unknown> }): Promise<void> {
         await this.request('/api/voice/telemetry', {
             method: 'POST',
             body: JSON.stringify(event)

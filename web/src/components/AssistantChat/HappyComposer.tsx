@@ -3,7 +3,6 @@ import { ComposerPrimitive, useAssistantApi, useAssistantState } from '@assistan
 import {
     type ChangeEvent as ReactChangeEvent,
     type ClipboardEvent as ReactClipboardEvent,
-    type FocusEvent as ReactFocusEvent,
     type FormEvent as ReactFormEvent,
     type KeyboardEvent as ReactKeyboardEvent,
     type MouseEvent as ReactMouseEvent,
@@ -28,6 +27,7 @@ import { supportsEffort, supportsModelChange, PI_THINKING_LEVEL_LABELS } from '@
 import type { PiThinkingLevel } from '@hapi/protocol'
 import { markSkillUsed } from '@/lib/recent-skills'
 import { useComposerDraft } from '@/hooks/useComposerDraft'
+import { consumeQueuedMessageEdit, useQueuedMessageEdit } from '@/lib/queued-message-edits'
 import { useComposerEnterBehavior } from '@/hooks/useComposerEnterBehavior'
 import { FloatingOverlay } from '@/components/ChatInput/FloatingOverlay'
 import { Autocomplete } from '@/components/ChatInput/Autocomplete'
@@ -37,6 +37,7 @@ import type { PendingSchedule } from '@/components/AssistantChat/ScheduleTimePic
 import { AttachmentItem } from '@/components/AssistantChat/AttachmentItem'
 import { getContextBudgetTokens } from '@/chat/modelConfig'
 import { useTranslation } from '@/lib/use-translation'
+import { formatUserMessageForDisplay } from '@/chat/questionAnswers'
 import { getModelOptionsForFlavor, getNextModelForFlavor } from './modelOptions'
 import { getClaudeComposerEffortOptions } from './claudeEffortOptions'
 import { getCodexComposerReasoningEffortOptions } from './codexReasoningEffortOptions'
@@ -176,10 +177,11 @@ function formatReasoningLabel(value: string | null | undefined, label: string, l
     return label
 }
 
-function formatCompactModelLabel(label: string): string {
-    return label
-        .replace(/^GPT-/i, '')
-        .replace(/^gpt-/i, '')
+export function formatCompactModelLabel(label: string): string {
+    const normalized = label.trim()
+    const separator = normalized.lastIndexOf('-')
+    const suffix = separator >= 0 ? normalized.slice(separator + 1).trim() : ''
+    return suffix || normalized
 }
 
 function formatTokenCount(value: number): string {
@@ -253,6 +255,14 @@ export function HappyComposer(props: {
     /** Workspace identity for project-scoped skill shortcuts. */
     projectPath?: string | null
     disabled?: boolean
+    /** Replaces the send glyph with a lock while preserving the current draft. */
+    locked?: boolean
+    /** Native transports can expose interruption independently of transcript activity. */
+    canAbort?: boolean
+    abortPending?: boolean
+    onAbort?: () => Promise<void>
+    allowGoals?: boolean
+    onReadOnlyModelInfo?: () => void
     permissionMode?: PermissionMode
     collaborationMode?: CodexCollaborationMode
     threadGoal?: ThreadGoal | null
@@ -324,6 +334,8 @@ export function HappyComposer(props: {
     sendError?: ComposerSendError | null
     onClearSendError?: () => void
     showStatusBar?: boolean
+    /** Native sessions report these settings but do not support changing them here. */
+    readOnlyModelInfo?: boolean
     /** Hide file input affordances for transports that only accept text. */
     allowAttachments?: boolean
     activeSideSessions?: ActiveSideSessionChip[]
@@ -333,6 +345,7 @@ export function HappyComposer(props: {
     const {
         sessionId,
         disabled = false,
+        locked = false,
         permissionMode: rawPermissionMode,
         collaborationMode: rawCollaborationMode,
         threadGoal,
@@ -428,13 +441,16 @@ export function HappyComposer(props: {
     const [settingsPanel, setSettingsPanel] = useState<SettingsPanel>('main')
     const [showPiModelPanel, setShowPiModelPanel] = useState(false)
     const [showPiThinkingPanel, setShowPiThinkingPanel] = useState(false)
-    const [isAborting, setIsAborting] = useState(false)
+    const [abortRequested, setIsAborting] = useState(false)
+    const isAborting = abortRequested || props.abortPending === true
     const [isSwitching, setIsSwitching] = useState(false)
     const [showSideSessionMenu, setShowSideSessionMenu] = useState(false)
     const [showContinueHint, setShowContinueHint] = useState(false)
-    // Start small, expand while the text field is active, then return to the
-    // compact entry point when focus leaves an empty composer. A typed draft
-    // is always expanded, even after the textarea temporarily loses focus.
+    // Start small on each detail-page mount. Once the user expands this
+    // composer, keep it expanded for the rest of that page visit. SessionChat
+    // and the native detail page key the component by session, so leaving or
+    // switching sessions creates a fresh compact composer. A typed draft is
+    // always expanded too.
     const [composerExpanded, setComposerExpanded] = useState(false)
     // pendingSchedule is controlled externally when onSchedule prop is provided; otherwise local state
     const [pendingScheduleLocal, setPendingScheduleLocal] = useState<PendingSchedule | null>(null)
@@ -448,8 +464,6 @@ export function HappyComposer(props: {
         }
     }, [activeSideSessions.length])
 
-    const composerRootRef = useRef<HTMLDivElement>(null)
-    const composerBlurFrameRef = useRef<number | null>(null)
     const textareaRef = useRef<HTMLTextAreaElement>(null)
     const settingsButtonRef = useRef<HTMLButtonElement>(null)
     const piModelButtonRef = useRef<HTMLButtonElement>(null)
@@ -457,7 +471,21 @@ export function HappyComposer(props: {
     const prevControlledByUser = useRef(controlledByUser)
     const skillsByName = useMemo(() => new Map(skills.map((skill) => [skill.name, skill])), [skills])
 
-    useComposerDraft(sessionId, composerText, (text) => api.composer().setText(text))
+    const composerDraftReady = useComposerDraft(sessionId, composerText, (text) => api.composer().setText(text))
+    const queuedEdit = useQueuedMessageEdit(sessionId)
+    useEffect(() => {
+        // A draft written while cancellation was in flight belongs to the
+        // user. Leave this handoff saved until that draft is sent/cleared.
+        if (!composerDraftReady || !sessionId || !queuedEdit || sendError || composerText || hasAttachments || selectedSkill || pendingSchedule) return
+        const restored = extractLeadingSkillForComposer(queuedEdit.text, skillsByName)
+        if (restored) setSelectedSkill(restored.skill)
+        api.composer().setText(formatUserMessageForDisplay(restored?.text ?? queuedEdit.text))
+        if (queuedEdit.pendingSchedule?.type === 'absolute' && queuedEdit.pendingSchedule.ms > Date.now()) {
+            setPendingSchedule(queuedEdit.pendingSchedule)
+        }
+        setComposerExpanded(true)
+        consumeQueuedMessageEdit(sessionId, queuedEdit.id)
+    }, [composerDraftReady, sessionId, queuedEdit, sendError, composerText, hasAttachments, selectedSkill, pendingSchedule, skillsByName, api, setPendingSchedule])
 
     // assistant-ui clears `composer.text` synchronously the moment a send is
     // invoked AND `SessionChat.handleSend` clears `pendingSchedule` the
@@ -485,7 +513,7 @@ export function HappyComposer(props: {
                 setSelectedSkill(restored.skill)
                 api.composer().setText(restored.text)
             } else {
-                api.composer().setText(sendError.text)
+                api.composer().setText(formatUserMessageForDisplay(sendError.text))
             }
         }
         // Restore the pending schedule too.  `scheduledAt` was already
@@ -674,7 +702,7 @@ export function HappyComposer(props: {
         haptic('light')
     }, [api, suggestions, inputState, autocompletePrefixes, focusComposerInputAt, haptic, skillsByName, handleSkillSelect])
 
-    const abortDisabled = controlsDisabled || isAborting || !threadIsRunning
+    const abortDisabled = controlsDisabled || isAborting || !threadIsRunning || props.canAbort === false
     const switchDisabled = controlsDisabled || isSwitching || !controlledByUser
     const showSwitchButton = Boolean(controlledByUser && onSwitchToRemote)
     const showTerminalButton = Boolean(onTerminal || terminalUnsupported)
@@ -697,8 +725,14 @@ export function HappyComposer(props: {
         if (abortDisabled) return
         haptic('error')
         setIsAborting(true)
-        api.thread().cancelRun()
-    }, [abortDisabled, api, haptic])
+        if (props.onAbort) {
+            // The transport owns error feedback. A failed/unknown request must
+            // not leave the local button permanently spinning.
+            void props.onAbort().catch(() => {}).finally(() => setIsAborting(false))
+        } else {
+            api.thread().cancelRun()
+        }
+    }, [abortDisabled, api, haptic, props.onAbort])
 
     const handleSwitch = useCallback(async () => {
         if (switchDisabled || !onSwitchToRemote) return
@@ -1078,7 +1112,7 @@ export function HappyComposer(props: {
         && onCollaborationModeChange
         && collaborationModeOptions.some((option) => option.mode === 'plan')
     )
-    const showGoalModeTool = agentFlavor === 'codex'
+    const showGoalModeTool = agentFlavor === 'codex' && props.allowGoals !== false
     const showPermissionSettings = Boolean(onPermissionModeChange && permissionModeOptions.length > 0)
     const showModelSettings = Boolean(onModelChange && supportsModelChange(agentFlavor) && (piModels && piModels.length > 0 || modelOptions.length > 0))
     const showModelEffortSettings = Boolean(
@@ -1124,10 +1158,13 @@ export function HappyComposer(props: {
     // effect below. This prevents one compact render between the first typed
     // character and the persistent expanded state.
     const composerCompact = !composerExpanded && !requiresExpandedComposer
+    const [promptIndex] = useState(() => Math.floor(Math.random() * 6))
+    const playfulPrompts = [
+        t('composer.prompt.0'), t('composer.prompt.1'), t('composer.prompt.2'),
+        t('composer.prompt.3'), t('composer.prompt.4'), t('composer.prompt.5'),
+    ]
     const composerPlaceholder = inactiveNotice
-        ?? (composerCompact
-            ? t('misc.compactComposerPrompt')
-            : showContinueHint ? t('misc.typeMessage') : t('misc.typeAMessage'))
+        ?? (showContinueHint && !composerCompact ? t('misc.typeMessage') : playfulPrompts[promptIndex])
 
     useEffect(() => {
         if (requiresExpandedComposer) {
@@ -1140,31 +1177,6 @@ export function HappyComposer(props: {
             setComposerExpanded(true)
         }
     }, [composerCompact])
-    const handleComposerBlur = useCallback((_event: ReactFocusEvent<HTMLTextAreaElement>) => {
-        if (composerBlurFrameRef.current !== null) {
-            window.cancelAnimationFrame(composerBlurFrameRef.current)
-        }
-        // Let a click on a toolbar control settle first. Collapsing during the
-        // input's blur phase would unmount that control before its click fires.
-        composerBlurFrameRef.current = window.requestAnimationFrame(() => {
-            composerBlurFrameRef.current = null
-            if (requiresExpandedComposer) {
-                return
-            }
-            const activeElement = document.activeElement
-            if (activeElement instanceof Node && composerRootRef.current?.contains(activeElement)) {
-                return
-            }
-            setComposerExpanded(false)
-        })
-    }, [requiresExpandedComposer])
-    useEffect(() => {
-        return () => {
-            if (composerBlurFrameRef.current !== null) {
-                window.cancelAnimationFrame(composerBlurFrameRef.current)
-            }
-        }
-    }, [])
     // Keep one surface mounted and morph its grid tracks instead of swapping
     // a pill for a panel. This is the web equivalent of a container transform:
     // the input remains the visual anchor while the toolbar fades in after the
@@ -1189,9 +1201,11 @@ export function HappyComposer(props: {
             ?? null,
         [codexReasoningEffortOptions, modelReasoningEffort]
     )
-    const currentReasoningLabel = currentReasoningOption
-        ? formatReasoningLabel(currentReasoningOption.value, currentReasoningOption.label, locale)
-        : null
+    const currentReasoningLabel = props.readOnlyModelInfo
+        ? modelReasoningEffort ? formatReasoningLabel(modelReasoningEffort, modelReasoningEffort, locale) : null
+        : currentReasoningOption
+            ? formatReasoningLabel(currentReasoningOption.value, currentReasoningOption.label, locale)
+            : null
     const compactModelLabel = formatCompactModelLabel(currentModelLabel)
     const settingsLabel = currentReasoningLabel
         ? `${compactModelLabel} ${currentReasoningLabel}`
@@ -1625,10 +1639,7 @@ export function HappyComposer(props: {
             data-testid="happy-composer"
             data-mobile-layout-state={composerCompact ? 'compact' : 'expanded'}
         >
-            <div
-                ref={composerRootRef}
-                className="mx-auto w-full max-w-content"
-            >
+            <div className="mx-auto w-full max-w-content">
                 <ComposerPrimitive.Root
                     className="relative"
                     onSubmit={handleSubmit}
@@ -1770,7 +1781,7 @@ export function HappyComposer(props: {
                     ) : null}
 
                     <div
-                        className={`relative grid overflow-hidden border transition-[grid-template-rows,border-radius,border-color,box-shadow,background-color] duration-[220ms] ease-[cubic-bezier(0.2,0,0,1)] motion-reduce:transition-none ${composerGridRowsClass} ${
+                        className={`ios-composer-control relative grid overflow-hidden border transition-[grid-template-rows,border-radius,border-color,box-shadow,background-color] duration-[220ms] ease-[cubic-bezier(0.2,0,0,1)] motion-reduce:transition-none ${composerGridRowsClass} ${
                             composerCompact
                                 ? 'rounded-full border-[var(--app-composer-compact-border)] bg-[var(--app-bg)] shadow-[var(--app-composer-compact-shadow)]'
                                 : 'rounded-[22px] border-[var(--app-composer-expanded-border)] [background:var(--app-composer-expanded-bg)] [box-shadow:var(--app-composer-expanded-shadow)]'
@@ -1796,23 +1807,28 @@ export function HappyComposer(props: {
                         >
                             <ComposerPrimitive.Input
                                 ref={textareaRef}
-                                placeholder={composerPlaceholder}
+                                placeholder=""
+                                aria-label={t('chat.placeholder')}
+                                aria-description={!hasText ? composerPlaceholder : undefined}
                                 disabled={controlsDisabled}
                                 maxRows={composerCompact ? 1 : 6}
                                 submitOnEnter={false}
                                 cancelOnEscape={false}
                                 onFocus={handleComposerFocus}
-                                onBlur={handleComposerBlur}
                                 onChange={handleChange}
                                 onSelect={handleSelect}
                                 onKeyDown={handleKeyDown}
                                 onPaste={handlePaste}
-                                className={`relative z-10 flex-1 resize-none bg-transparent text-base text-[var(--app-fg)] placeholder-[var(--app-hint)] transition-[height,min-height,max-height] duration-[220ms] ease-[cubic-bezier(0.2,0,0,1)] focus:outline-none disabled:cursor-not-allowed disabled:opacity-50 motion-reduce:transition-none ${
+                                className={`relative z-10 min-w-0 flex-1 resize-none bg-transparent text-base text-[var(--app-fg)] placeholder-[var(--app-hint)] transition-[height,min-height,max-height] duration-[220ms] ease-[cubic-bezier(0.2,0,0,1)] focus:outline-none disabled:cursor-not-allowed disabled:opacity-50 motion-reduce:transition-none ${
                                     composerCompact
                                         ? 'h-6 max-h-6 overflow-hidden pr-12 leading-6'
                                         : 'min-h-[44px] max-h-[10rem] overflow-y-auto overscroll-contain leading-snug'
                                 }`}
                             />
+                            {!hasText ? <span aria-hidden="true" data-testid="composer-placeholder"
+                                className={`pointer-events-none absolute inset-x-4 truncate text-base text-[var(--app-hint)] ${composerCompact ? 'top-3 pr-12 leading-6' : 'top-2 leading-snug'}`}>
+                                {composerPlaceholder}
+                            </span> : null}
                             {composerCompact ? (
                                 <div className="absolute right-1 top-1/2 z-20 -translate-y-1/2">
                                     <UnifiedButton
@@ -1820,6 +1836,7 @@ export function HappyComposer(props: {
                                         voiceStatus={voiceStatus}
                                         voiceEnabled={voiceEnabled}
                                         controlsDisabled={controlsDisabled}
+                                        locked={locked}
                                         onSend={sendComposerMessage}
                                         onVoiceToggle={onVoiceToggle ?? (() => {})}
                                         showAbortButton={showAbortButton}
@@ -1844,10 +1861,13 @@ export function HappyComposer(props: {
                             <ComposerButtons
                                 canSend={canSend}
                                 controlsDisabled={controlsDisabled}
-                                showSettingsButton={showSettingsButton}
+                                locked={locked}
+                                showSettingsButton={showSettingsButton || Boolean(props.readOnlyModelInfo && (model || modelReasoningEffort))}
+                                settingsReadOnly={props.readOnlyModelInfo}
+                                onSettingsReadOnlyClick={props.onReadOnlyModelInfo}
                                 onSettingsToggle={handleSettingsToggle}
                                 settingsButtonRef={settingsButtonRef}
-                                settingsLabel={settingsLabel}
+                                settingsLabel={props.readOnlyModelInfo ? [model, currentReasoningLabel].filter(Boolean).join(' ') : settingsLabel}
                                 settingsModelLabel={compactModelLabel}
                                 settingsReasoningLabel={currentReasoningLabel}
                                 fastModeActive={serviceTier?.trim().toLowerCase() === 'fast'}

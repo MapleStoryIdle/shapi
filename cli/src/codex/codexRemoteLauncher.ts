@@ -1,4 +1,17 @@
 import React from 'react';
+import {
+    aggregateCodexTokenUsage,
+    readCodexTokenUsage,
+    selectCodexTokenUsage,
+    type CodexTokenUsage,
+    type CodexUsageBreakdown
+} from '@hapi/protocol/codexUsage';
+import {
+    extractCodexFailureMessage,
+    isCodexAuthenticationError,
+    isHttpForbiddenError,
+    selectPreferredCodexFailureMessage
+} from '@hapi/protocol';
 import { randomUUID } from 'node:crypto';
 import { lstat } from 'node:fs/promises';
 
@@ -21,6 +34,7 @@ import { registerAppServerPermissionHandlers } from './utils/appServerPermission
 import { buildThreadStartParams, buildTurnStartParams } from './utils/appServerConfig';
 import type { ReviewTarget, ThreadGoal, ThreadGoalStatus } from './appServerTypes';
 import { shouldIgnoreTerminalEvent } from './utils/terminalEventGuard';
+import { notifyRunnerCodexRecoveryReady, notifyRunnerCodexRecoveryUnconfirmed } from '@/runner/controlClient';
 import { parseCodexSpecialCommand } from './codexSpecialCommands';
 import {
     RemoteLauncherBase,
@@ -60,17 +74,7 @@ async function registerGeneratedImageFromPath(args: { id: string; path: string; 
 
 type HappyServer = Awaited<ReturnType<typeof buildHapiMcpBridge>>['server'];
 type QueuedMessage = { message: string; mode: EnhancedMode; isolate: boolean; hash: string };
-type PendingSideSessionFork = {
-    callId: string | null;
-    parentThreadId: string;
-    timeout: ReturnType<typeof setTimeout>;
-    resolve: (value: {
-        childCodexThreadId: string;
-        parentCodexThreadId: string;
-    }) => void;
-    reject: (error: Error) => void;
-};
-type CodexTaskStatusCode = 'system_error' | 'usage_limit' | 'model_capacity' | 'context_window' | 'unknown';
+type CodexTaskStatusCode = 'system_error' | 'authentication' | 'http_forbidden' | 'network_error' | 'usage_limit' | 'model_capacity' | 'context_window' | 'unknown';
 type CodexTaskStatusEvent = {
     type: 'task-status';
     status: 'retrying' | 'compacting' | 'compacted' | 'failed';
@@ -112,14 +116,27 @@ type CodexSubagentSnapshot = {
     statusText?: string;
     activity?: string;
     activityKind?: string;
+    model?: string;
+    modelReasoningEffort?: string;
     startedAt: number;
     updatedAt: number;
     completedAt?: number;
 };
 
+type CodexSubagentConfiguration = {
+    childModel?: string;
+    childReasoningEffort?: string;
+};
+
+type CodexSubagentCardConfiguration = {
+    requestedModel?: string;
+    requestedReasoningEffort?: string;
+    parentModel?: string;
+    parentReasoningEffort?: string;
+};
+
 const AGENT_RUN_UPDATE_THROTTLE_MS = 300;
 const AGENT_RUN_START_TIMEOUT_MS = 30 * 1000;
-const SIDE_SESSION_FORK_TIMEOUT_MS = 60 * 1000;
 const SUBAGENT_STATE_FLUSH_DEBOUNCE_MS = 250;
 const THROTTLED_AGENT_RUN_ACTIVITY_KINDS = new Set(['thinking']);
 const CODEX_SPAWN_AGENT_FULL_HISTORY_ARGUMENT_ERROR =
@@ -135,12 +152,123 @@ const CONTEXT_COMPACT_RETRYABLE_ERROR_PATTERNS = [
     'context window',
     'clear earlier history'
 ];
+const NETWORK_ERROR_PATTERNS = [
+    'network error',
+    'network request failed',
+    'failed to fetch',
+    'fetch failed',
+    'error sending request',
+    'stream disconnected before completion',
+    'connection reset',
+    'connection refused',
+    'connection timed out',
+    'connection timeout',
+    'network is unreachable',
+    'network unreachable',
+    'socket hang up',
+    'could not resolve host',
+    'dns error',
+    'econnreset',
+    'econnrefused',
+    'etimedout',
+    'enotfound',
+    'eai_again'
+];
+const APP_SERVER_TRANSPORT_ERROR_PATTERNS = [
+    'codex app-server exited',
+    'codex app-server disconnected',
+    'failed to spawn codex app-server',
+    'write epipe',
+    'broken pipe'
+];
 const SAME_THREAD_MAX_RETRIES = 3;
 const SAME_THREAD_MAX_COMPACT_RETRIES = 1;
 const SAME_THREAD_COMPACT_TIMEOUT_MS = 10 * 60 * 1000;
 const CODEX_USAGE_SETTINGS_URL = 'https://chatgpt.com/codex/settings/usage';
 const CODEX_GOALS_UNSUPPORTED_MESSAGE = 'Codex goals are not supported by this Codex runtime. Upgrade Codex or enable features.goals.';
 const MAX_CODEX_GOAL_OBJECTIVE_CHARS = 4_000;
+
+function recoveryRecord(value: unknown): Record<string, unknown> | null {
+    return value !== null && typeof value === 'object' && !Array.isArray(value)
+        ? value as Record<string, unknown>
+        : null
+}
+
+function recoveryString(value: unknown): string | null {
+    return typeof value === 'string' && value.trim() ? value.trim() : null
+}
+
+type RecoveredCodexThreadState = 'active' | 'idle' | 'unknown'
+
+export function readRecoveredCodexThreadState(value: unknown, expectedThreadId: string): RecoveredCodexThreadState {
+    const root = recoveryRecord(value)
+    const data = recoveryRecord(root?.data) ?? root
+    const thread = recoveryRecord(data?.thread) ?? data
+    if (recoveryString(thread?.id ?? thread?.threadId) !== expectedThreadId) return 'unknown'
+    const turns = Array.isArray(thread?.turns)
+        ? thread?.turns
+        : Array.isArray(data?.turns)
+            ? data?.turns
+            : null
+    if (!turns) return 'unknown'
+    const active = new Set(['inprogress', 'processing', 'active', 'running'])
+    const terminal = new Set(['idle', 'completed', 'complete', 'failed', 'aborted', 'interrupted', 'cancelled', 'canceled'])
+    for (const turn of turns) {
+        const record = recoveryRecord(turn)
+        const nested = recoveryRecord(record?.turn)
+        const rawStatus = recoveryString(record?.status ?? record?.state ?? nested?.status ?? nested?.state)
+        if (!rawStatus) return 'unknown'
+        const status = rawStatus.toLowerCase().replace(/[-_\s]/g, '')
+        if (active.has(status)) return 'active'
+        if (!terminal.has(status)) return 'unknown'
+    }
+    return 'idle'
+}
+
+/** Strict recovery-only parser: ambiguous/malformed state is never idle. */
+export function isExactIdleRecoveryThreadRead(value: unknown, expectedThreadId: string): boolean {
+    return readRecoveredCodexThreadState(value, expectedThreadId) === 'idle'
+}
+
+type SideSessionForkBoundary = {
+    lastTurnId: string | null;
+    hasInProgressTurn: boolean;
+}
+
+/** Selects the latest terminal turn before any in-progress turn. */
+export function readSideSessionForkBoundary(value: unknown, expectedThreadId: string): SideSessionForkBoundary | null {
+    const root = recoveryRecord(value)
+    const data = recoveryRecord(root?.data) ?? root
+    const thread = recoveryRecord(data?.thread) ?? data
+    if (recoveryString(thread?.id ?? thread?.threadId) !== expectedThreadId) return null
+    const turns = Array.isArray(thread?.turns)
+        ? thread.turns
+        : Array.isArray(data?.turns)
+            ? data.turns
+            : null
+    if (!turns) return null
+
+    const terminal = new Set(['completed', 'failed', 'interrupted'])
+    let lastTurnId: string | null = null
+    let hasInProgressTurn = false
+    for (const turn of turns) {
+        const record = recoveryRecord(turn)
+        const nested = recoveryRecord(record?.turn)
+        const turnId = recoveryString(record?.id ?? record?.turnId ?? nested?.id ?? nested?.turnId)
+        const rawStatus = recoveryString(record?.status ?? record?.state ?? nested?.status ?? nested?.state)
+        if (!rawStatus) return null
+        const status = rawStatus.toLowerCase().replace(/[-_\s]/g, '')
+        if (status === 'inprogress') {
+            hasInProgressTurn = true
+            continue
+        }
+        if (!terminal.has(status) || !turnId) return null
+        if (!hasInProgressTurn) {
+            lastTurnId = turnId
+        }
+    }
+    return { lastTurnId, hasInProgressTurn }
+}
 
 type GoalForwardSignature = {
     objective: string | null;
@@ -219,6 +347,20 @@ function isContextCompactRetryableCodexError(error: string | null): boolean {
     return CONTEXT_COMPACT_RETRYABLE_ERROR_PATTERNS.some((pattern) => normalized.includes(pattern));
 }
 
+function isNetworkCodexError(error: string | null): boolean {
+    if (!error) {
+        return false;
+    }
+    const normalized = error.toLowerCase();
+    return NETWORK_ERROR_PATTERNS.some((pattern) => normalized.includes(pattern));
+}
+
+export function isCodexAppServerTransportError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    const normalized = message.toLowerCase();
+    return APP_SERVER_TRANSPORT_ERROR_PATTERNS.some((pattern) => normalized.includes(pattern));
+}
+
 function extractCodexUsageActionUrl(error: string): string | null {
     const match = error.match(/https:\/\/chatgpt\.com\/codex\/settings\/usage[^\s)]*/i);
     return match?.[0] ?? null;
@@ -236,6 +378,12 @@ function classifyCodexTaskFailure(error: string | null): {
 } {
     if (!error) {
         return { code: 'unknown' };
+    }
+    if (isHttpForbiddenError(error)) {
+        return { code: 'http_forbidden' };
+    }
+    if (isCodexAuthenticationError(error)) {
+        return { code: 'authentication' };
     }
 
     const normalized = error.toLowerCase();
@@ -258,6 +406,9 @@ function classifyCodexTaskFailure(error: string | null): {
     }
     if (isContextCompactRetryableCodexError(error) || normalized.includes('same-conversation compact')) {
         return { code: 'context_window' };
+    }
+    if (isNetworkCodexError(error)) {
+        return { code: 'network_error' };
     }
     return { code: 'unknown' };
 }
@@ -325,6 +476,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
     private currentThreadId: string | null = null;
     private currentTurnId: string | null = null;
     private readonly activeChildTurns = new Map<string, string>();
+    private cleanupPromise: Promise<void> | null = null;
 
     constructor(session: CodexSession) {
         super(process.env.DEBUG ? session.logPath : undefined);
@@ -522,7 +674,9 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             return false;
         };
 
-        const applyResolvedModel = (value: unknown): string | undefined => {
+        const applyResolvedModel = (value: unknown, provider?: unknown): string | undefined => {
+            const providerId = asString(provider);
+            if (providerId) session.client.updateMetadata(metadata => ({ ...metadata, codexModelProvider: providerId }));
             const resolvedModel = asString(value) ?? undefined;
             if (!resolvedModel) {
                 return undefined;
@@ -534,7 +688,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
 
         const applyForkedThreadConfiguration = (response: unknown): void => {
             const record = asRecord(response);
-            applyResolvedModel(record?.model);
+            applyResolvedModel(record?.model, record?.modelProvider ?? record?.model_provider);
 
             const reasoningEffort = asString(record?.reasoningEffort ?? record?.reasoning_effort);
             if (reasoningEffort) {
@@ -782,6 +936,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
         const agentSummaryByCardId = new Map<string, string>();
         const agentSummaryByAgentId = new Map<string, string>();
         const agentStatusByAgentId = new Map<string, string>();
+        const agentFailureByAgentId = new Map<string, string>();
         const agentStartedAtByCardId = new Map<string, number>();
         const agentStartedAtByAgentId = new Map<string, number>();
         const agentTypeByCardId = new Map<string, string>();
@@ -791,6 +946,11 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
         const pendingAgentTracesByAgentId = new Map<string, unknown[]>();
         const pendingAgentToolInputByCallId = new Map<string, { name: string; input: unknown }>();
         const childAgentRuntimeById = new Map<string, ChildAgentRuntime>();
+        const openChildToolCallsByAgentId = new Map<string, Map<string, number | undefined>>();
+        const childAgentConfigurationById = new Map<string, CodexSubagentConfiguration>();
+        const usageByThreadId = new Map<string, CodexTokenUsage>();
+        const usageByModelAndEffort = new Map<string, CodexUsageBreakdown>();
+        const subagentCardConfigurationById = new Map<string, CodexSubagentCardConfiguration>();
         const subagentSnapshotById = new Map<string, CodexSubagentSnapshot>();
         const lastAgentRunUpdateAtByAgentId = new Map<string, number>();
         const lastAgentRunUpdateSignatureByAgentId = new Map<string, string>();
@@ -801,19 +961,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
         const pendingThrottledAgentUpdateTimerByAgentId = new Map<string, ReturnType<typeof setTimeout>>();
         const pendingAgentStartTimersByCardId = new Map<string, ReturnType<typeof setTimeout>>();
         let subagentStateFlushTimer: ReturnType<typeof setTimeout> | null = null;
-        let pendingSideSessionFork: PendingSideSessionFork | null = null;
-        const takePendingSideSessionFork = (parentThreadId?: string): PendingSideSessionFork | null => {
-            const fork = pendingSideSessionFork as PendingSideSessionFork | null;
-            if (!fork) {
-                return null;
-            }
-            if (parentThreadId && fork.parentThreadId !== parentThreadId) {
-                return null;
-            }
-            pendingSideSessionFork = null;
-            clearTimeout(fork.timeout);
-            return fork;
-        };
+        let sideSessionForkInFlight = false;
         this.permissionHandler = permissionHandler;
         this.reasoningProcessor = reasoningProcessor;
         this.diffProcessor = diffProcessor;
@@ -909,6 +1057,23 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             const activityKind = asString(event.activityKind ?? event.activity_kind) ?? existing?.activityKind;
             const threadId = asString(event.threadId ?? event.thread_id) ?? existing?.threadId ?? agentId;
             const turnId = asString(event.turnId ?? event.turn_id) ?? existing?.turnId ?? this.activeChildTurns.get(threadId);
+            const eventConfiguration = asRecord(event.hapiSubagentConfig);
+            const childConfiguration = childAgentConfigurationById.get(agentId);
+            const cardConfiguration = cardId ? subagentCardConfigurationById.get(cardId) : undefined;
+            const model = cardConfiguration?.requestedModel
+                ?? asString(eventConfiguration?.childModel ?? eventConfiguration?.child_model)
+                ?? childConfiguration?.childModel
+                ?? existing?.model
+                ?? asString(eventConfiguration?.parentModel ?? eventConfiguration?.parent_model)
+                ?? cardConfiguration?.parentModel
+                ?? asString(session.getModel());
+            const modelReasoningEffort = cardConfiguration?.requestedReasoningEffort
+                ?? asString(eventConfiguration?.childReasoningEffort ?? eventConfiguration?.child_reasoning_effort)
+                ?? childConfiguration?.childReasoningEffort
+                ?? existing?.modelReasoningEffort
+                ?? asString(eventConfiguration?.parentReasoningEffort ?? eventConfiguration?.parent_reasoning_effort)
+                ?? cardConfiguration?.parentReasoningEffort
+                ?? asString(session.getModelReasoningEffort());
 
             subagentSnapshotById.set(agentId, {
                 id: agentId,
@@ -921,6 +1086,8 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 ...(statusText ? { statusText } : {}),
                 ...(activity ? { activity } : {}),
                 ...(activityKind ? { activityKind } : {}),
+                ...(model ? { model } : {}),
+                ...(modelReasoningEffort ? { modelReasoningEffort } : {}),
                 startedAt,
                 updatedAt: now,
                 ...(completedAt ? { completedAt } : {})
@@ -929,17 +1096,78 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             scheduleSubagentStateFlush(flushImmediately);
         };
 
+        const closeActiveChildTools = (
+            agentId: string,
+            runtime: ChildAgentRuntime,
+            reason: string
+        ): void => {
+            const activeCallIds = new Set([
+                ...runtime.activeToolsByCallId.keys(),
+                ...runtime.toolStartedAtByCallId.keys(),
+                ...(openChildToolCallsByAgentId.get(agentId)?.keys() ?? [])
+            ]);
+            for (const callId of activeCallIds) {
+                const completedAt = Date.now();
+                const startedAt = runtime.toolStartedAtByCallId.get(callId)
+                    ?? openChildToolCallsByAgentId.get(agentId)?.get(callId);
+                emitAgentRunEvent({
+                    type: 'agent-run-trace',
+                    agentId,
+                    ...(agentCardByAgentId.get(agentId) ? { cardId: agentCardByAgentId.get(agentId) } : {}),
+                    message: {
+                        type: 'tool-call-result',
+                        callId,
+                        output: reason,
+                        is_error: true,
+                        completedAt,
+                        ...(startedAt !== undefined ? { durationMs: Math.max(0, completedAt - startedAt) } : {}),
+                        id: randomUUID()
+                    }
+                });
+            }
+            openChildToolCallsByAgentId.delete(agentId);
+        };
+
         const markAllActiveSubagents = (status: string, statusText: string): void => {
             for (const snapshot of subagentSnapshotById.values()) {
                 if (isTerminalAgentRunStatus(snapshot.status)) continue;
-                subagentSnapshotById.set(snapshot.id, {
+                const completedAt = Date.now();
+                cancelPendingThrottledAgentRunUpdate(snapshot.id);
+                pendingAgentUpdatesByAgentId.delete(snapshot.id);
+                pendingAgentTracesByAgentId.delete(snapshot.id);
+                const runtime = childAgentRuntimeById.get(snapshot.id);
+                if (runtime) {
+                    closeActiveChildTools(snapshot.id, runtime, statusText);
+                    runtime.terminal = true;
+                    runtime.reasoningProcessor.reset();
+                    runtime.diffProcessor.reset();
+                    runtime.toolStartedAtByCallId.clear();
+                    runtime.activeToolsByCallId.clear();
+                    runtime.pendingTitleByCallId.clear();
+                    runtime.reasoningPreview = '';
+                }
+                agentStatusByAgentId.set(snapshot.id, status);
+                const terminalSnapshot = {
                     ...snapshot,
                     status,
                     statusText,
                     activity: statusText,
                     activityKind: status,
-                    updatedAt: Date.now(),
-                    completedAt: Date.now()
+                    updatedAt: completedAt,
+                    completedAt
+                };
+                subagentSnapshotById.set(snapshot.id, terminalSnapshot);
+                emitAgentRunEvent({
+                    type: 'agent-run-update',
+                    agentId: snapshot.id,
+                    ...(snapshot.cardId ? { cardId: snapshot.cardId } : {}),
+                    ...(snapshot.summary ? { summary: snapshot.summary } : {}),
+                    status,
+                    statusText,
+                    activity: statusText,
+                    activityKind: status,
+                    startedAt: snapshot.startedAt,
+                    completedAt
                 });
             }
             flushSubagentState();
@@ -1025,15 +1253,56 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
 
         let failAgentStartCard = (_cardId: string, _error: unknown): void => {};
 
+        const getParentSubagentConfiguration = (): Record<string, string> => {
+            const parentModel = asString(session.getModel());
+            const parentReasoningEffort = asString(session.getModelReasoningEffort());
+            return {
+                ...(parentModel ? { parentModel } : {}),
+                ...(parentReasoningEffort ? { parentReasoningEffort } : {})
+            };
+        };
+
+        const addParentSubagentConfiguration = (input: unknown): unknown => {
+            const record = asRecord(input);
+            const parentConfiguration = getParentSubagentConfiguration();
+            if (!record || Object.keys(parentConfiguration).length === 0) {
+                return input;
+            }
+
+            const existingConfiguration = asRecord(record.hapiSubagentConfig) ?? {};
+            return {
+                ...record,
+                hapiSubagentConfig: {
+                    ...existingConfiguration,
+                    ...parentConfiguration
+                }
+            };
+        };
+
         const emitAgentRunStart = (cardId: string, input: unknown): void => {
             childAgentActivityInCurrentTurn = true;
             const startedAt = Date.now();
+            const cardInput = addParentSubagentConfiguration(input);
+            const cardInputRecord = asRecord(cardInput);
+            const cardInputConfiguration = asRecord(cardInputRecord?.hapiSubagentConfig);
+            const requestedModel = asString(cardInputRecord?.model);
+            const requestedReasoningEffort = asString(cardInputRecord?.reasoning_effort ?? cardInputRecord?.reasoningEffort);
+            const parentModel = asString(cardInputConfiguration?.parentModel ?? cardInputConfiguration?.parent_model);
+            const parentReasoningEffort = asString(
+                cardInputConfiguration?.parentReasoningEffort ?? cardInputConfiguration?.parent_reasoning_effort
+            );
+            subagentCardConfigurationById.set(cardId, {
+                ...(requestedModel ? { requestedModel } : {}),
+                ...(requestedReasoningEffort ? { requestedReasoningEffort } : {}),
+                ...(parentModel ? { parentModel } : {}),
+                ...(parentReasoningEffort ? { parentReasoningEffort } : {})
+            });
             agentStartedAtByCardId.set(cardId, startedAt);
-            const agentType = extractAgentType(input);
+            const agentType = extractAgentType(cardInput);
             if (agentType) {
                 agentTypeByCardId.set(cardId, agentType);
             }
-            const summary = summarizeAgentInput(input);
+            const summary = summarizeAgentInput(cardInput);
             if (summary) {
                 agentSummaryByCardId.set(cardId, summary);
             }
@@ -1050,7 +1319,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             emitAgentRunEvent({
                 type: 'agent-run-start',
                 cardId,
-                input,
+                input: cardInput,
                 startedAt,
                 status: 'starting',
                 statusText: 'Starting',
@@ -1238,6 +1507,19 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             const nextStatus = asString(update.status);
             const currentStatus = agentStatusByAgentId.get(agentId);
             const activityKind = asString(update.activityKind ?? update.activity_kind);
+            if (isTerminalAgentRunStatus(nextStatus)) {
+                const runtime = childAgentRuntimeById.get(agentId);
+                if (runtime) {
+                    closeActiveChildTools(agentId, runtime, 'Subagent ended before the tool completed');
+                    runtime.terminal = true;
+                    runtime.reasoningProcessor.reset();
+                    runtime.diffProcessor.reset();
+                    runtime.toolStartedAtByCallId.clear();
+                    runtime.activeToolsByCallId.clear();
+                    runtime.pendingTitleByCallId.clear();
+                    runtime.reasoningPreview = '';
+                }
+            }
             if (
                 isTerminalAgentRunStatus(currentStatus)
                 && !isTerminalAgentRunStatus(nextStatus)
@@ -1269,6 +1551,10 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             if (nextStatus) {
                 agentStatusByAgentId.set(agentId, nextStatus);
             }
+            const hapiSubagentConfig = {
+                ...(asRecord(update.hapiSubagentConfig) ?? {}),
+                ...(childAgentConfigurationById.get(agentId) ?? {})
+            };
             const event = {
                 type: 'agent-run-update',
                 agentId,
@@ -1276,7 +1562,8 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 startedAt,
                 ...(isTerminalAgentRunStatus(nextStatus) ? { completedAt: Date.now() } : {}),
                 ...(agentSummaryByAgentId.has(agentId) ? { summary: agentSummaryByAgentId.get(agentId) } : {}),
-                ...update
+                ...update,
+                ...(Object.keys(hapiSubagentConfig).length > 0 ? { hapiSubagentConfig } : {})
             };
             const signature = getAgentRunUpdateSignature(agentId, event, cardIdOverride);
             if (lastAgentRunUpdateSignatureByAgentId.get(agentId) === signature) {
@@ -1295,26 +1582,197 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             cardIdOverride?: string | null
         ): void => {
             const nextStatus = asString(update.status);
+            let effectiveUpdate = update;
+            if (nextStatus === 'failed' || nextStatus === 'error') {
+                const previousFailure = agentFailureByAgentId.get(agentId);
+                const incomingFailure = extractCodexFailureMessage([
+                    update.error,
+                    update.message,
+                    update.result,
+                ]);
+                const preferredFailure = selectPreferredCodexFailureMessage(
+                    previousFailure,
+                    incomingFailure
+                );
+                if (preferredFailure) {
+                    agentFailureByAgentId.set(agentId, preferredFailure);
+                    if (previousFailure && preferredFailure !== incomingFailure) {
+                        effectiveUpdate = {
+                            ...update,
+                            error: preferredFailure,
+                            activity: formatActivity('Failed', preferredFailure)
+                        };
+                    }
+                }
+            }
             const terminal = isTerminalAgentRunStatus(nextStatus);
             if (terminal) {
                 cancelPendingThrottledAgentRunUpdate(agentId);
-                emitAgentRunUpdateNow(agentId, update, cardIdOverride);
+                emitAgentRunUpdateNow(agentId, effectiveUpdate, cardIdOverride);
                 return;
             }
 
-            const activityKind = asString(update.activityKind ?? update.activity_kind);
+            const activityKind = asString(effectiveUpdate.activityKind ?? effectiveUpdate.activity_kind);
             if (!activityKind || !THROTTLED_AGENT_RUN_ACTIVITY_KINDS.has(activityKind)) {
-                emitAgentRunUpdateNow(agentId, update, cardIdOverride);
+                emitAgentRunUpdateNow(agentId, effectiveUpdate, cardIdOverride);
                 return;
             }
 
             const lastAt = lastAgentRunUpdateAtByAgentId.get(agentId);
             if (lastAt === undefined || Date.now() - lastAt >= AGENT_RUN_UPDATE_THROTTLE_MS) {
-                emitAgentRunUpdateNow(agentId, update, cardIdOverride);
+                emitAgentRunUpdateNow(agentId, effectiveUpdate, cardIdOverride);
                 return;
             }
 
-            scheduleThrottledAgentRunUpdate(agentId, update, cardIdOverride);
+            scheduleThrottledAgentRunUpdate(agentId, effectiveUpdate, cardIdOverride);
+        };
+
+        const getFirstChildConfigurationValue = (
+            records: Array<Record<string, unknown> | null>,
+            keys: string[]
+        ): string | null => {
+            for (const record of records) {
+                if (!record) continue;
+                for (const key of keys) {
+                    const value = asString(record[key]);
+                    if (value) return value;
+                }
+            }
+            return null;
+        };
+
+        const extractChildAgentConfiguration = (event: Record<string, unknown>): CodexSubagentConfiguration => {
+            const turn = asRecord(event.turn);
+            const thread = asRecord(event.thread);
+            const records = [
+                event,
+                turn,
+                thread,
+                asRecord(event.info),
+                asRecord(event.config),
+                asRecord(event.configuration),
+                asRecord(event.turnContext),
+                asRecord(event.turn_context),
+                asRecord(turn?.config),
+                asRecord(turn?.configuration),
+                asRecord(thread?.config),
+                asRecord(thread?.configuration)
+            ];
+            const childModel = getFirstChildConfigurationValue(records, ['model', 'modelId', 'model_id']);
+            const childReasoningEffort = getFirstChildConfigurationValue(records, [
+                'reasoningEffort',
+                'reasoning_effort',
+                'modelReasoningEffort',
+                'model_reasoning_effort'
+            ]);
+            return {
+                ...(childModel ? { childModel } : {}),
+                ...(childReasoningEffort ? { childReasoningEffort } : {})
+            };
+        };
+
+        const captureChildAgentConfiguration = (agentId: string, event: Record<string, unknown>): void => {
+            const nextValues = extractChildAgentConfiguration(event);
+            if (Object.keys(nextValues).length === 0) return;
+
+            const previous = childAgentConfigurationById.get(agentId) ?? {};
+            const next = { ...previous, ...nextValues };
+            if (
+                next.childModel === previous.childModel
+                && next.childReasoningEffort === previous.childReasoningEffort
+            ) {
+                return;
+            }
+            childAgentConfigurationById.set(agentId, next);
+
+            const cardId = agentCardByAgentId.get(agentId);
+            if (!cardId) return;
+
+            const snapshot = subagentSnapshotById.get(agentId);
+            const status = snapshot?.status ?? agentStatusByAgentId.get(agentId) ?? 'running';
+            emitAgentRunUpdate(agentId, {
+                status,
+                statusText: snapshot?.statusText ?? status
+            }, cardId);
+        };
+
+        const recordCodexThreadUsage = (
+            threadId: string,
+            role: 'parent' | 'child',
+            event: Record<string, unknown>
+        ): void => {
+            const next = readCodexTokenUsage(event.info, Date.now());
+            if (!next) return;
+
+            const previous = usageByThreadId.get(threadId) ?? null;
+            const usage = selectCodexTokenUsage(previous, next);
+            if (!usage) return;
+
+            const childConfiguration = role === 'child' ? childAgentConfigurationById.get(threadId) : undefined;
+            const eventConfiguration = extractChildAgentConfiguration(event);
+            const childSnapshot = role === 'child' ? subagentSnapshotById.get(threadId) : undefined;
+            const childCardConfiguration = role === 'child'
+                ? subagentCardConfigurationById.get(childSnapshot?.cardId ?? agentCardByAgentId.get(threadId) ?? '')
+                : undefined;
+            const model = eventConfiguration.childModel
+                ?? childConfiguration?.childModel
+                ?? childSnapshot?.model
+                ?? childCardConfiguration?.requestedModel
+                ?? asString(session.getModel())
+                ?? null;
+            const reasoningEffort = eventConfiguration.childReasoningEffort
+                ?? childConfiguration?.childReasoningEffort
+                ?? childSnapshot?.modelReasoningEffort
+                ?? childCardConfiguration?.requestedReasoningEffort
+                ?? asString(session.getModelReasoningEffort())
+                ?? null;
+
+            const key = JSON.stringify([model, reasoningEffort]);
+            const existing = usageByModelAndEffort.get(key) ?? {
+                input: 0,
+                output: 0,
+                cachedInput: 0,
+                reasoningOutput: 0,
+                total: 0,
+                model,
+                reasoningEffort
+            };
+            const increment = <K extends keyof Pick<CodexTokenUsage, 'input' | 'output' | 'cachedInput' | 'reasoningOutput' | 'total'>>(counter: K): number | null => {
+                const current = usage[counter];
+                if (current === null) return null;
+                return Math.max(0, current - (previous?.[counter] ?? 0));
+            };
+            const add = (counter: keyof Pick<CodexUsageBreakdown, 'input' | 'output' | 'cachedInput' | 'reasoningOutput' | 'total'>): number | null => {
+                const delta = increment(counter);
+                return existing[counter] === null || delta === null ? null : existing[counter] + delta;
+            };
+            usageByModelAndEffort.set(key, {
+                ...existing,
+                input: add('input'),
+                output: add('output'),
+                cachedInput: add('cachedInput'),
+                reasoningOutput: add('reasoningOutput'),
+                total: add('total')
+            });
+            usageByThreadId.set(threadId, usage);
+
+            session.client.updateMetadata((metadata) => ({
+                ...metadata,
+                codexTokenUsage: (() => {
+                    const aggregate = aggregateCodexTokenUsage(
+                        Array.from(usageByThreadId.values(), (threadUsage) => ({ usage: threadUsage })),
+                        Date.now()
+                    );
+                    return aggregate ? {
+                        ...aggregate,
+                        breakdown: Array.from(usageByModelAndEffort.values()).sort((left, right) => {
+                            const totalDifference = (right.total ?? -1) - (left.total ?? -1);
+                            if (totalDifference !== 0) return totalDifference;
+                            return `${left.model ?? ''}\u0000${left.reasoningEffort ?? ''}`.localeCompare(`${right.model ?? ''}\u0000${right.reasoningEffort ?? ''}`);
+                        })
+                    } : null;
+                })()
+            }));
         };
 
         failAgentStartCard = (cardId: string, error: unknown): void => {
@@ -1390,6 +1848,18 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
         };
 
         const emitAgentRunTraceMessage = (agentId: string, message: unknown): void => {
+            const trace = asRecord(message);
+            const traceType = asString(trace?.type);
+            const callId = asString(trace?.callId ?? trace?.call_id);
+            if (callId && traceType === 'tool-call') {
+                const openCalls = openChildToolCallsByAgentId.get(agentId) ?? new Map<string, number | undefined>();
+                openCalls.set(callId, typeof trace?.startedAt === 'number' ? trace.startedAt : undefined);
+                openChildToolCallsByAgentId.set(agentId, openCalls);
+            } else if (callId && traceType === 'tool-call-result') {
+                const openCalls = openChildToolCallsByAgentId.get(agentId);
+                openCalls?.delete(callId);
+                if (openCalls?.size === 0) openChildToolCallsByAgentId.delete(agentId);
+            }
             const cardId = agentCardByAgentId.get(agentId);
             if (!cardId) {
                 const traces = pendingAgentTracesByAgentId.get(agentId) ?? [];
@@ -1619,10 +2089,6 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 const agentId = asString(outputRecord?.agent_id ?? outputRecord?.agentId ?? outputRecord?.id)
                     ?? (agentIdsFromState.length === 1 ? agentIdsFromState[0] : null)
                     ?? extractAgentTargets(pending?.input).at(0);
-                const sideSessionFork = pendingSideSessionFork
-                    && (pendingSideSessionFork.callId === null || pendingSideSessionFork.callId === callId)
-                    ? pendingSideSessionFork
-                    : null;
                 if (!agentId) {
                     const detail = isError
                         ? output
@@ -1630,11 +2096,6 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                             message: 'spawn_agent completed without returning an agent id',
                             output
                         };
-                    if (sideSessionFork) {
-                        pendingSideSessionFork = null;
-                        clearTimeout(sideSessionFork.timeout);
-                        sideSessionFork.reject(new Error(previewText(detail) ?? 'spawn_agent completed without returning an agent id'));
-                    }
                     failAgentStartCard(callId, detail);
                     return;
                 }
@@ -1647,18 +2108,6 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     ...(isError ? { error: output } : { spawnResult: output })
                 }, callId);
                 flushPendingAgentUpdates(agentId);
-                if (sideSessionFork) {
-                    pendingSideSessionFork = null;
-                    clearTimeout(sideSessionFork.timeout);
-                    if (isError) {
-                        sideSessionFork.reject(new Error(previewText(output) ?? 'spawn_agent failed'));
-                    } else {
-                        sideSessionFork.resolve({
-                            childCodexThreadId: agentId,
-                            parentCodexThreadId: sideSessionFork.parentThreadId
-                        });
-                    }
-                }
                 return;
             }
 
@@ -1731,6 +2180,14 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             childAgentActivityInCurrentTurn = true;
             const runtime = getChildRuntime(agentId);
             const isChildTerminalEvent = msgType === 'task_complete' || msgType === 'turn_aborted' || msgType === 'task_failed';
+            if (
+                runtime.terminal
+                && msgType !== 'task_started'
+                && msgType !== 'agent_message'
+                && !isChildTerminalEvent
+            ) {
+                return;
+            }
             if (runtime.blockedNestedAgent && !isChildTerminalEvent) {
                 return;
             }
@@ -1752,6 +2209,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             };
 
             if (msgType === 'token_count') {
+                recordCodexThreadUsage(agentId, 'child', msg);
                 return;
             }
 
@@ -1769,6 +2227,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 runtime.finalMessage = null;
                 runtime.terminal = false;
                 agentStatusByAgentId.delete(agentId);
+                agentFailureByAgentId.delete(agentId);
                 updateActivity('Starting task', 'starting');
                 return;
             }
@@ -2097,6 +2556,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 return;
             }
             if (isChildTerminalEvent) {
+                closeActiveChildTools(agentId, runtime, 'Subagent ended before the tool completed');
                 runtime.terminal = true;
                 runtime.reasoningProcessor.reset();
                 runtime.diffProcessor.reset();
@@ -2350,10 +2810,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                         this.currentThreadId = threadId;
                         session.onSessionFound(threadId);
                     } else {
-                        logger.debug(
-                            `[Codex] Ignoring thread_started for non-active thread; ` +
-                            `eventThreadId=${threadId}, activeThread=${this.currentThreadId}`
-                        );
+                        captureChildAgentConfiguration(threadId, msg);
                     }
                 }
                 return;
@@ -2369,6 +2826,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     `[Codex] Routing event from non-active thread into agent trace; ` +
                     `type=${msgType}, eventThreadId=${eventThreadId}, activeThread=${this.currentThreadId}`
                 );
+                captureChildAgentConfiguration(eventThreadId, msg);
                 if (msgType === 'task_started') {
                     if (eventTurnId) {
                         this.activeChildTurns.set(eventThreadId, eventTurnId);
@@ -2468,6 +2926,14 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                         `(attempt ${sameThreadRetryAttempt}/${SAME_THREAD_MAX_RETRIES}): ${error ?? 'unknown error'}`
                     );
                 }
+                markAllActiveSubagents(
+                    msgType === 'task_failed' ? 'failed' : 'canceled',
+                    msgType === 'task_complete'
+                        ? 'Parent turn completed'
+                        : msgType === 'turn_aborted'
+                            ? 'Parent turn canceled'
+                            : 'Parent turn failed'
+                );
                 this.currentTurnId = null;
                 allowAnonymousTerminalEvent = false;
                 if (isThreadStatusFailure && !shouldRetrySameThread && !shouldCompactAndRetrySameThread) {
@@ -2562,6 +3028,15 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 wakeLoop();
             }
 
+            if (isTerminalEvent && !shouldRetrySameThread && !shouldCompactAndRetrySameThread) {
+                // Persist an explicit outcome for monitoring workflows. A ready
+                // notification alone cannot distinguish completion from abort.
+                session.sendAgentMessage({
+                    type: 'turn-outcome',
+                    turnId: eventTurnId ?? undefined,
+                    outcome: msgType === 'task_complete' ? 'completed' : msgType === 'turn_aborted' ? 'aborted' : 'failed'
+                });
+            }
             if (isTerminalEvent && !turnInFlight && !suppressReadyForThisTerminalEvent) {
                 scheduleReadyAfterTurn?.();
             } else if (readyAfterTurnTimer && msgType !== 'task_started' && !suppressReadyForThisTerminalEvent) {
@@ -2702,6 +3177,9 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             }
             if (msgType === 'token_count') {
                 const threadId = eventThreadId ?? this.currentThreadId;
+                if (threadId) {
+                    recordCodexThreadUsage(threadId, 'parent', msg);
+                }
                 session.sendAgentMessage({
                     ...addCodexEventScope(msg, 'parent', threadId),
                     id: randomUUID()
@@ -2856,9 +3334,6 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                             const input = msg.input ?? {};
                             pendingAgentToolInputByCallId.set(callId, { name, input });
                             if (name === 'spawn_agent') {
-                                if (pendingSideSessionFork && pendingSideSessionFork.callId === null) {
-                                    pendingSideSessionFork.callId = callId;
-                                }
                                 emitAgentRunStart(callId, input);
                             } else {
                                 for (const agentId of extractAgentTargets(input)) {
@@ -3012,8 +3487,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             session.sendSessionEvent({ type: 'ready' });
         };
 
-        await appServerClient.connect();
-        await appServerClient.initialize({
+        const initializeAppServer = () => appServerClient.initialize({
             clientInfo: {
                 name: 'hapi-codex-client',
                 version: '1.0.0'
@@ -3022,6 +3496,57 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 experimentalApi: true
             }
         });
+        await appServerClient.connect();
+        await initializeAppServer();
+        if (session.recoveryRequestId) {
+            try {
+                const requestedThreadId = session.sessionId;
+                if (!requestedThreadId) {
+                    throw new Error('Native control recovery is missing its requested Codex thread id');
+                }
+                // This path deliberately runs before the normal queue loop. It
+                // attaches the managed client but never starts a turn or sends a
+                // prompt; an explicit exact response is the only readiness proof.
+                const threadParams = buildThreadStartParams({
+                    cwd: session.path,
+                    mode: {
+                        permissionMode: 'default',
+                        collaborationMode: 'default'
+                    },
+                    mcpServers,
+                    cliOverrides: session.codexCliOverrides
+                });
+                const resumed = await appServerClient.resumeThread({ threadId: requestedThreadId, ...threadParams }, { signal: this.abortController.signal });
+                const resumedRecord = asRecord(resumed);
+                const resumedThreadId = asString(asRecord(resumedRecord?.thread)?.id);
+                if (resumedThreadId !== requestedThreadId) {
+                    throw new Error('Native control recovery did not receive an exact thread.id response');
+                }
+                const read = await appServerClient.readThread({ threadId: requestedThreadId, includeTurns: true }, { signal: this.abortController.signal });
+                if (!isExactIdleRecoveryThreadRead(read, requestedThreadId)) {
+                    throw new Error('Native control recovery could not confirm the exact thread is idle');
+                }
+                this.currentThreadId = requestedThreadId;
+                session.onSessionFound(requestedThreadId);
+                const ready = await notifyRunnerCodexRecoveryReady({
+                    recoveryRequestId: session.recoveryRequestId,
+                    sessionId: session.client.sessionId,
+                    threadId: requestedThreadId
+                });
+                if (ready?.error) {
+                    throw new Error(`Native control recovery readiness acknowledgement failed: ${ready.error}`);
+                }
+                logger.debug(`[Codex] Native control recovery ready for ${requestedThreadId}`);
+            } catch (error) {
+                await notifyRunnerCodexRecoveryUnconfirmed({
+                    recoveryRequestId: session.recoveryRequestId,
+                    sessionId: session.client.sessionId,
+                    threadId: session.sessionId ?? 'unknown',
+                    error: errorMessage(error).slice(0, 2_000)
+                }).catch(() => {});
+                throw error;
+            }
+        }
         let supportsTurnCollaborationMode = true;
         let supportsGoals = true;
         try {
@@ -3041,7 +3566,9 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             logger.debug(`[Codex] collaborationMode/list failed: ${errorMessage(error)}`);
         }
 
-        let hasThread = false;
+        // Recovery already attached and validated the exact thread above; do
+        // not issue a second resume before the first managed turn.
+        let hasThread = this.currentThreadId !== null;
         let pending: QueuedMessage | null = null;
         let suppressReadyForAdminCommand = false;
 
@@ -3139,7 +3666,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 const resumeRecord = asRecord(resumeResponse);
                 const resumeThread = resumeRecord ? asRecord(resumeRecord.thread) : null;
                 const threadId = asString(resumeThread?.id) ?? resumeCandidate;
-                applyResolvedModel(resumeRecord?.model);
+                applyResolvedModel(resumeRecord?.model, resumeRecord?.modelProvider ?? resumeRecord?.model_provider);
                 this.currentThreadId = threadId;
                 session.onSessionFound(threadId);
                 hasThread = true;
@@ -3201,7 +3728,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     const resumeRecord = asRecord(resumeResponse);
                     const resumeThread = resumeRecord ? asRecord(resumeRecord.thread) : null;
                     const threadId = asString(resumeThread?.id) ?? resumeCandidate;
-                    applyResolvedModel(resumeRecord?.model);
+                    applyResolvedModel(resumeRecord?.model, resumeRecord?.modelProvider ?? resumeRecord?.model_provider);
                     this.currentThreadId = threadId;
                     session.onSessionFound(threadId);
                     hasThread = true;
@@ -3226,7 +3753,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 const threadRecord = asRecord(threadResponse);
                 const thread = threadRecord ? asRecord(threadRecord.thread) : null;
                 const threadId = asString(thread?.id);
-                applyResolvedModel(threadRecord?.model);
+                applyResolvedModel(threadRecord?.model, threadRecord?.modelProvider ?? threadRecord?.model_provider);
                 if (!threadId) {
                     throw new Error('app-server thread/start did not return thread.id');
                 }
@@ -3265,7 +3792,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     const resumeRecord = asRecord(resumeResponse);
                     const resumeThread = resumeRecord ? asRecord(resumeRecord.thread) : null;
                     const threadId = asString(resumeThread?.id) ?? resumeCandidate;
-                    applyResolvedModel(resumeRecord?.model);
+                    applyResolvedModel(resumeRecord?.model, resumeRecord?.modelProvider ?? resumeRecord?.model_provider);
                     this.currentThreadId = threadId;
                     session.onSessionFound(threadId);
                     hasThread = true;
@@ -3289,7 +3816,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             const threadRecord = asRecord(threadResponse);
             const thread = threadRecord ? asRecord(threadRecord.thread) : null;
             const threadId = asString(thread?.id);
-            applyResolvedModel(threadRecord?.model);
+            applyResolvedModel(threadRecord?.model, threadRecord?.modelProvider ?? threadRecord?.model_provider);
             if (!threadId) {
                 throw new Error('app-server thread/start did not return thread.id');
             }
@@ -3542,7 +4069,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 const resumeRecord = asRecord(resumeResponse);
                 const resumeThread = resumeRecord ? asRecord(resumeRecord.thread) : null;
                 const threadId = asString(resumeThread?.id) ?? resumeCandidate;
-                applyResolvedModel(resumeRecord?.model);
+                applyResolvedModel(resumeRecord?.model, resumeRecord?.modelProvider ?? resumeRecord?.model_provider);
                 this.currentThreadId = threadId;
                 session.onSessionFound(threadId);
                 hasThread = true;
@@ -3555,7 +4082,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             const threadRecord = asRecord(threadResponse);
             const thread = threadRecord ? asRecord(threadRecord.thread) : null;
             const threadId = asString(thread?.id);
-            applyResolvedModel(threadRecord?.model);
+            applyResolvedModel(threadRecord?.model, threadRecord?.modelProvider ?? threadRecord?.model_provider);
             if (!threadId) {
                 throw new Error('app-server thread/start did not return thread.id');
             }
@@ -3565,27 +4092,12 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             return threadId;
         };
 
-        const sideSessionForkPrompt = [
-            'Create a SHAPI side session from the current conversation.',
-            'Call spawn_agent exactly once with fork_context: true.',
-            'Do not set agent_type, subagent_type, model, or reasoning_effort.',
-            'Use this child message: "Initialize a SHAPI side session forked from the current conversation. Do not make code changes or take actions yet. Reply only: Side session ready."',
-            'Do not write normal assistant text before or after the tool call.'
-        ].join('\n');
-
         session.client.rpcHandlerManager.registerHandler(RPC_METHODS.ForkCodexSideSession, async () => {
-            if (pendingSideSessionFork) {
+            if (sideSessionForkInFlight) {
                 return {
                     type: 'error',
                     code: 'busy',
                     message: 'A side session fork is already in progress'
-                };
-            }
-            if (turnInFlight || recoveryInFlight || pending || session.queue.size() > 0) {
-                return {
-                    type: 'error',
-                    code: 'busy',
-                    message: 'Codex is busy; wait for the current turn to finish before creating a side session'
                 };
             }
 
@@ -3598,87 +4110,123 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 };
             }
 
-            let parentThreadId: string;
+            sideSessionForkInFlight = true;
             try {
-                parentThreadId = await ensureThreadForSideSessionFork(mode);
-            } catch (error) {
-                return {
-                    type: 'error',
-                    code: 'thread_unavailable',
-                    message: `Codex conversation could not be prepared: ${errorMessage(error)}`
-                };
-            }
-
-            let rejectFork: (error: Error) => void = () => {};
-            const forkPromise = new Promise<{
-                childCodexThreadId: string;
-                parentCodexThreadId: string;
-            }>((resolve, reject) => {
-                rejectFork = reject;
-                const timeout = setTimeout(() => {
-                    const timedOutFork = takePendingSideSessionFork(parentThreadId);
-                    if (!timedOutFork) {
-                        return;
-                    }
-                    reject(new Error('Timed out waiting for Codex to create the side session'));
-                }, SIDE_SESSION_FORK_TIMEOUT_MS);
-                timeout.unref?.();
-                pendingSideSessionFork = {
-                    callId: null,
-                    parentThreadId,
-                    timeout,
-                    resolve,
-                    reject
-                };
-            });
-            void forkPromise.catch(() => {});
-
-            try {
-                suppressReadyForAdminCommand = true;
-                clearReadyAfterTurnTimer?.();
-                turnInFlight = true;
-                allowAnonymousTerminalEvent = false;
-                session.onThinkingChange(true);
-                const turnResponse = await appServerClient.startTurn(buildTurnStartParams({
+                const parentThreadId = await ensureThreadForSideSessionFork(mode);
+                const read = await appServerClient.readThread({
                     threadId: parentThreadId,
-                    message: sideSessionForkPrompt,
-                    cwd: session.path,
-                    mode,
-                    cliOverrides: session.codexCliOverrides
-                }), {
+                    includeTurns: true
+                }, {
                     signal: this.abortController.signal
                 });
-                const turnRecord = asRecord(turnResponse);
-                const turn = turnRecord ? asRecord(turnRecord.turn) : null;
-                const turnId = asString(turn?.id);
-                if (turnId) {
-                    this.currentTurnId = turnId;
-                } else {
-                    allowAnonymousTerminalEvent = true;
+                const boundary = readSideSessionForkBoundary(read, parentThreadId);
+                if (!boundary) {
+                    return {
+                        type: 'error',
+                        code: 'fork_boundary_unavailable',
+                        message: 'Codex conversation history could not be read safely'
+                    };
                 }
 
-                const fork = await forkPromise;
+                let childCodexThreadId: string | null = null;
+                if (boundary.lastTurnId) {
+                    const forkResponse = await appServerClient.forkThread({
+                        threadId: parentThreadId,
+                        lastTurnId: boundary.lastTurnId
+                    }, {
+                        signal: this.abortController.signal
+                    });
+                    childCodexThreadId = asString(asRecord(asRecord(forkResponse)?.thread)?.id);
+                } else if (boundary.hasInProgressTurn) {
+                    const threadResponse = await appServerClient.startThread(buildThreadStartParams({
+                        cwd: session.path,
+                        mode,
+                        mcpServers,
+                        cliOverrides: session.codexCliOverrides
+                    }), {
+                        signal: this.abortController.signal
+                    });
+                    childCodexThreadId = asString(asRecord(asRecord(threadResponse)?.thread)?.id);
+                } else {
+                    const forkResponse = await appServerClient.forkThread({
+                        threadId: parentThreadId
+                    }, {
+                        signal: this.abortController.signal
+                    });
+                    childCodexThreadId = asString(asRecord(asRecord(forkResponse)?.thread)?.id);
+                }
+                if (!childCodexThreadId) {
+                    throw new Error('app-server did not return the side session thread.id');
+                }
                 return {
                     type: 'success',
-                    ...fork
+                    childCodexThreadId,
+                    parentCodexThreadId: parentThreadId
                 };
             } catch (error) {
-                rejectFork(error instanceof Error ? error : new Error(String(error)));
                 return {
                     type: 'error',
                     code: 'fork_failed',
                     message: errorMessage(error)
                 };
             } finally {
-                takePendingSideSessionFork(parentThreadId);
-                turnInFlight = false;
-                allowAnonymousTerminalEvent = false;
-                this.currentTurnId = null;
-                suppressReadyForAdminCommand = false;
-                session.onThinkingChange(false);
-                scheduleReadyAfterTurn?.();
+                sideSessionForkInFlight = false;
             }
         });
+
+        const recoverAppServerThread = async (
+            threadId: string,
+            mode: EnhancedMode
+        ): Promise<{ state: Exclude<RecoveredCodexThreadState, 'unknown'> } | { error: string }> => {
+            try {
+                // A transport failure leaves all pending RPCs rejected. Start a
+                // fresh app-server, repeat its handshake, then attach only to
+                // the exact existing conversation. Never resend the user turn:
+                // its delivery may already have reached Codex before the pipe
+                // disappeared.
+                await appServerClient.disconnect();
+                await appServerClient.connect();
+                await initializeAppServer();
+                const threadParams = buildThreadStartParams({
+                    cwd: session.path,
+                    mode,
+                    mcpServers,
+                    cliOverrides: session.codexCliOverrides
+                });
+                const resumed = await appServerClient.resumeThread({
+                    threadId,
+                    ...threadParams
+                }, { signal: this.abortController.signal });
+                const resumedThreadId = asString(asRecord(asRecord(resumed)?.thread)?.id);
+                if (resumedThreadId !== threadId) {
+                    throw new Error(`Recovery returned a different Codex thread: ${resumedThreadId ?? 'missing'}`);
+                }
+                const read = await appServerClient.readThread({
+                    threadId,
+                    includeTurns: true
+                }, { signal: this.abortController.signal });
+                const state = readRecoveredCodexThreadState(read, threadId);
+                if (state === 'unknown') {
+                    throw new Error('Recovered Codex thread state could not be confirmed');
+                }
+                this.currentThreadId = threadId;
+                this.currentTurnId = null;
+                session.onSessionFound(threadId);
+                hasThread = true;
+                turnInFlight = state === 'active';
+                allowAnonymousTerminalEvent = state === 'active';
+                session.onThinkingChange(state === 'active');
+                if (state === 'idle') {
+                    activeMessage = null;
+                }
+                logger.debug(`[Codex] Recovered app-server thread ${threadId}; state=${state}`);
+                return { state };
+            } catch (recoveryError) {
+                logger.warn(`[Codex] App-server recovery failed for thread ${threadId}:`, recoveryError);
+                await appServerClient.disconnect().catch(() => {});
+                return { error: errorMessage(recoveryError) };
+            }
+        };
 
         while (!this.shouldExit) {
             logActiveHandles('loop-top');
@@ -3786,7 +4334,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                             const resumeRecord = asRecord(resumeResponse);
                             const resumeThread = resumeRecord ? asRecord(resumeRecord.thread) : null;
                             threadId = asString(resumeThread?.id) ?? resumeCandidate;
-                            applyResolvedModel(resumeRecord?.model);
+                            applyResolvedModel(resumeRecord?.model, resumeRecord?.modelProvider ?? resumeRecord?.model_provider);
                             logger.debug(`[Codex] Resumed app-server thread ${threadId}`);
                         } catch (error) {
                             logger.warn(`[Codex] Failed to resume app-server thread ${resumeCandidate}; preserving old conversation boundary`, error);
@@ -3808,7 +4356,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                         const threadRecord = asRecord(threadResponse);
                         const thread = threadRecord ? asRecord(threadRecord.thread) : null;
                         threadId = asString(thread?.id);
-                        applyResolvedModel(threadRecord?.model);
+                        applyResolvedModel(threadRecord?.model, threadRecord?.modelProvider ?? threadRecord?.model_provider);
                         if (!threadId) {
                             throw new Error('app-server thread/start did not return thread.id');
                         }
@@ -3889,21 +4437,40 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                     }
                 }
             } catch (error) {
-                logger.warn('Error in codex session:', error);
+                const detail = errorMessage(error);
+                logger.warn(`[Codex] Session operation failed: ${detail}`, error);
                 const isAbortError = error instanceof Error && error.name === 'AbortError';
+                const failedThreadId = this.currentThreadId;
                 turnInFlight = false;
                 allowAnonymousTerminalEvent = false;
                 this.currentTurnId = null;
 
-                if (isAbortError) {
+                if (this.shouldExit) {
+                    logger.debug('[Codex] Ignoring turn failure during shutdown');
+                } else if (isAbortError) {
                     messageBuffer.addMessage('Aborted by user', 'status');
                     session.sendSessionEvent({ type: 'message', message: 'Aborted by user' });
+                } else if (failedThreadId && isCodexAppServerTransportError(error)) {
+                    const recovery = await recoverAppServerThread(failedThreadId, {
+                        ...message.mode,
+                        model: session.getModel() ?? message.mode.model
+                    });
+                    if ('error' in recovery) {
+                        const terminalDetail = `${detail}; recovery failed: ${recovery.error}`;
+                        const terminalMessage = `Process exited unexpectedly: ${terminalDetail}`;
+                        messageBuffer.addMessage(terminalMessage, 'status');
+                        session.sendSessionEvent({ type: 'message', message: terminalMessage });
+                        this.currentThreadId = null;
+                        hasThread = false;
+                    }
                 } else {
-                    messageBuffer.addMessage('Process exited unexpectedly', 'status');
-                    session.sendSessionEvent({ type: 'message', message: 'Process exited unexpectedly' });
+                    const failureMessage = `Task failed: ${detail}`;
+                    sendTaskStatus(failureMessage, {
+                        status: 'failed',
+                        eventMessage: detail,
+                        recoverable: false
+                    });
                     this.currentTurnId = null;
-                    this.currentThreadId = null;
-                    hasThread = false;
                 }
             } finally {
                 if (!turnInFlight) {
@@ -3935,13 +4502,25 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             }
         }
 
-        takePendingSideSessionFork()?.reject(new Error('Codex session ended before the side session was created'));
         failPendingAgentStarts('spawn_agent did not return an agent id before the Codex session ended');
         cancelAllPendingThrottledAgentRunUpdates();
         markAllActiveSubagents('canceled', 'Session ended');
     }
 
-    protected async cleanup(): Promise<void> {
+    protected cleanup(): Promise<void> {
+        if (this.cleanupPromise) return this.cleanupPromise;
+        this.cleanupPromise = this.performCleanup();
+        return this.cleanupPromise;
+    }
+
+    public shutdown(): Promise<void> {
+        this.shouldExit = true;
+        this.exitReason ??= 'exit';
+        this.abortController.abort();
+        return this.cleanup();
+    }
+
+    private async performCleanup(): Promise<void> {
         logger.debug('[codex-remote]: cleanup start');
         this.appServerClient.setStderrHandler(null);
         try {
@@ -3971,5 +4550,11 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
 
 export async function codexRemoteLauncher(session: CodexSession): Promise<'switch' | 'exit'> {
     const launcher = new CodexRemoteLauncher(session);
-    return launcher.launch();
+    const cleanup = () => launcher.shutdown();
+    session.setActiveTransportCleanup(cleanup);
+    try {
+        return await launcher.launch();
+    } finally {
+        session.clearActiveTransportCleanup(cleanup);
+    }
 }

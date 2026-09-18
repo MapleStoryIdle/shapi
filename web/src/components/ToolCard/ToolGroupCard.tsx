@@ -7,11 +7,12 @@ import { FILE_MUTATION_DIALOG_CLASS_NAME, ToolDetailDialogContent, ToolDetailDia
 import { getTerminalExecutionToolState, isTerminalExecutionTool } from '@/components/ToolCard/terminalExecution'
 import { TerminalExecutionDrawer } from '@/components/ToolCard/TerminalExecutionDrawer'
 import { getToolPresentation } from '@/components/ToolCard/knownTools'
-import { getTerminalCommandDisplayTitle, getTerminalCommandIntent, getTerminalCommandIntentDetail, getTerminalCommandIntentLabel, getTerminalCommandSummary } from '@/components/ToolCard/terminalCommandIntent'
+import { getTerminalCommandDisplayTitle, getTerminalCommandIntent, getTerminalCommandIntentDetail, getTerminalCommandIntentLabel, getTerminalCommandSummary, getTerminalReadRequestLabel, joinTerminalSummaryParts } from '@/components/ToolCard/terminalCommandIntent'
 import { getFileMutationDialogSummary } from '@/components/ToolCard/fileMutationDetail'
 import { formatGroupedHeaderSubtitle, formatGroupedHeaderTitle } from '@/components/ToolCard/groupedPresentation'
+import { getCodexAgentActivity, getCodexAgentEffectiveConfiguration, getCodexAgentSummary, parseCodexSpawnAgentResult } from '@/components/ToolCard/codexAgents'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
-import { Dialog, DialogContent } from '@/components/ui/dialog'
+import { ChatDetailDialog } from '@/components/ui/ChatDetailDialog'
 import { CliOutputBlock } from '@/components/CliOutputBlock'
 import { getEventPresentation } from '@/chat/presentation'
 import { AgentFlavorIcon } from '@/components/AgentFlavorIcon'
@@ -20,6 +21,7 @@ import { cn } from '@/lib/utils'
 import { useTranslation } from '@/lib/use-translation'
 import { getInputStringAny } from '@/lib/toolInputUtils'
 import { detectExplicitSkillName } from '@/chat/skillUsage'
+import { useSharedNow } from '@/hooks/useSharedNow'
 import {
     getDefaultToolGroupExpansionState,
     getPrimaryToolGroupExpansionStateKey,
@@ -27,8 +29,6 @@ import {
     isToolGroupExpansionOpen,
     resolveToolGroupExpansionState
 } from '@/components/ToolCard/toolGroupExpansion'
-
-const COMPACT_ELAPSED_INTERVAL_MS = 1000
 
 type ToolGroupCompactHeaderState = {
     groupId: string
@@ -71,8 +71,10 @@ function getToolEndMs(tool: ToolCallBlock, now: number): number {
     return tool.tool.completedAt ?? tool.tool.startedAt ?? tool.tool.createdAt
 }
 
-export function isToolGroupActive(block: ToolGroupBlock): boolean {
-    return block.tools.some((tool) => tool.tool.state === 'running' || tool.tool.state === 'pending')
+export function isToolGroupActive(block: ToolGroupBlock, sessionRunActive = false): boolean {
+    return block.turnActive === true
+        || block.tools.some((tool) => tool.tool.state === 'running' || tool.tool.state === 'pending')
+        || (sessionRunActive && block.defaultOpen)
 }
 
 export function getToolGroupDurationMs(block: ToolGroupBlock, now: number): number {
@@ -80,7 +82,12 @@ export function getToolGroupDurationMs(block: ToolGroupBlock, now: number): numb
         return 0
     }
 
-    const startedAt = Math.min(...block.tools.map(getToolStartMs))
+    const toolStartedAt = Math.min(...block.tools.map(getToolStartMs))
+    if (block.turnActive) {
+        const startedAt = Math.min(block.invokedAt ?? block.createdAt, toolStartedAt)
+        return Math.max(0, now - startedAt)
+    }
+    const startedAt = toolStartedAt
     const endedAt = Math.max(...block.tools.map((tool) => getToolEndMs(tool, now)))
     return Math.max(0, endedAt - startedAt)
 }
@@ -168,42 +175,130 @@ function formatCompactRawText(value: string): string {
     return normalized.length > 96 ? `${normalized.slice(0, 95)}…` : normalized
 }
 
+/** Turn a Codex reasoning/commentary snapshot into one calm activity label. */
+export function formatLiveProcessText(value: string): string | null {
+    const sections = value
+        .split(/\n\s*\n/)
+        .map((section) => section.trim())
+        .filter(Boolean)
+    const section = sections[sections.length - 1]
+    if (!section) return null
+
+    const emphasized = [...section.matchAll(/\*\*([^*]+)\*\*/g)]
+    const source = emphasized[emphasized.length - 1]?.[1] ?? section.split(/\r?\n/).find(Boolean) ?? section
+    const normalized = source
+        .replace(/^\s*(?:#{1,6}|[-*+>])\s*/, '')
+        .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+        .replace(/\*\*|__|`/g, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+
+    if (!normalized) return null
+    return formatCompactRawText(normalized)
+}
+
+function getLatestLiveProcessBlock(block: ToolGroupBlock): ToolCallBlock | Exclude<NonNullable<ToolGroupBlock['detailBlocks']>[number], ToolCallBlock> | null {
+    if (!block.turnActive) return null
+    const details = block.detailBlocks ?? block.tools
+    return details.findLast((detail) => (
+        detail.kind === 'tool-call'
+        || detail.kind === 'agent-text'
+        || detail.kind === 'agent-reasoning'
+    )) ?? null
+}
+
 export function formatToolGroupCompactTitle(
     block: ToolGroupBlock,
     now: number,
-    t: (key: string, params?: Record<string, string | number>) => string
+    t: (key: string, params?: Record<string, string | number>) => string,
+    sessionRunActive = false
 ): string {
-    const active = isToolGroupActive(block)
-    const durationMs = getToolGroupDurationMs(block, now)
-    const renderedDuration = formatCompactDuration(durationMs)
-    const skillName = getToolGroupSkillName(block)
+    const nativeActive = isToolGroupActive(block)
+    const active = isToolGroupActive(block, sessionRunActive)
+    const label = getToolGroupCompactLabel(block, t, active, active && !nativeActive)
+    const duration = formatCompactDuration(getToolGroupDurationMs(block, now))
+    if (!active && label === t('toolGroup.compact.processed', { duration: '' }).trim()) {
+        return [label, duration].filter(Boolean).join(' ')
+    }
+    return joinTerminalSummaryParts([
+        label,
+        duration
+    ])
+}
+
+function getToolGroupCompactLabel(
+    block: ToolGroupBlock,
+    t: (key: string, params?: Record<string, string | number>) => string,
+    active = isToolGroupActive(block),
+    sessionFallback = false
+): string {
+    const runningTerminal = active
+        ? block.tools.findLast((tool) => (
+            isTerminalExecutionTool(tool.tool.name)
+            && (tool.tool.state === 'running' || tool.tool.state === 'pending')
+        )) ?? null
+        : null
+    if (runningTerminal) {
+        const terminalIntent = getTerminalCommandIntent(runningTerminal.tool.input)
+        const terminalLabel = terminalIntent?.kind === 'read-request'
+            ? getTerminalReadRequestLabel(terminalIntent, t)
+            : terminalIntent
+                ? getTerminalCommandDisplayTitle(runningTerminal.tool.input, t)
+                : getTerminalCommandSummary(runningTerminal.tool.input)
+        const stateLabel = t(runningTerminal.tool.state === 'pending'
+            ? 'terminal.execution.pending'
+            : 'terminal.execution.running')
+        return terminalLabel ? `${stateLabel} · ${terminalLabel}` : stateLabel
+    }
+    if (sessionFallback) {
+        return t('toolGroup.compact.processing', { duration: '' }).trim()
+    }
+    const latestLiveBlock = getLatestLiveProcessBlock(block)
+    if (latestLiveBlock?.kind === 'agent-text' || latestLiveBlock?.kind === 'agent-reasoning') {
+        const activity = formatLiveProcessText(latestLiveBlock.text)
+        if (activity) return activity
+    }
+
+    const liveTool = latestLiveBlock?.kind === 'tool-call' ? latestLiveBlock : null
+    const skillName = block.turnActive
+        ? liveTool?.tool.name === 'Skill'
+            ? getInputStringAny(liveTool.tool.input, ['skill', 'name'])?.trim() ?? null
+            : null
+        : getToolGroupSkillName(block)
     if (skillName) {
         return active
-            ? t('toolGroup.compact.skill.processing', { skill: skillName, duration: renderedDuration }).trim()
-            : t('toolGroup.compact.skill.processed', { skill: skillName, duration: renderedDuration }).trim()
+            ? t('toolGroup.compact.skill.processing', { skill: skillName, duration: '' }).trim()
+            : t('toolGroup.compact.skill.processed', { skill: skillName, duration: '' }).trim()
     }
 
     const latestActiveTool = active
         ? block.tools.findLast((tool) => tool.tool.state === 'running' || tool.tool.state === 'pending') ?? null
         : null
-    const displayTool = !block.forceGenericCompactTitle && block.tools.length === 1
+    const latestTerminal = active
+        ? block.tools.findLast((tool) => isTerminalExecutionTool(tool.tool.name)) ?? null
+        : null
+    const displayTool = liveTool ?? (!block.forceGenericCompactTitle && block.tools.length === 1
         ? block.tools[0]
-        : latestActiveTool
+        : latestActiveTool ?? latestTerminal)
     if (displayTool) {
         const invocationTitle = getInputStringAny(displayTool.tool.input, ['title'])?.trim()
         if (invocationTitle) {
-            return `${formatCompactRawText(invocationTitle)} ${renderedDuration}`.trim()
+            return formatCompactRawText(invocationTitle)
         }
 
         if (isTerminalExecutionTool(displayTool.tool.name)) {
             const terminalIntent = getTerminalCommandIntent(displayTool.tool.input)
-            const terminalLabel = terminalIntent?.kind === 'read-request' && terminalIntent.targets.length > 1
-                ? t('toolGroup.compact.row.readBatch')
+            const terminalLabel = terminalIntent?.kind === 'read-request'
+                ? getTerminalReadRequestLabel(terminalIntent, t)
                 : terminalIntent
                     ? getTerminalCommandDisplayTitle(displayTool.tool.input, t)
                     : getTerminalCommandSummary(displayTool.tool.input)
-            if (terminalLabel) return `${terminalLabel} ${renderedDuration}`.trim()
-            return `${t('terminal.execution.title')} ${renderedDuration}`.trim()
+            const state = getTerminalExecutionToolState(displayTool)
+            const stateLabel = active
+                ? t(state === 'error' ? 'terminal.execution.failed' : 'terminal.execution.completed')
+                : null
+            const label = terminalLabel || t('terminal.execution.title')
+            return stateLabel ? `${stateLabel} · ${label}` : label
         }
 
         const status = active ? 'processing' : 'processed'
@@ -213,7 +308,7 @@ export function formatToolGroupCompactTitle(
             if (fileTarget) {
                 return t(`toolGroup.compact.single.${status}.mutationTarget`, {
                     target: formatCompactRawText(fileTarget),
-                    duration: renderedDuration
+                    duration: ''
                 }).trim()
             }
 
@@ -221,12 +316,12 @@ export function formatToolGroupCompactTitle(
             if (command) {
                 return t(`toolGroup.compact.single.${status}.commandFallback`, {
                     command: formatCompactRawText(command),
-                    duration: renderedDuration
+                    duration: ''
                 }).trim()
             }
         }
         if (kind !== 'other') {
-            return t(`toolGroup.compact.single.${status}.${kind}`, { duration: renderedDuration }).trim()
+            return t(`toolGroup.compact.single.${status}.${kind}`, { duration: '' }).trim()
         }
 
         const presentation = getToolPresentation({
@@ -238,13 +333,13 @@ export function formatToolGroupCompactTitle(
             metadata: null
         }, t)
         if (presentation.title) {
-            return `${formatCompactRawText(presentation.title)} ${renderedDuration}`.trim()
+            return formatCompactRawText(presentation.title)
         }
     }
 
     return active
-        ? t('toolGroup.compact.processing', { duration: renderedDuration }).trim()
-        : t('toolGroup.compact.processed', { duration: renderedDuration }).trim()
+        ? t('toolGroup.compact.processing', { duration: '' }).trim()
+        : t('toolGroup.compact.processed', { duration: '' }).trim()
 }
 
 function CompactDetailBlock(props: { block: Exclude<NonNullable<ToolGroupBlock['detailBlocks']>[number], ToolCallBlock> }) {
@@ -259,9 +354,14 @@ function CompactDetailBlock(props: { block: Exclude<NonNullable<ToolGroupBlock['
     }
 
     if (block.kind === 'agent-reasoning') {
+        const lines = block.text
+            .split(/\n\s*\n/)
+            .map(formatLiveProcessText)
+            .filter((line): line is string => line !== null)
+            .filter((line, index, source) => source.indexOf(line) === index)
         return (
-            <div className="min-w-0 pl-[15px] whitespace-pre-wrap text-[13px] leading-5 text-[var(--app-hint)]">
-                {block.text}
+            <div className="min-w-0 space-y-0.5 pl-[15px] text-[13px] leading-5 text-[var(--app-hint)]">
+                {lines.map((line) => <div key={line}>{line}</div>)}
             </div>
         )
     }
@@ -320,6 +420,235 @@ function CompactDetailItem(props: {
     }
 
     return <CompactDetailBlock block={block} />
+}
+
+const CODEX_SUBAGENT_FRIENDLY_NAMES = [
+    'Atlas',
+    'Nova',
+    'Orbit',
+    'Sage',
+    'Scout',
+    'Beacon',
+    'Harbor',
+    'Piper'
+] as const
+
+export const CODEX_SUBAGENT_CARD_COLORS = [
+    '#4E7CF5',
+    '#7367E8',
+    '#9862C7',
+    '#C35E92',
+    '#337FA8',
+    '#258C91',
+    '#647AA3',
+    '#8A6F9E'
+] as const
+
+function getStablePaletteIndex(value: string, paletteLength: number): number {
+    let hash = 2_166_136_261
+    for (let index = 0; index < value.length; index += 1) {
+        hash ^= value.charCodeAt(index)
+        hash = Math.imul(hash, 16_777_619)
+    }
+    return (hash >>> 0) % paletteLength
+}
+
+function getTrimmedInputString(input: unknown, keys: string[]): string | null {
+    return getInputStringAny(input, keys)?.trim() || null
+}
+
+function getCodexSubagentInternalIds(tool: ToolCallBlock): ReadonlySet<string> {
+    const ids = new Set<string>()
+    const inputId = getTrimmedInputString(tool.tool.input, ['agentId', 'agent_id'])
+    if (inputId) ids.add(inputId.toLowerCase())
+
+    const spawnResult = parseCodexSpawnAgentResult(tool.tool.result)
+    if (spawnResult?.agentId) ids.add(spawnResult.agentId.trim().toLowerCase())
+    return ids
+}
+
+function getSafeCodexSubagentIdentityCandidate(value: string | null, internalIds: ReadonlySet<string>): string | null {
+    const candidate = value?.trim() || null
+    if (!candidate || internalIds.has(candidate.toLowerCase())) return null
+    return candidate
+}
+
+export function getCodexSubagentCardIdentity(tool: ToolCallBlock): string {
+    const input = tool.tool.input
+    const internalIds = getCodexSubagentInternalIds(tool)
+    const agentPath = getTrimmedInputString(input, ['agent_path', 'agentPath'])
+    const pathName = getSafeCodexSubagentIdentityCandidate(
+        agentPath?.replace(/^\/root\//, '') ?? null,
+        internalIds
+    )
+    if (pathName) return pathName
+
+    const displayName = getSafeCodexSubagentIdentityCandidate(getTrimmedInputString(input, [
+        'displayName',
+        'display_name',
+        'name',
+        'nickname',
+        'agentName',
+        'agent_name'
+    ]), internalIds)
+    if (displayName) return displayName
+
+    const spawnNickname = getSafeCodexSubagentIdentityCandidate(
+        parseCodexSpawnAgentResult(tool.tool.result)?.nickname ?? null,
+        internalIds
+    )
+    if (spawnNickname) return spawnNickname
+
+    const role = getSafeCodexSubagentIdentityCandidate(getTrimmedInputString(input, [
+        'agent_type',
+        'subagent_type',
+        'specialization',
+        'specialty',
+        'role',
+        'type'
+    ]), internalIds)
+    if (role) return role
+
+    const summary = getSafeCodexSubagentIdentityCandidate(getCodexAgentSummary(input), internalIds)
+    if (summary) return summary
+
+    return CODEX_SUBAGENT_FRIENDLY_NAMES[
+        getStablePaletteIndex(tool.id || 'codex-agent', CODEX_SUBAGENT_FRIENDLY_NAMES.length)
+    ]
+}
+
+export function getCodexSubagentCardColor(toolId: string): string {
+    return CODEX_SUBAGENT_CARD_COLORS[
+        getStablePaletteIndex(toolId || 'codex-agent', CODEX_SUBAGENT_CARD_COLORS.length)
+    ]
+}
+
+/**
+ * Keep cards distinct when their stable palette hashes collide. Sorting ids
+ * makes the collision resolution independent of the source array order.
+ */
+export function assignCodexSubagentCardColors(toolIds: readonly string[]): ReadonlyMap<string, string> {
+    const uniqueToolIds = [...new Set(toolIds)].sort()
+    const assignments = new Map<string, string>()
+    const usedColors = new Set<string>()
+
+    for (const toolId of uniqueToolIds) {
+        const preferredIndex = getStablePaletteIndex(toolId || 'codex-agent', CODEX_SUBAGENT_CARD_COLORS.length)
+        let color = CODEX_SUBAGENT_CARD_COLORS[preferredIndex]
+        if (usedColors.size < CODEX_SUBAGENT_CARD_COLORS.length) {
+            for (let offset = 0; offset < CODEX_SUBAGENT_CARD_COLORS.length; offset += 1) {
+                const candidate = CODEX_SUBAGENT_CARD_COLORS[
+                    (preferredIndex + offset) % CODEX_SUBAGENT_CARD_COLORS.length
+                ]
+                if (!usedColors.has(candidate)) {
+                    color = candidate
+                    break
+                }
+            }
+        }
+        assignments.set(toolId, color)
+        usedColors.add(color)
+    }
+
+    return assignments
+}
+
+export function getCodexSubagentCardState(state: unknown): ToolCallBlock['tool']['state'] {
+    const normalized = typeof state === 'string' ? state.trim().toLowerCase() : ''
+    if (normalized === 'completed') return 'completed'
+    if (
+        normalized === 'error'
+        || normalized === 'failed'
+        || normalized === 'cancelled'
+        || normalized === 'canceled'
+        || normalized === 'not-found'
+        || normalized === 'not_found'
+        || normalized === 'not found'
+    ) {
+        return 'error'
+    }
+    if (normalized === 'pending') return 'pending'
+    return 'running'
+}
+
+function getCodexSubagentCardStatusLabel(
+    state: ToolCallBlock['tool']['state'],
+    t: (key: string, params?: Record<string, string | number>) => string
+): string {
+    if (state === 'pending') return t('terminal.execution.pending')
+    if (state === 'running') return t('terminal.execution.running')
+    if (state === 'error') return t('terminal.execution.failed')
+    return t('terminal.execution.completed')
+}
+
+function getCodexSubagentCardMetadata(
+    tool: ToolCallBlock
+): string | null {
+    const configuration = getCodexAgentEffectiveConfiguration(tool.tool.input, tool.model)
+    if (configuration.model) {
+        return [configuration.model, configuration.reasoningEffort]
+            .filter((value): value is string => value !== null)
+            .join(' · ')
+    }
+
+    const activity = getCodexAgentActivity(tool.tool.input)
+    return activity ? formatLiveProcessText(activity) : null
+}
+
+function CodexSubagentCards(props: {
+    tools: ToolCallBlock[]
+    onSelectTool: (toolId: string) => void
+    t: (key: string, params?: Record<string, string | number>) => string
+}) {
+    if (props.tools.length === 0) return null
+
+    const colors = assignCodexSubagentCardColors(props.tools.map((tool) => tool.id))
+
+    return (
+        <div className="mt-2 flex flex-wrap gap-2" data-codex-subagent-cards>
+            {props.tools.map((tool) => {
+                const identity = getCodexSubagentCardIdentity(tool)
+                const metadata = getCodexSubagentCardMetadata(tool)
+                const state = getCodexSubagentCardState(tool.tool.state)
+                const statusLabel = getCodexSubagentCardStatusLabel(state, props.t)
+                const color = colors.get(tool.id) ?? getCodexSubagentCardColor(tool.id)
+
+                return (
+                    <button
+                        key={tool.id}
+                        type="button"
+                        className="flex min-h-11 w-[calc((100%-0.5rem)/2)] max-w-[calc((100%-0.5rem)/2)] min-w-0 shrink-0 cursor-pointer flex-col items-start gap-1 rounded-xl border border-l-[3px] border-[var(--app-border)] bg-[var(--app-bg)] px-3 py-2 text-left transition-colors hover:bg-[var(--app-subtle-bg)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)]"
+                        style={{ borderLeftColor: color }}
+                        onClick={() => props.onSelectTool(tool.id)}
+                        aria-haspopup="dialog"
+                        data-codex-subagent-card
+                        data-codex-subagent-color={color}
+                        data-codex-subagent-status={state}
+                        data-tool-id={tool.id}
+                    >
+                        <span className="flex w-full min-w-0 items-center">
+                            <span className="min-w-0 flex-1 truncate text-sm font-medium text-[var(--app-fg)]" title={identity}>
+                                {identity}
+                            </span>
+                        </span>
+                        <span className="flex w-full min-w-0 items-center gap-1.5">
+                            <span className={cn('shrink-0', toolStatusColorClass(state))} aria-hidden="true">
+                                <ToolStatusIcon state={state} />
+                            </span>
+                            {metadata ? (
+                                <span className="min-w-0 flex-1 truncate text-[11px] text-[var(--app-hint)]" title={metadata}>
+                                    {metadata}
+                                </span>
+                            ) : null}
+                            <span className="sr-only" role="status" aria-label={statusLabel} aria-live="polite" aria-atomic="true">
+                                {statusLabel}
+                            </span>
+                        </span>
+                    </button>
+                )
+            })}
+        </div>
+    )
 }
 
 function SummaryBadge(props: { className: string; text: string }) {
@@ -390,14 +719,14 @@ function CompactRowLabel(props: { block: ToolCallBlock; metadata: SessionMetadat
     const terminalCommandSummary = isTerminalExecutionTool(props.block.tool.name)
         ? getTerminalCommandSummary(props.block.tool.input)
         : null
-    const isBatchRead = terminalIntent?.kind === 'read-request' && terminalIntent.targets.length > 1
+    const isReadRequest = terminalIntent?.kind === 'read-request'
     const isUnknownTerminal = isTerminalExecutionTool(props.block.tool.name)
         && terminalIntent === null
         && terminalCommandSummary === null
     const label = isUnknownTerminal
         ? t('terminal.execution.title')
-        : isBatchRead
-        ? t('toolGroup.compact.row.readBatch')
+        : isReadRequest
+        ? getTerminalReadRequestLabel(terminalIntent, t)
         : terminalIntent
             ? getTerminalCommandIntentLabel(props.block.tool.input, terminalIntent, t)
             : terminalCommandSummary
@@ -416,8 +745,8 @@ function CompactRowLabel(props: { block: ToolCallBlock; metadata: SessionMetadat
     const detail = isUnknownTerminal
         ? null
         : terminalIntent || terminalCommandSummary
-        ? terminalIntent && !isBatchRead
-            ? getTerminalCommandIntentDetail(terminalIntent)
+        ? terminalIntent && !isReadRequest
+            ? getTerminalCommandIntentDetail(terminalIntent, t)
             : null
         : presentation.subtitle ?? (kind === 'other' ? null : presentation.title)
 
@@ -473,13 +802,16 @@ function ToolGroupDetailSurface(props: {
     metadata: SessionMetadataSummary | null
     onClose: () => void
 }) {
-    if (!props.selectedTool) return null
+    const lastTool = useRef(props.selectedTool)
+    useEffect(() => { if (props.selectedTool) lastTool.current = props.selectedTool }, [props.selectedTool])
+    const selectedTool = props.selectedTool ?? lastTool.current
+    if (!selectedTool) return null
 
-    if (isTerminalExecutionTool(props.selectedTool.tool.name)) {
+    if (isTerminalExecutionTool(selectedTool.tool.name)) {
         return (
             <TerminalExecutionDrawer
-                block={props.selectedTool}
-                open
+                block={selectedTool}
+                open={props.selectedTool !== null}
                 onOpenChange={(nextOpen) => {
                     if (!nextOpen) props.onClose()
                 }}
@@ -487,21 +819,18 @@ function ToolGroupDetailSurface(props: {
         )
     }
 
-    const useFileMutationDialog = getFileMutationDialogSummary(props.selectedTool, props.metadata) !== null
+    const useFileMutationDialog = getFileMutationDialogSummary(selectedTool, props.metadata) !== null
 
     return (
-        <Dialog open onOpenChange={(nextOpen) => {
+        <ChatDetailDialog open={props.selectedTool !== null} onOpenChange={(nextOpen) => {
             if (!nextOpen) props.onClose()
-        }}>
-            <DialogContent
-                className={cn('max-w-2xl', useFileMutationDialog ? FILE_MUTATION_DIALOG_CLASS_NAME : null)}
-                aria-describedby={undefined}
-                data-file-mutation-dialog={useFileMutationDialog ? 'true' : undefined}
-            >
-                <ToolDetailDialogHeader block={props.selectedTool} metadata={props.metadata} fallbackTitle={props.title} />
-                <ToolDetailDialogContent block={props.selectedTool} metadata={props.metadata} />
-            </DialogContent>
-        </Dialog>
+        }}
+            title={props.title}
+            desktopClassName={cn('max-w-2xl', useFileMutationDialog ? FILE_MUTATION_DIALOG_CLASS_NAME : null)}
+            header={<ToolDetailDialogHeader block={selectedTool} metadata={props.metadata} fallbackTitle={props.title} />}
+        >
+            <ToolDetailDialogContent block={selectedTool} metadata={props.metadata} />
+        </ChatDetailDialog>
     )
 }
 
@@ -518,19 +847,30 @@ export function ToolGroupCard(props: {
     const [isHydratingHistory, setIsHydratingHistory] = useState(false)
     const [historyExhausted, setHistoryExhausted] = useState(false)
     const [retryNonce, setRetryNonce] = useState(0)
-    const [now, setNow] = useState(() => Date.now())
+    const hasRunningTerminal = props.block.forceCompact === true && props.block.tools.some((tool) => (
+        isTerminalExecutionTool(tool.tool.name)
+        && (tool.tool.state === 'running' || tool.tool.state === 'pending')
+    ))
+    const [autoExpansionReady, setAutoExpansionReady] = useState(hasRunningTerminal)
     const hydrationRunRef = useRef(0)
     const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
     const { suppressFocusRing, onTriggerPointerDown, onTriggerKeyDown, onTriggerBlur } = usePointerFocusRing()
     const compactHeaderState = useContext(ToolGroupCompactHeaderContext)
     const compactMode = ctx.terminalToolDisplayMode === 'compact' || props.block.forceCompact === true
-    const hasActiveTools = isToolGroupActive(props.block)
+    // The newest Process row can temporarily lose its latest terminal snapshot
+    // while the session is still running. Do not treat that transport gap as
+    // turn completion; the session-level run state is the final fallback.
+    const hasActiveTools = isToolGroupActive(props.block, ctx.toolGroupRunActive)
+    const now = useSharedNow(compactMode && hasActiveTools)
+    const requestsAutomaticExpansion = hasActiveTools && (
+        hasRunningTerminal || props.block.defaultOpen || props.block.forceCompact !== true
+    )
     const useExternalCompactHeader = compactMode && compactHeaderState?.groupId === props.block.id
     const expansionStateKeys = getToolGroupExpansionStateKeys(props.block)
     const primaryExpansionStateKey = getPrimaryToolGroupExpansionStateKey(props.block)
     const usesManagedExpansionState = ctx.setToolGroupExpansionState !== undefined
     const defaultExpansionState = getDefaultToolGroupExpansionState(
-        props.block.defaultOpen || (!props.block.forceCompact && (ctx.toolGroupRunActive === true || hasActiveTools))
+        requestsAutomaticExpansion && autoExpansionReady
     )
     const expansionState = resolveToolGroupExpansionState(
         props.block,
@@ -563,6 +903,20 @@ export function ToolGroupCard(props: {
     }, [ctx, displayedOpen, externalSetOpen, primaryExpansionStateKey, useExternalCompactHeader, usesManagedExpansionState])
 
     useEffect(() => {
+        setAutoExpansionReady(hasRunningTerminal)
+        if (hasRunningTerminal) {
+            return
+        }
+        if (!requestsAutomaticExpansion) {
+            return
+        }
+        const timer = setTimeout(() => {
+            setAutoExpansionReady(true)
+        }, 3_000)
+        return () => clearTimeout(timer)
+    }, [hasRunningTerminal, props.block.id, requestsAutomaticExpansion])
+
+    useEffect(() => {
         if (!usesManagedExpansionState) {
             return
         }
@@ -571,6 +925,43 @@ export function ToolGroupCard(props: {
         }
         ctx.setToolGroupExpansionState?.(primaryExpansionStateKey, defaultExpansionState)
     }, [ctx, defaultExpansionState, expansionStateKeys, primaryExpansionStateKey, usesManagedExpansionState])
+
+    // Do not flash open for sub-second work. Once the active group has stayed
+    // visible for three full seconds, promote only untouched automatic state.
+    useEffect(() => {
+        if (!usesManagedExpansionState || !autoExpansionReady || !requestsAutomaticExpansion) {
+            return
+        }
+        const states = expansionStateKeys.map((key) => ctx.toolGroupExpansionStates?.[key])
+        if (states.some((state) => state === 'user-open' || state === 'user-closed')) {
+            return
+        }
+        if (states.some((state) => state === 'auto-open')) {
+            return
+        }
+        ctx.setToolGroupExpansionState?.(primaryExpansionStateKey, 'auto-open')
+    }, [
+        autoExpansionReady,
+        ctx,
+        expansionStateKeys,
+        primaryExpansionStateKey,
+        requestsAutomaticExpansion,
+        usesManagedExpansionState,
+    ])
+
+    // A live process becomes a historical Processed card as the next snapshot
+    // arrives. Close only automatic expansion; an explicit user choice stays.
+    useEffect(() => {
+        if (!usesManagedExpansionState || defaultExpansionState !== 'auto-closed') {
+            return
+        }
+        const autoOpenKeys = expansionStateKeys.filter((key) => (
+            ctx.toolGroupExpansionStates?.[key] === 'auto-open'
+        ))
+        for (const key of autoOpenKeys) {
+            ctx.setToolGroupExpansionState?.(key, 'auto-closed')
+        }
+    }, [ctx, defaultExpansionState, expansionStateKeys, usesManagedExpansionState])
 
     function clearRetryTimer() {
         if (retryTimerRef.current === null) {
@@ -595,15 +986,6 @@ export function ToolGroupCard(props: {
             clearRetryTimer()
         }
     }, [])
-
-    useEffect(() => {
-        if (!compactMode || !hasActiveTools) {
-            return
-        }
-        setNow(Date.now())
-        const interval = setInterval(() => setNow(Date.now()), COMPACT_ELAPSED_INTERVAL_MS)
-        return () => clearInterval(interval)
-    }, [compactMode, hasActiveTools])
 
     useEffect(() => {
         if (!displayedOpen) {
@@ -686,11 +1068,34 @@ export function ToolGroupCard(props: {
             metadata: props.metadata
         }, t)
     }, [selectedTool, props.metadata, t])
+    const codexSubagentTools = useMemo(() => props.block.tools
+        .map((tool, index) => ({ tool, index }))
+        .filter(({ tool }) => tool.tool.name === 'CodexAgent')
+        .sort((left, right) => (
+            (left.tool.tool.startedAt ?? left.tool.tool.createdAt) - (right.tool.tool.startedAt ?? right.tool.tool.createdAt)
+            || left.tool.createdAt - right.tool.createdAt
+            || left.index - right.index
+        ))
+        .map(({ tool }) => tool), [props.block.tools])
+    const codexSubagentToolIds = useMemo(
+        () => new Set(codexSubagentTools.map((tool) => tool.id)),
+        [codexSubagentTools]
+    )
+    const compactDetailBlocks = useMemo(() => {
+        const blocks = props.block.detailBlocks && props.block.detailBlocks.length > 0
+            ? props.block.detailBlocks
+            : props.block.tools
+        return blocks.filter((block) => (
+            block.kind !== 'tool-call'
+            || block.tool.name !== 'CodexAgent'
+            || !codexSubagentToolIds.has(block.id)
+        ))
+    }, [codexSubagentToolIds, props.block.detailBlocks, props.block.tools])
 
     const primaryTitle = formatGroupedHeaderTitle(props.block, t)
     const subtitle = formatGroupedHeaderSubtitle(props.block, t) ?? formatActionSummary(props.block, t)
     const fileCount = props.block.summary.fileTargets.length
-    const compactTitle = formatToolGroupCompactTitle(props.block, now, t)
+    const compactTitle = formatToolGroupCompactTitle(props.block, now, t, ctx.toolGroupRunActive)
     const toggleOpen = () => {
         setDisplayedOpen((value) => !value)
     }
@@ -712,7 +1117,13 @@ export function ToolGroupCard(props: {
                         aria-expanded={displayedOpen}
                     >
                         {props.block.showAgentIcon ? (
-                            <AgentFlavorIcon flavor={ctx.metadata?.flavor} className="h-3.5 w-3.5 shrink-0 text-[var(--app-hint)]" />
+                            <AgentFlavorIcon
+                                flavor={ctx.metadata?.flavor}
+                                className={cn(
+                                    'h-3.5 w-3.5 shrink-0 text-[var(--app-hint)]',
+                                    hasActiveTools && 'motion-safe:animate-pulse'
+                                )}
+                            />
                         ) : null}
                         <span className="min-w-0 flex-1 truncate">{compactTitle}</span>
                         <span className="shrink-0 text-[var(--app-hint)]">
@@ -721,28 +1132,23 @@ export function ToolGroupCard(props: {
                     </button>
                 ) : null}
 
+                <CodexSubagentCards
+                    tools={codexSubagentTools}
+                    onSelectTool={setSelectedToolId}
+                    t={t}
+                />
+
                 {displayedOpen ? (
                     <div className={cn('relative ml-[7px] flex flex-col gap-0.5', useExternalCompactHeader ? 'mt-0.5' : 'mt-1')}>
                         <span aria-hidden="true" className="pointer-events-none absolute inset-y-0 left-0 w-px bg-[var(--app-divider)]" data-tool-group-timeline />
-                        {props.block.detailBlocks && props.block.detailBlocks.length > 0 ? (
-                            props.block.detailBlocks.map((block, index) => (
-                                <CompactDetailItem
-                                    key={`detail:${block.kind}:${block.id}:${index}`}
-                                    block={block}
-                                    metadata={props.metadata}
-                                    onSelectTool={setSelectedToolId}
-                                />
-                            ))
-                        ) : (
-                            props.block.tools.map((tool) => (
-                                <CompactDetailItem
-                                    key={tool.id}
-                                    block={tool}
-                                    metadata={props.metadata}
-                                    onSelectTool={setSelectedToolId}
-                                />
-                            ))
-                        )}
+                        {compactDetailBlocks.map((block, index) => (
+                            <CompactDetailItem
+                                key={`detail:${block.kind}:${block.id}:${index}`}
+                                block={block}
+                                metadata={props.metadata}
+                                onSelectTool={setSelectedToolId}
+                            />
+                        ))}
 
                         {isHydratingHistory ? (
                             <div className="pl-[15px] text-xs text-[var(--app-hint)]">
@@ -759,7 +1165,9 @@ export function ToolGroupCard(props: {
 
                 <ToolGroupDetailSurface
                     selectedTool={selectedTool}
-                    title={selectedPresentation?.title ?? selectedTool?.tool.name ?? ''}
+                    title={selectedTool?.tool.name === 'CodexAgent'
+                        ? getCodexSubagentCardIdentity(selectedTool)
+                        : selectedPresentation?.title ?? selectedTool?.tool.name ?? ''}
                     metadata={props.metadata}
                     onClose={() => setSelectedToolId(null)}
                 />
@@ -874,7 +1282,9 @@ export function ToolGroupCard(props: {
 
             <ToolGroupDetailSurface
                 selectedTool={selectedTool}
-                title={selectedPresentation?.title ?? selectedTool?.tool.name ?? ''}
+                title={selectedTool?.tool.name === 'CodexAgent'
+                    ? getCodexSubagentCardIdentity(selectedTool)
+                    : selectedPresentation?.title ?? selectedTool?.tool.name ?? ''}
                 metadata={props.metadata}
                 onClose={() => setSelectedToolId(null)}
             />
