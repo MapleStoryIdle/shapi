@@ -27,14 +27,18 @@ export function startRunnerControlServer({
   spawnSession,
   requestShutdown,
   onHappySessionWebhook,
+  onCodexRecoveryReady,
+  onCodexRecoveryUnconfirmed,
   onExternalCodexRequest,
   onExternalCodexLifecycle
 }: {
   getChildren: () => TrackedSession[];
-  stopSession: (sessionId: string) => boolean;
+  stopSession: (sessionId: string) => boolean | Promise<boolean>;
   spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>;
   requestShutdown: () => void;
-  onHappySessionWebhook: (sessionId: string, metadata: Metadata) => void;
+  onHappySessionWebhook: (sessionId: string, metadata: Metadata) => Promise<void> | void;
+  onCodexRecoveryReady?: (input: { recoveryRequestId: string; sessionId: string; threadId: string }) => boolean;
+  onCodexRecoveryUnconfirmed?: (input: { recoveryRequestId: string; sessionId: string; threadId: string; error: string }) => boolean;
   onExternalCodexRequest: (request: Omit<ExternalCodexRequestPayload, 'machineId'>) => void;
   onExternalCodexLifecycle: (event: ExternalCodexLifecycleEvent) => void;
 }): Promise<{ port: number; stop: () => Promise<void> }> {
@@ -65,10 +69,36 @@ export function startRunnerControlServer({
       const { sessionId, metadata } = request.body;
 
       logger.debug(`[CONTROL SERVER] Session started: ${sessionId}`);
-      onHappySessionWebhook(sessionId, metadata);
+      await onHappySessionWebhook(sessionId, metadata);
 
       return { status: 'ok' as const };
     });
+
+    typed.post('/codex-recovery-ready', {
+      schema: {
+        body: z.object({ recoveryRequestId: z.string().min(1).max(200), sessionId: z.string().min(1).max(200), threadId: z.string().min(1).max(200) }).strict(),
+        response: { 200: z.object({ status: z.literal('ok') }), 409: z.object({ status: z.literal('rejected') }) }
+      }
+    }, async (request, reply) => {
+      if (onCodexRecoveryReady?.(request.body) !== true) {
+        reply.code(409)
+        return { status: 'rejected' as const }
+      }
+      return { status: 'ok' as const }
+    })
+
+    typed.post('/codex-recovery-unconfirmed', {
+      schema: {
+        body: z.object({ recoveryRequestId: z.string().min(1).max(200), sessionId: z.string().min(1).max(200), threadId: z.string().min(1).max(200), error: z.string().min(1).max(2_000) }).strict(),
+        response: { 200: z.object({ status: z.literal('ok') }), 409: z.object({ status: z.literal('rejected') }) }
+      }
+    }, async (request, reply) => {
+      if (onCodexRecoveryUnconfirmed?.(request.body) !== true) {
+        reply.code(409)
+        return { status: 'rejected' as const }
+      }
+      return { status: 'ok' as const }
+    })
 
     // Global Codex hooks forward native permission prompts and
     // request_user_input calls here. The hook payload has already been
@@ -147,7 +177,7 @@ export function startRunnerControlServer({
       const { sessionId } = request.body;
 
       logger.debug(`[CONTROL SERVER] Stop session request: ${sessionId}`);
-      const success = stopSession(sessionId);
+      const success = await stopSession(sessionId);
       return { success };
     });
 

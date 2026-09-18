@@ -22,28 +22,22 @@ import {
 import { VOICE_BACKEND_LABELS } from '@hapi/protocol/voicePickerCatalog'
 import type { VoiceBackendType } from '@hapi/protocol/voice'
 import { getFontScaleOptions, useFontScale, type FontScale } from '@/hooks/useFontScale'
-import { getTerminalFontSizeOptions, useTerminalFontSize, type TerminalFontSize } from '@/hooks/useTerminalFontSize'
 import { getComposerEnterBehaviorOptions, useComposerEnterBehavior, type ComposerEnterBehavior } from '@/hooks/useComposerEnterBehavior'
-import { getTerminalToolDisplayModeOptions, useTerminalToolDisplayMode, type TerminalToolDisplayMode } from '@/hooks/useTerminalToolDisplayMode'
 import { getSessionListStatusModeOptions, useSessionListStatusMode, type SessionListStatusMode } from '@/hooks/useSessionListStatusMode'
 import { useShowActiveSessionsOnly } from '@/hooks/useShowActiveSessionsOnly'
+import {
+    MAX_KANBAN_RECENT_MINUTES,
+    MIN_KANBAN_RECENT_MINUTES,
+    normalizeKanbanRecentMinutes,
+    useKanbanRecentPreferences,
+} from '@/hooks/useKanbanRecentPreferences'
 import {
     MAX_SESSION_PREVIEW_LIMIT,
     MIN_SESSION_PREVIEW_LIMIT,
     normalizeSessionPreviewLimit,
     useSessionPreviewLimit,
 } from '@/hooks/useSessionPreviewLimit'
-import {
-    getChatSurfaceColorPickerValue,
-    getChatSurfaceColorPresetOptions,
-    toCustomChatSurfaceColorPreference,
-    toPresetChatSurfaceColorPreference,
-    useChatSurfaceColors,
-    type ChatSurfaceColorPreference,
-    type ChatSurfaceColorPreset,
-} from '@/hooks/useChatSurfaceColors'
 import { useAppearance, getAppearanceOptions, type AppearancePreference } from '@/hooks/useTheme'
-import { useThemeColors, type ThemeColorKeyId } from '@/hooks/useThemeColors'
 import { MotionIcon, toMotionIcon } from '@/components/MotionIcon'
 import { PROTOCOL_VERSION } from '@hapi/protocol'
 import { VoiceRespondsControls, VoiceSoundsControls, VoicePersonaControls, VoiceDiagnosticsControls } from '@/components/settings/VoiceAdvancedControls'
@@ -261,160 +255,96 @@ function SessionPreviewLimitControl(props: {
     )
 }
 
-function ChatSurfaceColorControl(props: {
+function KanbanRecentMinutesControl(props: {
+    value: number
+    onChange: (value: number) => void
     label: string
-    preference: ChatSurfaceColorPreference
-    onPresetChange: (preset: ChatSurfaceColorPreset) => void
-    onCustomChange: (value: string) => void
-    t: (key: string) => string
+    unit: string
+    description: string
 }) {
-    const presetOptions = getChatSurfaceColorPresetOptions()
-    const pickerValue = getChatSurfaceColorPickerValue(props.preference)
-    const isCustomSelected = props.preference.startsWith('custom:')
+    const [draft, setDraft] = useState(String(props.value))
+
+    useEffect(() => setDraft(String(props.value)), [props.value])
+
+    const commitDraft = () => {
+        const parsed = draft.trim() === '' ? props.value : Number(draft)
+        const next = normalizeKanbanRecentMinutes(parsed)
+        props.onChange(next)
+        setDraft(String(next))
+    }
 
     return (
-        <div className="border-t border-[var(--app-divider)] px-3 py-3">
-            <div className="mb-2 text-[var(--app-fg)]">{props.label}</div>
-            <div className="flex flex-wrap gap-2">
-                {presetOptions.map((option) => {
-                    const selected = props.preference === toPresetChatSurfaceColorPreference(option.value)
-                    const swatchColor = getChatSurfaceColorPickerValue(toPresetChatSurfaceColorPreference(option.value))
-                    return (
-                        <button
-                            key={option.value}
-                            type="button"
-                            onClick={() => props.onPresetChange(option.value)}
-                            className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm transition-colors ${
-                                selected
-                                    ? 'border-[var(--app-link)] bg-[var(--app-subtle-bg)] text-[var(--app-link)]'
-                                    : 'border-[var(--app-border)] bg-[var(--app-bg)] text-[var(--app-fg)] hover:bg-[var(--app-subtle-bg)]'
-                            }`}
-                        >
-                            <span className="h-2.5 w-2.5 rounded-full opacity-80" style={{ backgroundColor: swatchColor }} />
-                            <span>{props.t(option.labelKey)}</span>
-                        </button>
-                    )
-                })}
-            </div>
-            <div className="mt-3 flex items-center justify-between gap-3">
-                <span className="text-sm text-[var(--app-hint)]">{props.t('settings.chat.surfaceColor.custom')}</span>
-                <label
-                    className={`inline-flex items-center rounded-xl border px-2 py-1 transition-colors ${
-                        isCustomSelected
-                            ? 'border-[var(--app-link)] bg-[var(--app-subtle-bg)]'
-                            : 'border-[var(--app-border)] bg-[var(--app-bg)]'
-                    }`}
-                >
-                    <input
-                        aria-label={props.t('settings.chat.surfaceColor.custom')}
-                        type="color"
-                        value={pickerValue}
-                        onChange={(event) => props.onCustomChange(event.target.value)}
-                        className="h-8 w-11 cursor-pointer appearance-none border-0 bg-transparent p-0"
-                    />
-                </label>
-            </div>
+        <div className="flex items-center justify-between gap-3 px-3 py-3">
+            <label htmlFor="kanban-recent-minutes" className="flex min-w-0 flex-col">
+                <span className="text-[var(--app-fg)]">{props.label}</span>
+                <span className="text-xs text-[var(--app-hint)]">{props.description}</span>
+            </label>
+            <span className="flex h-9 shrink-0 items-center rounded-lg border border-[var(--app-border)] bg-[var(--app-bg)] shadow-sm focus-within:ring-2 focus-within:ring-[var(--app-link)]">
+                <input
+                    id="kanban-recent-minutes"
+                    type="number"
+                    inputMode="numeric"
+                    min={MIN_KANBAN_RECENT_MINUTES}
+                    max={MAX_KANBAN_RECENT_MINUTES}
+                    aria-label={props.label}
+                    value={draft}
+                    onChange={(event) => setDraft(event.target.value)}
+                    onBlur={commitDraft}
+                    onKeyDown={(event) => {
+                        if (event.key === 'Enter') {
+                            event.preventDefault()
+                            commitDraft()
+                            event.currentTarget.blur()
+                        }
+                        if (event.key === 'Escape') {
+                            event.preventDefault()
+                            setDraft(String(props.value))
+                            event.currentTarget.blur()
+                        }
+                    }}
+                    className="h-8 w-16 bg-transparent px-2 text-right text-sm font-medium tabular-nums text-[var(--app-fg)] outline-none"
+                />
+                <span className="pr-2 text-xs text-[var(--app-hint)]">{props.unit}</span>
+            </span>
         </div>
     )
 }
 
-function ThemeColorControl(props: { t: (key: string) => string }) {
-    const { keys, getPickerValue, isCustomized, hasAnyCustom, setColor, resetColor, resetAll } = useThemeColors()
-
-    return (
-        <div className="border-t border-[var(--app-divider)] px-3 py-3">
-            <div className="mb-1 flex items-center justify-between gap-3">
-                <span className="text-[var(--app-fg)]">{props.t('settings.display.themeColors.title')}</span>
-                {hasAnyCustom && (
-                    <button
-                        type="button"
-                        onClick={resetAll}
-                        className="text-sm text-[var(--app-link)] transition-colors hover:underline"
-                    >
-                        {props.t('settings.display.themeColors.resetAll')}
-                    </button>
-                )}
-            </div>
-            <div className="mb-3 text-sm text-[var(--app-hint)]">{props.t('settings.display.themeColors.description')}</div>
-            <div className="flex flex-col gap-2">
-                {keys.map((key) => {
-                    const value = getPickerValue(key.id)
-                    const customized = isCustomized(key.id)
-                    return (
-                        <div key={key.id} className="flex items-center justify-between gap-3">
-                            <span className="text-sm text-[var(--app-fg)]">{props.t(key.labelKey)}</span>
-                            <div className="flex items-center gap-2">
-                                {customized && (
-                                    <button
-                                        type="button"
-                                        onClick={() => resetColor(key.id as ThemeColorKeyId)}
-                                        className="text-xs text-[var(--app-hint)] transition-colors hover:text-[var(--app-link)]"
-                                    >
-                                        {props.t('settings.display.themeColors.reset')}
-                                    </button>
-                                )}
-                                <label
-                                    className={`inline-flex items-center rounded-xl border px-2 py-1 transition-colors ${
-                                        customized
-                                            ? 'border-[var(--app-link)] bg-[var(--app-subtle-bg)]'
-                                            : 'border-[var(--app-border)] bg-[var(--app-bg)]'
-                                    }`}
-                                >
-                                    <input
-                                        aria-label={props.t(key.labelKey)}
-                                        type="color"
-                                        value={value}
-                                        onChange={(event) => setColor(key.id as ThemeColorKeyId, event.target.value)}
-                                        className="h-8 w-11 cursor-pointer appearance-none border-0 bg-transparent p-0"
-                                    />
-                                </label>
-                            </div>
-                        </div>
-                    )
-                })}
-            </div>
-        </div>
-    )
-}
-
-export default function SettingsPage() {
+export function SettingsPageContent(props: { mode?: 'settings' | 'voice'; onBack?: () => void } = {}) {
     const { t, locale, setLocale } = useTranslation()
     const { api } = useAppContext()
     const { forceReload } = usePwaUpdateContext()
-    const goBack = useAppGoBack()
+    const defaultGoBack = useAppGoBack()
+    const goBack = props.onBack ?? defaultGoBack
+    const isVoicePlugin = props.mode === 'voice'
     const [isOpen, setIsOpen] = useState(false)
     const [isAppearanceOpen, setIsAppearanceOpen] = useState(false)
     const [isFontOpen, setIsFontOpen] = useState(false)
-    const [isTerminalFontOpen, setIsTerminalFontOpen] = useState(false)
     const [isChatOpen, setIsChatOpen] = useState(false)
-    const [isTerminalToolDisplayOpen, setIsTerminalToolDisplayOpen] = useState(false)
     const [isSessionListStatusOpen, setIsSessionListStatusOpen] = useState(false)
+    const [isAdvancedOpen, setIsAdvancedOpen] = useState(false)
     const [isVoiceOpen, setIsVoiceOpen] = useState(false)
     const [isVoiceBackendOpen, setIsVoiceBackendOpen] = useState(false)
     const [isVoicePickerOpen, setIsVoicePickerOpen] = useState(false)
     const containerRef = useRef<HTMLDivElement>(null)
     const appearanceContainerRef = useRef<HTMLDivElement>(null)
     const fontContainerRef = useRef<HTMLDivElement>(null)
-    const terminalFontContainerRef = useRef<HTMLDivElement>(null)
     const chatContainerRef = useRef<HTMLDivElement>(null)
-    const terminalToolDisplayContainerRef = useRef<HTMLDivElement>(null)
     const sessionListStatusContainerRef = useRef<HTMLDivElement>(null)
     const voiceContainerRef = useRef<HTMLDivElement>(null)
     const voiceBackendPickerRef = useRef<HTMLDivElement>(null)
     const voicePickerContainerRef = useRef<HTMLDivElement>(null)
     const { fontScale, setFontScale } = useFontScale()
-    const { terminalFontSize, setTerminalFontSize } = useTerminalFontSize()
     const { sessionPreviewLimit, setSessionPreviewLimit } = useSessionPreviewLimit()
     const { composerEnterBehavior, setComposerEnterBehavior } = useComposerEnterBehavior()
-    const { terminalToolDisplayMode, setTerminalToolDisplayMode } = useTerminalToolDisplayMode()
     const { sessionListStatusMode, setSessionListStatusMode } = useSessionListStatusMode()
     const { showActiveSessionsOnly, setShowActiveSessionsOnly } = useShowActiveSessionsOnly()
     const {
-        toolGroupBackground,
-        userMessageBackground,
-        setToolGroupBackground,
-        setUserMessageBackground,
-    } = useChatSurfaceColors()
+        recentMinutes: kanbanRecentMinutes,
+        autoRemoveOnOpen: kanbanRecentAutoRemove,
+        setRecentMinutes: setKanbanRecentMinutes,
+        setAutoRemoveOnOpen: setKanbanRecentAutoRemove,
+    } = useKanbanRecentPreferences()
     const { appearance, setAppearance } = useAppearance()
 
     // Voice language state - read from localStorage
@@ -448,9 +378,7 @@ export default function SettingsPage() {
     }
 
     const fontScaleOptions = getFontScaleOptions()
-    const terminalFontSizeOptions = getTerminalFontSizeOptions()
     const composerEnterBehaviorOptions = getComposerEnterBehaviorOptions()
-    const terminalToolDisplayModeOptions = getTerminalToolDisplayModeOptions()
     const sessionListStatusModeOptions = getSessionListStatusModeOptions()
     const appearanceOptions = getAppearanceOptions()
     const currentLocale = locales.find((loc) => loc.value === locale)
@@ -466,9 +394,7 @@ export default function SettingsPage() {
             ? 'sun'
             : 'moon'
     const currentFontScaleLabel = fontScaleOptions.find((opt) => opt.value === fontScale)?.label ?? '100%'
-    const currentTerminalFontSizeLabel = terminalFontSizeOptions.find((opt) => opt.value === terminalFontSize)?.label ?? '13px'
     const currentComposerEnterBehaviorLabel = composerEnterBehaviorOptions.find((opt) => opt.value === composerEnterBehavior)?.labelKey ?? 'settings.chat.enterBehavior.send'
-    const currentTerminalToolDisplayModeLabel = terminalToolDisplayModeOptions.find((opt) => opt.value === terminalToolDisplayMode)?.labelKey ?? 'settings.chat.terminalToolDisplay.compact'
     const currentSessionListStatusModeLabel = sessionListStatusModeOptions.find((opt) => opt.value === sessionListStatusMode)?.labelKey ?? 'settings.display.sessionListStatus.standard'
     const currentVoiceLanguage = voiceLanguages.find((lang) => lang.code === voiceLanguage)
 
@@ -521,19 +447,9 @@ export default function SettingsPage() {
         setIsFontOpen(false)
     }
 
-    const handleTerminalFontSizeChange = (newSize: TerminalFontSize) => {
-        setTerminalFontSize(newSize)
-        setIsTerminalFontOpen(false)
-    }
-
     const handleComposerEnterBehaviorChange = (newBehavior: ComposerEnterBehavior) => {
         setComposerEnterBehavior(newBehavior)
         setIsChatOpen(false)
-    }
-
-    const handleTerminalToolDisplayModeChange = (newMode: TerminalToolDisplayMode) => {
-        setTerminalToolDisplayMode(newMode)
-        setIsTerminalToolDisplayOpen(false)
     }
 
     const handleSessionListStatusModeChange = (newMode: SessionListStatusMode) => {
@@ -566,6 +482,7 @@ export default function SettingsPage() {
 
     // Resolve configured backends, user preference, and voice selection for that backend
     useEffect(() => {
+        if (!isVoicePlugin) return
         let cancelled = false
         fetchVoiceBackend(api).then((resp) => {
             if (cancelled) return
@@ -580,10 +497,11 @@ export default function SettingsPage() {
             setVoiceId(readStoredVoiceSelection('elevenlabs'))
         })
         return () => { cancelled = true }
-    }, [api])
+    }, [api, isVoicePlugin])
 
     // Fetch ElevenLabs voices only after hub reports elevenlabs backend
     useEffect(() => {
+        if (!isVoicePlugin) return
         if (voiceBackend !== 'elevenlabs') {
             setDynamicVoices(null)
             return
@@ -593,7 +511,7 @@ export default function SettingsPage() {
             if (!cancelled && voices.length > 0) setDynamicVoices(voices)
         })
         return () => { cancelled = true }
-    }, [api, voiceBackend])
+    }, [api, isVoicePlugin, voiceBackend])
 
     const handleVoicePreview = (previewUrl: string, voiceId: string, event: React.MouseEvent) => {
         event.stopPropagation()
@@ -627,7 +545,7 @@ export default function SettingsPage() {
 
     // Close dropdown when clicking outside
     useEffect(() => {
-        if (!isOpen && !isAppearanceOpen && !isFontOpen && !isTerminalFontOpen && !isChatOpen && !isTerminalToolDisplayOpen && !isSessionListStatusOpen && !isVoiceOpen && !isVoiceBackendOpen && !isVoicePickerOpen) return
+        if (!isOpen && !isAppearanceOpen && !isFontOpen && !isChatOpen && !isSessionListStatusOpen && !isVoiceOpen && !isVoiceBackendOpen && !isVoicePickerOpen) return
 
         const handleClickOutside = (event: MouseEvent) => {
             if (isOpen && containerRef.current && !containerRef.current.contains(event.target as Node)) {
@@ -639,14 +557,8 @@ export default function SettingsPage() {
             if (isFontOpen && fontContainerRef.current && !fontContainerRef.current.contains(event.target as Node)) {
                 setIsFontOpen(false)
             }
-            if (isTerminalFontOpen && terminalFontContainerRef.current && !terminalFontContainerRef.current.contains(event.target as Node)) {
-                setIsTerminalFontOpen(false)
-            }
             if (isChatOpen && chatContainerRef.current && !chatContainerRef.current.contains(event.target as Node)) {
                 setIsChatOpen(false)
-            }
-            if (isTerminalToolDisplayOpen && terminalToolDisplayContainerRef.current && !terminalToolDisplayContainerRef.current.contains(event.target as Node)) {
-                setIsTerminalToolDisplayOpen(false)
             }
             if (isSessionListStatusOpen && sessionListStatusContainerRef.current && !sessionListStatusContainerRef.current.contains(event.target as Node)) {
                 setIsSessionListStatusOpen(false)
@@ -664,20 +576,18 @@ export default function SettingsPage() {
 
         document.addEventListener('mousedown', handleClickOutside)
         return () => document.removeEventListener('mousedown', handleClickOutside)
-    }, [isOpen, isAppearanceOpen, isFontOpen, isTerminalFontOpen, isChatOpen, isTerminalToolDisplayOpen, isSessionListStatusOpen, isVoiceOpen, isVoiceBackendOpen, isVoicePickerOpen])
+    }, [isOpen, isAppearanceOpen, isFontOpen, isChatOpen, isSessionListStatusOpen, isVoiceOpen, isVoiceBackendOpen, isVoicePickerOpen])
 
     // Close on escape key
     useEffect(() => {
-        if (!isOpen && !isAppearanceOpen && !isFontOpen && !isTerminalFontOpen && !isChatOpen && !isTerminalToolDisplayOpen && !isSessionListStatusOpen && !isVoiceOpen && !isVoiceBackendOpen && !isVoicePickerOpen) return
+        if (!isOpen && !isAppearanceOpen && !isFontOpen && !isChatOpen && !isSessionListStatusOpen && !isVoiceOpen && !isVoiceBackendOpen && !isVoicePickerOpen) return
 
         const handleEscape = (event: KeyboardEvent) => {
             if (event.key === 'Escape') {
                 setIsOpen(false)
                 setIsAppearanceOpen(false)
                 setIsFontOpen(false)
-                setIsTerminalFontOpen(false)
                 setIsChatOpen(false)
-                setIsTerminalToolDisplayOpen(false)
                 setIsSessionListStatusOpen(false)
                 setIsVoiceOpen(false)
                 setIsVoiceBackendOpen(false)
@@ -687,12 +597,12 @@ export default function SettingsPage() {
 
         document.addEventListener('keydown', handleEscape)
         return () => document.removeEventListener('keydown', handleEscape)
-    }, [isOpen, isAppearanceOpen, isFontOpen, isTerminalFontOpen, isChatOpen, isTerminalToolDisplayOpen, isSessionListStatusOpen, isVoiceOpen, isVoiceBackendOpen, isVoicePickerOpen])
+    }, [isOpen, isAppearanceOpen, isFontOpen, isChatOpen, isSessionListStatusOpen, isVoiceOpen, isVoiceBackendOpen, isVoicePickerOpen])
 
     return (
         <div className="flex h-full min-h-0 flex-col">
             <div className="bg-[var(--app-bg)] pt-[var(--app-safe-area-top)]">
-                <div className="mx-auto w-full max-w-content flex items-center gap-2 p-3 border-b border-[var(--app-border)]">
+                <div className={`mx-auto flex w-full items-center gap-2 border-b border-[var(--app-border)] p-3 ${isVoicePlugin ? 'max-w-[720px]' : 'max-w-content'}`}>
                     <button
                         type="button"
                         onClick={goBack}
@@ -700,12 +610,13 @@ export default function SettingsPage() {
                     >
                         <BackIcon />
                     </button>
-                    <div className="flex-1 font-semibold">{t('settings.title')}</div>
+                    <div className="flex-1 font-semibold">{isVoicePlugin ? t('settings.voice.title') : t('settings.title')}</div>
                 </div>
             </div>
 
             <div className="app-scroll-y flex-1 min-h-0">
-                <div className="mx-auto w-full max-w-content space-y-4 px-3 py-4">
+                    <div className={`mx-auto w-full space-y-4 px-3 py-4 ${isVoicePlugin ? 'max-w-[720px]' : 'max-w-content'}`}>
+                    {!isVoicePlugin ? <>
                     {/* Language section */}
                     <div className="relative rounded-xl border border-[var(--app-border)] bg-[var(--app-bg)] shadow-sm">
                         <div className="px-3 py-2 text-xs font-semibold text-[var(--app-hint)] uppercase tracking-wide">
@@ -820,7 +731,16 @@ export default function SettingsPage() {
                                 </div>
                             )}
                         </div>
-                        <ThemeColorControl t={t} />
+                        <button
+                            type="button"
+                            onClick={() => setIsAdvancedOpen((value) => !value)}
+                            className="flex min-h-11 w-full items-center justify-between border-t border-[var(--app-divider)] px-3 py-3 text-left text-[var(--app-fg)] transition-colors hover:bg-[var(--app-subtle-bg)]"
+                            aria-expanded={isAdvancedOpen}
+                        >
+                            <span>{t('settings.advanced.title')}</span>
+                            <ChevronDownIcon className={`text-[var(--app-hint)] transition-transform ${isAdvancedOpen ? 'rotate-180' : ''}`} />
+                        </button>
+                        {isAdvancedOpen ? <>
                         <div ref={fontContainerRef} className="relative">
                             <button
                                 type="button"
@@ -869,54 +789,6 @@ export default function SettingsPage() {
                                 </div>
                             )}
                         </div>
-                        <div ref={terminalFontContainerRef} className="relative">
-                            <button
-                                type="button"
-                                onClick={() => setIsTerminalFontOpen(!isTerminalFontOpen)}
-                                className="flex w-full items-center justify-between px-3 py-3 text-left transition-colors hover:bg-[var(--app-subtle-bg)]"
-                                aria-expanded={isTerminalFontOpen}
-                                aria-haspopup="listbox"
-                            >
-                                <span className="text-[var(--app-fg)]">{t('settings.display.terminalFontSize')}</span>
-                                <span className="flex items-center gap-1 text-[var(--app-hint)]">
-                                    <span>{currentTerminalFontSizeLabel}</span>
-                                    <ChevronDownIcon className={`transition-transform ${isTerminalFontOpen ? 'rotate-180' : ''}`} />
-                                </span>
-                            </button>
-
-                            {isTerminalFontOpen && (
-                                <div
-                                    className="absolute right-3 top-full mt-1 min-w-[140px] rounded-lg border border-[var(--app-border)] bg-[var(--app-bg)] shadow-lg overflow-hidden z-50"
-                                    role="listbox"
-                                    aria-label={t('settings.display.terminalFontSize')}
-                                >
-                                    {terminalFontSizeOptions.map((opt) => {
-                                        const isSelected = terminalFontSize === opt.value
-                                        return (
-                                            <button
-                                                key={opt.value}
-                                                type="button"
-                                                role="option"
-                                                aria-selected={isSelected}
-                                                onClick={() => handleTerminalFontSizeChange(opt.value)}
-                                                className={`flex items-center justify-between w-full px-3 py-2 text-base text-left transition-colors ${
-                                                    isSelected
-                                                        ? 'text-[var(--app-link)] bg-[var(--app-subtle-bg)]'
-                                                        : 'text-[var(--app-fg)] hover:bg-[var(--app-subtle-bg)]'
-                                                }`}
-                                            >
-                                                <span>{opt.label}</span>
-                                                {isSelected && (
-                                                    <span className="ml-2 text-[var(--app-link)]">
-                                                        <CheckIcon />
-                                                    </span>
-                                                )}
-                                            </button>
-                                        )
-                                    })}
-                                </div>
-                            )}
-                        </div>
                         <SessionPreviewLimitControl
                             label={t('settings.display.sessionPreviewLimit')}
                             value={sessionPreviewLimit}
@@ -924,6 +796,30 @@ export default function SettingsPage() {
                             decreaseLabel={t('settings.display.sessionPreviewLimit.decrease')}
                             increaseLabel={t('settings.display.sessionPreviewLimit.increase')}
                         />
+                        <KanbanRecentMinutesControl
+                            label={t('settings.display.kanbanRecentMinutes')}
+                            description={t('settings.display.kanbanRecentMinutes.desc')}
+                            unit={t('settings.display.kanbanRecentMinutes.unit')}
+                            value={kanbanRecentMinutes}
+                            onChange={setKanbanRecentMinutes}
+                        />
+                        <div className="flex items-center justify-between gap-3 px-3 py-3">
+                            <div className="flex min-w-0 flex-col">
+                                <span className="text-[var(--app-fg)]">{t('settings.display.kanbanRecentAutoRemove')}</span>
+                                <span className="text-xs text-[var(--app-hint)]">{t('settings.display.kanbanRecentAutoRemove.desc')}</span>
+                            </div>
+                            <label className="relative inline-flex h-5 w-9 shrink-0 items-center">
+                                <input
+                                    type="checkbox"
+                                    checked={kanbanRecentAutoRemove}
+                                    onChange={(event) => setKanbanRecentAutoRemove(event.target.checked)}
+                                    className="peer sr-only"
+                                    aria-label={t('settings.display.kanbanRecentAutoRemove')}
+                                />
+                                <span className="absolute inset-0 rounded-full bg-[var(--app-border)] transition-colors peer-checked:bg-[var(--app-link)]" />
+                                <span className="absolute left-0.5 h-4 w-4 rounded-full bg-[var(--app-bg)] transition-transform peer-checked:translate-x-4" />
+                            </label>
+                        </div>
                         <div className="flex items-center justify-between gap-3 px-3 py-3">
                             <div className="flex flex-col">
                                 <span className="text-[var(--app-fg)]">{t('settings.display.activeSessionsOnly')}</span>
@@ -994,9 +890,11 @@ export default function SettingsPage() {
                                 {t('settings.display.sessionListStatus.detailedDescription')}
                             </div>
                         ) : null}
+                        </> : null}
                     </div>
 
                     {/* Chat section */}
+                    {isAdvancedOpen ? (
                     <div className="relative rounded-xl border border-[var(--app-border)] bg-[var(--app-bg)] shadow-sm">
                         <div className="px-3 py-2 text-xs font-semibold text-[var(--app-hint)] uppercase tracking-wide">
                             {t('settings.chat.title')}
@@ -1049,76 +947,13 @@ export default function SettingsPage() {
                                 </div>
                             )}
                         </div>
-                        <div ref={terminalToolDisplayContainerRef} className="relative">
-                            <button
-                                type="button"
-                                onClick={() => setIsTerminalToolDisplayOpen(!isTerminalToolDisplayOpen)}
-                                className="flex w-full items-center justify-between px-3 py-3 text-left transition-colors hover:bg-[var(--app-subtle-bg)]"
-                                aria-expanded={isTerminalToolDisplayOpen}
-                                aria-haspopup="listbox"
-                            >
-                                <span className="text-[var(--app-fg)]">{t('settings.chat.terminalToolDisplay')}</span>
-                                <span className="flex items-center gap-1 text-[var(--app-hint)]">
-                                    <span>{t(currentTerminalToolDisplayModeLabel)}</span>
-                                    <ChevronDownIcon className={`transition-transform ${isTerminalToolDisplayOpen ? 'rotate-180' : ''}`} />
-                                </span>
-                            </button>
-
-                            {isTerminalToolDisplayOpen && (
-                                <div
-                                    className="absolute right-3 top-full mt-1 min-w-[230px] rounded-lg border border-[var(--app-border)] bg-[var(--app-bg)] shadow-lg overflow-hidden z-50"
-                                    role="listbox"
-                                    aria-label={t('settings.chat.terminalToolDisplay')}
-                                >
-                                    {terminalToolDisplayModeOptions.map((opt) => {
-                                        const isSelected = terminalToolDisplayMode === opt.value
-                                        return (
-                                            <button
-                                                key={opt.value}
-                                                type="button"
-                                                role="option"
-                                                aria-selected={isSelected}
-                                                onClick={() => handleTerminalToolDisplayModeChange(opt.value)}
-                                                className={`flex items-center justify-between w-full px-3 py-2 text-base text-left transition-colors ${
-                                                    isSelected
-                                                        ? 'text-[var(--app-link)] bg-[var(--app-subtle-bg)]'
-                                                        : 'text-[var(--app-fg)] hover:bg-[var(--app-subtle-bg)]'
-                                                }`}
-                                            >
-                                                <span>{t(opt.labelKey)}</span>
-                                                {isSelected && (
-                                                    <span className="ml-2 text-[var(--app-link)]">
-                                                        <CheckIcon />
-                                                    </span>
-                                                )}
-                                            </button>
-                                        )
-                                    })}
-                                </div>
-                            )}
-                        </div>
-                        <ChatSurfaceColorControl
-                            label={t('settings.chat.groupedToolBackground')}
-                            preference={toolGroupBackground}
-                            onPresetChange={(preset) => setToolGroupBackground(toPresetChatSurfaceColorPreference(preset))}
-                            onCustomChange={(value) => setToolGroupBackground(toCustomChatSurfaceColorPreference(value))}
-                            t={t}
-                        />
-                        <ChatSurfaceColorControl
-                            label={t('settings.chat.userMessageBackground')}
-                            preference={userMessageBackground}
-                            onPresetChange={(preset) => setUserMessageBackground(toPresetChatSurfaceColorPreference(preset))}
-                            onCustomChange={(value) => setUserMessageBackground(toCustomChatSurfaceColorPreference(value))}
-                            t={t}
-                        />
                     </div>
+                    ) : null}
+                    </> : null}
 
                     {/* Voice Assistant section */}
+                    {isVoicePlugin ? (
                     <div className="relative rounded-xl border border-[var(--app-border)] bg-[var(--app-bg)] shadow-sm">
-                        <div className="px-3 py-2 text-xs font-semibold text-[var(--app-hint)] uppercase tracking-wide">
-                            {t('settings.voice.title')}
-                        </div>
-
                         {/* ── Connection & provider ── */}
                         <div>
                             <div className="px-3 pb-1 pt-2 text-xs font-medium text-[var(--app-fg)]">
@@ -1281,8 +1116,10 @@ export default function SettingsPage() {
                             <VoiceDiagnosticsControls t={t} voiceBackend={voiceBackend} />
                         </div>
                     </div>
+                    ) : null}
 
                     {/* About section */}
+                    {!isVoicePlugin ? (
                     <div className="relative rounded-xl border border-[var(--app-border)] bg-[var(--app-bg)] shadow-sm">
                         <div className="px-3 py-2 text-xs font-semibold text-[var(--app-hint)] uppercase tracking-wide">
                             {t('settings.about.title')}
@@ -1318,8 +1155,13 @@ export default function SettingsPage() {
                             <span className="text-[var(--app-hint)]">{PROTOCOL_VERSION}</span>
                         </div>
                     </div>
+                    ) : null}
                 </div>
             </div>
         </div>
     )
+}
+
+export default function SettingsPage() {
+    return <SettingsPageContent />
 }

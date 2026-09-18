@@ -4,7 +4,12 @@ import { createCliOutputBlock, isCliOutputText, mergeCliOutputBlocks } from '@/c
 import { parseMessageAsEvent } from '@/chat/reducerEvents'
 import { collectTitleChanges, ensureToolBlock, extractTitleFromChangeTitleInput, isChangeTitleToolName, type PermissionEntry } from '@/chat/reducerTools'
 import { isSubagentToolName } from '@/chat/subagentTool'
-import { asString, isObject } from '@hapi/protocol'
+import {
+    asString,
+    extractCodexFailureMessage,
+    isObject,
+    selectPreferredCodexFailureMessage,
+} from '@hapi/protocol'
 
 function getEventString(event: Record<string, unknown>, key: string): string | null {
     return asString(event[key])
@@ -102,10 +107,12 @@ function getAgentRunDisplayPatch(event: Record<string, unknown>): Record<string,
     const summary = getEventString(event, 'summary')
     const activity = getEventString(event, 'activity')
     const activityKind = getEventString(event, 'activityKind') ?? getEventString(event, 'activity_kind')
+    const hapiSubagentConfig = isObject(event.hapiSubagentConfig) ? event.hapiSubagentConfig : null
 
     if (summary) patch.summary = summary
     if (activity) patch.activity = activity
     if (activityKind) patch.activityKind = activityKind
+    if (hapiSubagentConfig) patch.hapiSubagentConfig = hapiSubagentConfig
 
     return patch
 }
@@ -293,6 +300,8 @@ export function reduceTimeline(
     const textBlocksByStreamId = new Map<string, AgentTextBlock>()
     const reasoningBlocksByStreamId = new Map<string, AgentReasoningBlock>()
     let hasReadyEvent = false
+    let pendingCodexTurnUsage: TracedMessage['usage']
+    let codexUsageTarget: AgentTextBlock | null = null
 
     const ensureAgentRunBlock = (
         cardId: string,
@@ -340,11 +349,21 @@ export function reduceTimeline(
 
     const patchAgentRunInput = (block: ToolCallBlock, patch: Record<string, unknown>): void => {
         const current = isObject(block.tool.input) ? block.tool.input : {}
+        const currentHapiSubagentConfig = isObject(current.hapiSubagentConfig) ? current.hapiSubagentConfig : null
+        const nextHapiSubagentConfig = isObject(patch.hapiSubagentConfig) ? patch.hapiSubagentConfig : null
         block.tool = {
             ...block.tool,
             input: {
                 ...current,
-                ...patch
+                ...patch,
+                ...(currentHapiSubagentConfig || nextHapiSubagentConfig
+                    ? {
+                        hapiSubagentConfig: {
+                            ...(currentHapiSubagentConfig ?? {}),
+                            ...(nextHapiSubagentConfig ?? {})
+                        }
+                    }
+                    : {})
             }
         }
     }
@@ -456,6 +475,10 @@ export function reduceTimeline(
                 continue
             }
             if (msg.content.type === 'token-count') {
+                if (msg.usage) {
+                    pendingCodexTurnUsage = msg.usage
+                    if (codexUsageTarget) codexUsageTarget.usage = msg.usage
+                }
                 continue
             }
             if (msg.content.type === 'turn-duration') {
@@ -572,11 +595,23 @@ export function reduceTimeline(
                     ) {
                         continue
                     }
+                    const incomingFailure = nextState === 'error'
+                        ? extractCodexFailureMessage([event.error, event.message, event.result])
+                        : null
+                    const preferredFailure = nextState === 'error'
+                        ? selectPreferredCodexFailureMessage(
+                            block.tool.state === 'error' ? extractCodexFailureMessage(block.tool.result) : null,
+                            incomingFailure
+                        )
+                        : null
+                    const displayEvent = preferredFailure && preferredFailure !== incomingFailure
+                        ? { ...event, error: preferredFailure, activity: `Failed: ${preferredFailure}` }
+                        : event
                     patchAgentRunInput(block, {
                         agentId,
                         agentStatus: status,
                         statusText: getEventString(event, 'statusText') ?? getEventString(event, 'status_text') ?? status,
-                        ...getAgentRunDisplayPatch(event)
+                        ...getAgentRunDisplayPatch(displayEvent)
                     })
                     block.tool = { ...block.tool, state: nextState }
                     if (nextState === 'running') {
@@ -589,7 +624,7 @@ export function reduceTimeline(
                     if ('result' in event) {
                         block.tool = { ...block.tool, result: event.result }
                     } else if ('error' in event) {
-                        block.tool = { ...block.tool, result: event.error }
+                        block.tool = { ...block.tool, result: preferredFailure ?? event.error }
                     } else if ('spawnResult' in event) {
                         block.tool = { ...block.tool, result: event.spawnResult }
                     }
@@ -659,6 +694,8 @@ export function reduceTimeline(
         }
 
         if (msg.role === 'user') {
+            pendingCodexTurnUsage = undefined
+            codexUsageTarget = null
             if (isCliOutputText(msg.content.text, msg.meta)) {
                 blocks.push(createCliOutputBlock({
                     id: msg.id,
@@ -747,11 +784,12 @@ export function reduceTimeline(
                         const existing = textBlocksByStreamId.get(streamId)
                         if (existing) {
                             existing.text = c.text
-                            existing.usage = msg.usage
+                            existing.usage = msg.usage ?? pendingCodexTurnUsage
                             existing.model = msg.model
                             existing.meta = msg.meta
                             existing.invokedAt = msg.invokedAt
                             if (c.final === true) existing.final = true
+                            codexUsageTarget = existing
                             continue
                         }
                     }
@@ -762,7 +800,7 @@ export function reduceTimeline(
                         localId: msg.localId,
                         createdAt: msg.createdAt,
                         invokedAt: msg.invokedAt,
-                        usage: msg.usage,
+                        usage: msg.usage ?? pendingCodexTurnUsage,
                         model: msg.model,
                         text: c.text,
                         streamId,
@@ -770,6 +808,10 @@ export function reduceTimeline(
                         meta: msg.meta
                     }
                     blocks.push(block)
+                    if (pendingCodexTurnUsage) {
+                        if (codexUsageTarget && codexUsageTarget !== block) codexUsageTarget.usage = undefined
+                    }
+                    codexUsageTarget = block
                     if (streamId) {
                         textBlocksByStreamId.set(streamId, block)
                     }

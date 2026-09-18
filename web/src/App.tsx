@@ -2,9 +2,7 @@ import { Suspense, useCallback, useEffect, useMemo, useRef, useState, type React
 import { Outlet, useLocation, useMatchRoute, useRouter } from '@tanstack/react-router'
 import { useQueryClient } from '@tanstack/react-query'
 import { getTelegramWebApp, isTelegramApp } from '@/hooks/useTelegram'
-import { initializeChatSurfaceColors } from '@/hooks/useChatSurfaceColors'
 import { initializeTheme } from '@/hooks/useTheme'
-import { initializeThemeColors } from '@/hooks/useThemeColors'
 import { useAuth } from '@/hooks/useAuth'
 import { useAuthSource } from '@/hooks/useAuthSource'
 import { useServerUrl } from '@/hooks/useServerUrl'
@@ -44,6 +42,7 @@ import { ToastContainer } from '@/components/ToastContainer'
 import { PwaUpdateProvider } from '@/lib/pwa-update-context'
 import { ToastProvider, type ToastKind, useToast } from '@/lib/toast-context'
 import type { SyncEvent } from '@/types/api'
+import RunnerInstallPage from '@/routes/install'
 
 type ToastEvent = Extract<SyncEvent, { type: 'toast' }>
 
@@ -72,7 +71,7 @@ export function App() {
 function AppInner() {
     const { t } = useTranslation()
     const { serverUrl, baseUrl, setServerUrl, clearServerUrl } = useServerUrl()
-    const { authSource, isLoading: isAuthSourceLoading, setAccessToken } = useAuthSource(baseUrl)
+    const { authSource, isLoading: isAuthSourceLoading, setAccessToken, setCookieSession } = useAuthSource(baseUrl)
     const { token, api, isLoading: isAuthLoading, error: authError, needsBinding, bind } = useAuth(authSource, baseUrl)
     const goBack = useAppGoBack()
     const pathname = useLocation({ select: (location) => location.pathname })
@@ -85,8 +84,6 @@ function AppInner() {
         tg?.ready()
         tg?.expand()
         initializeTheme()
-        initializeThemeColors()
-        initializeChatSurfaceColors()
     }, [])
 
     // Native capture runs before React's synthetic click handlers. Mark the
@@ -346,6 +343,10 @@ function AppInner() {
                 return
             }
             const invalidations = [
+                queryClient.invalidateQueries({ queryKey: ['session-groups'] }),
+                queryClient.invalidateQueries({ queryKey: ['session-labels'] }),
+                queryClient.invalidateQueries({ queryKey: ['session-pins'] }),
+                queryClient.invalidateQueries({ queryKey: ['kanban-order'] }),
                 queryClient.invalidateQueries({ queryKey: queryKeys.sessions }),
                 // Invalidate ALL cached session-detail entries on reconnect, not just
                 // the selected one.  With `SESSION_DETAIL_STALE_TIME_MS` extending the
@@ -676,6 +677,9 @@ function AppInner() {
         enabled: sseEnabled && Boolean(sessionEventSubscription)
     })
 
+    // Installation instructions are intentionally public; pairing approval remains authenticated.
+    if (pathname === '/install') return withPwaBanner(<RunnerInstallPage />)
+
     // Loading auth source
     if (isAuthSourceLoading) {
         return withPwaBanner(
@@ -690,6 +694,7 @@ function AppInner() {
         return withPwaBanner(
             <LoginPrompt
                 onLogin={setAccessToken}
+                onCookieLogin={setCookieSession}
                 baseUrl={baseUrl}
                 serverUrl={serverUrl}
                 setServerUrl={setServerUrl}
@@ -730,6 +735,7 @@ function AppInner() {
             return withPwaBanner(
                 <LoginPrompt
                     onLogin={setAccessToken}
+                    onCookieLogin={setCookieSession}
                     baseUrl={baseUrl}
                     serverUrl={serverUrl}
                     setServerUrl={setServerUrl}
@@ -762,7 +768,7 @@ function AppInner() {
                         <PwaUpdateBanner />
                         <VoiceErrorBanner offsetFromTitleBar={Boolean(selectedSessionId)} />
                         <OfflineBanner offsetFromTitleBar={Boolean(selectedSessionId)} />
-                        <div className="h-full min-h-0 flex flex-col">
+                        <div className="h-full min-h-0 flex flex-col" data-drawer-page-background>
                             <Suspense fallback={
                                 <div className="flex flex-1 items-center justify-center p-4">
                                     <LoadingState label={t('loading.session')} className="text-sm" />

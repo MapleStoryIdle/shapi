@@ -2,7 +2,8 @@ import { describe, expect, it } from 'vitest'
 import type { AgentReasoningBlock, AgentTextBlock, ToolCallBlock, UserTextBlock } from '@/chat/types'
 import {
     buildIncrementalSessionDetailTimeline,
-    buildSessionDetailTimeline
+    buildSessionDetailTimeline,
+    hasCurrentTurnProcess
 } from './sessionDetailTimeline'
 
 function userBlock(): UserTextBlock {
@@ -58,6 +59,46 @@ function reasoningBlock(id: string, createdAt: number, text: string): AgentReaso
 }
 
 describe('buildSessionDetailTimeline', () => {
+    it('preserves earlier reasoning across an answered-question boundary while the next step runs', () => {
+        const question = toolBlock()
+        question.id = 'question'
+        question.tool = {
+            ...question.tool,
+            id: 'question',
+            name: 'request_user_input',
+            input: { questions: [{ id: 'direction', question: 'Continue?', options: [{ label: 'Yes' }] }] },
+            permission: { id: 'question', status: 'approved', answers: { direction: { answers: ['Yes'] } } }
+        }
+        const { visible } = buildSessionDetailTimeline([
+            userBlock(), reasoningBlock('earlier-reasoning', 2, 'Inspecting'), toolBlock(), question,
+            reasoningBlock('current-reasoning', 4, 'Verifying'), { ...toolBlock(), id: 'tool-2' }
+        ], { hasMoreMessages: false, runActive: true, aggregateActiveProcess: true })
+
+        expect(visible.map((block) => block.kind)).toEqual(['user-text', 'tool-group', 'question-answer', 'tool-group'])
+        expect(visible.flatMap((block) => block.kind === 'tool-group' ? block.detailBlocks ?? [] : [])
+            .filter((block) => block.kind === 'agent-reasoning').map((block) => block.id))
+            .toEqual(['earlier-reasoning', 'current-reasoning'])
+    })
+
+    it.each([false, true])('folds historical reasoning when active=%s and the page ends in a tool', (runActive) => {
+        const blocks = [
+            userBlock(), toolBlock(), reasoningBlock('reasoning-history', 3, 'Checking'),
+            agentBlock(), { ...toolBlock(), id: 'tool-history-end' },
+            { ...userBlock(), id: 'next-user', createdAt: 5 },
+            { ...toolBlock(), id: 'tool-current', createdAt: 6 },
+            reasoningBlock('reasoning-current', 7, 'Verifying')
+        ]
+        const { visible } = buildSessionDetailTimeline(blocks, {
+            hasMoreMessages: true, runActive, aggregateActiveProcess: true
+        })
+        expect(visible.some((block) => block.kind === 'agent-reasoning')).toBe(false)
+        expect(visible.some((block) => block.id === 'agent-1')).toBe(true)
+        const details = visible.flatMap((block) => block.kind === 'tool-group' ? block.detailBlocks ?? [] : [])
+        expect(details.filter((block) => block.kind === 'agent-reasoning').map((block) => block.id)).toEqual([
+            'reasoning-history', 'reasoning-current'
+        ])
+    })
+
     it('uses the same compact result grouping policy for either detail source', () => {
         const blocks = [userBlock(), toolBlock(), agentBlock()]
         const hapi = buildSessionDetailTimeline(blocks, { hasMoreMessages: false })
@@ -68,6 +109,36 @@ describe('buildSessionDetailTimeline', () => {
         expect(native.visible[0]?.kind).toBe('user-text')
         expect(native.visible[1]?.kind).toBe('tool-group')
         expect(native.visible[2]?.kind).toBe('agent-text')
+    })
+
+    it('only treats a process in the latest user turn as current', () => {
+        const secondUser: UserTextBlock = {
+            ...userBlock(),
+            id: 'user-2',
+            createdAt: 5,
+            text: 'Continue'
+        }
+        const currentTool: ToolCallBlock = {
+            ...toolBlock(),
+            id: 'tool-2',
+            createdAt: 6,
+            invokedAt: 6,
+            tool: {
+                ...toolBlock().tool,
+                id: 'tool-2',
+                createdAt: 6,
+                startedAt: 6
+            }
+        }
+        const beforeCurrentProcess = buildSessionDetailTimeline([
+            userBlock(), toolBlock(), agentBlock(), secondUser
+        ], { hasMoreMessages: false, runActive: true })
+        const withCurrentProcess = buildSessionDetailTimeline([
+            userBlock(), toolBlock(), agentBlock(), secondUser, currentTool
+        ], { hasMoreMessages: false, runActive: true })
+
+        expect(hasCurrentTurnProcess(beforeCurrentProcess.grouped, { minCreatedAt: secondUser.createdAt })).toBe(false)
+        expect(hasCurrentTurnProcess(withCurrentProcess.grouped, { minCreatedAt: secondUser.createdAt })).toBe(true)
     })
 
     it('keeps the current turn expanded while it is running', () => {
@@ -107,6 +178,94 @@ describe('buildSessionDetailTimeline', () => {
                 { id: 'tool-1' },
                 { id: 'reasoning-2' }
             ]
+        })
+    })
+
+    it('aggregates an active native turn into one process row', () => {
+        const secondTool: ToolCallBlock = {
+            ...toolBlock(),
+            id: 'tool-2',
+            createdAt: 5,
+            tool: {
+                ...toolBlock().tool,
+                id: 'tool-2',
+                createdAt: 5,
+                startedAt: 5,
+                completedAt: 6
+            }
+        }
+        const timeline = buildSessionDetailTimeline([
+            userBlock(),
+            toolBlock(),
+            reasoningBlock('reasoning-1', 3, 'Inspecting'),
+            { ...agentBlock(), id: 'process-1', text: 'Checking the first result' },
+            secondTool,
+            reasoningBlock('reasoning-2', 7, 'Verifying')
+        ], {
+            hasMoreMessages: false,
+            runActive: true,
+            aggregateActiveProcess: true
+        })
+
+        expect(timeline.visible.map((block) => block.id)).toEqual([
+            'user-1',
+            'tool-group:active-process:tool-1'
+        ])
+        expect(timeline.visible[1]).toMatchObject({
+            kind: 'tool-group',
+            turnActive: true,
+            tools: [{ id: 'tool-1' }, { id: 'tool-2' }],
+            detailBlocks: [
+                { id: 'tool-1' },
+                { id: 'process-1' },
+                { id: 'tool-2' },
+                { id: 'reasoning-2' }
+            ]
+        })
+    })
+
+    it('does not merge completed history into an active turn while its user row is still arriving', () => {
+        const historicalTool = toolBlock()
+        const historicalResult = agentBlock()
+        const activeTool: ToolCallBlock = {
+            ...toolBlock(),
+            id: 'tool-current',
+            createdAt: 11,
+            tool: {
+                ...toolBlock().tool,
+                id: 'tool-current',
+                state: 'running',
+                createdAt: 11,
+                startedAt: 11,
+                completedAt: null,
+                result: undefined
+            }
+        }
+
+        const timeline = buildSessionDetailTimeline([
+            userBlock(),
+            historicalTool,
+            historicalResult,
+            activeTool
+        ], {
+            hasMoreMessages: false,
+            runActive: true,
+            aggregateActiveProcess: true,
+            activeTurnStartedAt: 10
+        })
+
+        expect(timeline.visible.map((block) => block.id)).toEqual([
+            'user-1',
+            'tool-group:result-details:tool-group:tool-1',
+            'agent-1',
+            'tool-group:active-process:tool-current'
+        ])
+        expect(timeline.visible[1]).toMatchObject({ kind: 'tool-group' })
+        expect(timeline.visible[1]).not.toHaveProperty('turnActive')
+        expect(timeline.visible[3]).toMatchObject({
+            kind: 'tool-group',
+            turnActive: true,
+            tools: [{ id: 'tool-current' }]
         })
     })
 

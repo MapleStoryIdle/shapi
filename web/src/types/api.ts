@@ -28,6 +28,12 @@ export type {
     OpenVikingContextListResponse,
     OpenVikingContextReadResponse,
     OpenVikingStatusResponse,
+    OpenVikingMetricsResponse,
+    OpenVikingQualityIssue,
+    OpenVikingQualityResponse,
+    OpenVikingSearchHit,
+    OpenVikingSearchRequest,
+    OpenVikingSearchResponse,
     MachineDirectoryEntry,
     MachineListDirectoryResponse,
     MachinePathsExistsResponse,
@@ -107,6 +113,14 @@ export type SessionMetadataSummary = {
 
 export type MessageStatus = 'queued' | 'sending' | 'sent' | 'failed'
 
+export type CodexControlRecoveryResponse = {
+    success: true
+    status: 'pending' | 'ready' | 'unconfirmed'
+    recoveryRequestId: string
+    sessionId?: string
+    error?: string
+} | { success: false; code?: string; error: string }
+
 export type DecryptedMessage = ProtocolDecryptedMessage & {
     status?: MessageStatus
     originalText?: string
@@ -148,7 +162,8 @@ export type GitStatusFiles = {
 export type SkillSummary = {
     name: string
     description?: string
-    scope?: 'project' | 'user' | 'plugin' | 'system' | 'admin'
+    descriptions?: Partial<Record<'en' | 'zh-CN', string>>
+    scope?: 'hub' | 'project' | 'user' | 'plugin' | 'system' | 'admin'
 }
 
 export type SkillsResponse = {
@@ -204,13 +219,20 @@ export type CodexLocalSessionSummary = {
     model?: string | null
     modelReasoningEffort?: string | null
     runState?: CodexLocalSessionRunState
+    runStartedAt?: number
     waitingForUserInput?: boolean
+    /** Explicit false from current runners clears a stale SSH ownership lock. */
+    controlledByCodexSsh?: boolean
+    /** Canonical SHAPI session that owns this native thread on the selected machine. */
+    managedSessionId?: string | null
 }
 
 export type CodexLocalSessionsResponse = {
     success: true
     sessions: CodexLocalSessionSummary[]
 }
+
+export type { CodexManagedSessionTargetResponse } from '@hapi/protocol/schemas'
 
 export type CodexLocalSessionContextMessage = {
     id: string
@@ -224,10 +246,38 @@ export type CodexLocalSessionContextMessage = {
     }
 }
 
+/** Direct native child thread rendered through the shared CodexAgent card. */
+export type CodexLocalSessionSubagent = {
+    id: string
+    parentSessionId: string
+    name?: string | null
+    role?: string | null
+    agentPath?: string | null
+    model?: string | null
+    modelReasoningEffort?: string | null
+    status: 'running' | 'completed' | 'failed' | 'canceled' | 'unknown'
+    statusText?: string | null
+    startedAt: number
+    updatedAt: number
+    completedAt?: number
+    traceMessages: Array<{
+        createdAt?: number
+        role: 'agent'
+        content: {
+            type: 'codex'
+            data: unknown
+        }
+        meta?: unknown
+    }>
+}
+
 export type CodexLocalSessionContextResponse = {
+    modelProvider?: string | null
+    tokenUsage?: import('@hapi/protocol/codexUsage').CodexTokenUsage | null
     success: true
-    session: Pick<CodexLocalSessionSummary, 'id' | 'title' | 'cwd' | 'modifiedAt' | 'model' | 'modelReasoningEffort'>
+    session: Pick<CodexLocalSessionSummary, 'id' | 'title' | 'cwd' | 'modifiedAt' | 'model' | 'modelReasoningEffort' | 'controlledByCodexSsh'>
     messages: CodexLocalSessionContextMessage[]
+    subagents?: CodexLocalSessionSubagent[]
     page: {
         limit: number
         nextBefore: number | null
@@ -261,6 +311,7 @@ export type CodexLocalSessionDirectSendProgress = {
     phase: CodexLocalSessionDirectSendPhase
     startedAt: number
     phaseStartedAt: number
+    history?: Array<{ phase: CodexLocalSessionDirectSendPhase; startedAt: number }>
     transport: 'app-server' | 'exec-resume'
     attempt?: number
 }
@@ -270,14 +321,21 @@ export type CodexLocalSessionDirectSendRecoveryReason =
     | 'session_status_unknown'
     | 'launch_failed'
     | 'runner_restarted'
+    | 'review_guard_failed'
     | 'external_writer_active'
 
 export type CodexLocalSessionStatusResponse =
     | {
         success: true
         status: CodexLocalSessionRunState
+        controls?: import('@hapi/protocol/codexSessionControl').NativeCodexSessionControls
         activeTurnId?: string
+        activeClientMessageId?: string
+        deliveryReceipts?: Array<{ id: string; state: 'accepted' | 'delivered' }>
         waitingForUserInput?: boolean
+        pendingUserInput?: import('@hapi/protocol/codexSessionControl').NativeCodexUserInput
+        /** Current runners always include true or false. */
+        controlledByCodexSsh?: boolean
         stalledSince?: number
         startedAt?: number
         progress?: CodexLocalSessionDirectSendProgress
@@ -341,7 +399,7 @@ export type CodexLocalSessionRealtimeSnapshot = {
     status: Omit<Extract<CodexLocalSessionStatusResponse, { success: true }>, 'queuedMessages'> & {
         queuedMessageRefs?: Array<Pick<
             CodexLocalSessionQueuedMessage,
-            'id' | 'recoveryRequired' | 'recoveryReason'
+            'id' | 'recoveryRequired' | 'recoveryReason' | 'cancelBlocked'
         >>
     }
     timing: {
@@ -354,6 +412,7 @@ export type SendCodexLocalSessionMessageResponse =
     | {
         success: true
         status: 'processing' | 'queued'
+        managedSessionId?: string
         startedAt?: number
         progress?: CodexLocalSessionDirectSendProgress
         queuedAt?: number
@@ -371,6 +430,8 @@ export type DiscardCodexLocalSessionMessageResponse =
     | {
         success: true
         discarded: boolean
+        /** The receipt may still belong to an active native Codex turn. */
+        active?: boolean
         queuedMessages: CodexLocalSessionQueuedMessage[]
     }
     | {
@@ -388,6 +449,7 @@ export type ArchiveCodexLocalSessionResponse =
     }
 
 export type CodexLocalSessionQueuedMessage = {
+    cancelBlocked?: boolean
     id: string
     text: string
     queuedAt: number

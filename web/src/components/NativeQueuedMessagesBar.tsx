@@ -1,21 +1,32 @@
 import * as React from 'react'
-import * as Dialog from '@radix-ui/react-dialog'
-import { X } from 'lucide-react'
+import { BottomDrawer } from '@/components/ui/BottomDrawer'
+import { Loader2, Play, X } from 'lucide-react'
 import type { CodexLocalSessionQueuedMessage } from '@/types/api'
 import { useTranslation } from '@/lib/use-translation'
-import { QueueIcon, SessionDetailQueueTrigger } from '@/components/SessionDetailQueueTrigger'
+import { SessionDetailQueueTrigger } from '@/components/SessionDetailQueueTrigger'
+import { formatUserMessageForDisplay } from '@/chat/questionAnswers'
 
 /**
  * Queue affordance for an original native Codex thread.
  *
  * Native prompts are not SHAPI messages, so they intentionally do not use the
  * SHAPI queued-message mutation (there is no SHAPI session row to cancel). The
- * runner owns delivery; this component only exposes a truthful read-only view
- * of the FIFO waiting list returned by the native status endpoint.
+ * runner owns delivery and authoritatively decides whether a queued receipt
+ * can be cancelled. The drawer forwards cancellation through its parent.
  */
 export function NativeQueuedMessagesBar(props: {
     messages: readonly CodexLocalSessionQueuedMessage[]
     onExpandedChange?: (expanded: boolean) => void
+    paused?: boolean
+    resuming?: boolean
+    resumeDisabled?: boolean
+    onResume?: () => void
+    onCancel?: (message: CodexLocalSessionQueuedMessage) => void
+    cancelling?: boolean
+    onRetry?: () => void
+    retryMessageId?: string
+    retryDisabled?: boolean
+    retrying?: boolean
 }) {
     const { t } = useTranslation()
     const [open, setOpen] = React.useState(false)
@@ -26,65 +37,46 @@ export function NativeQueuedMessagesBar(props: {
     }, [open, props.onExpandedChange])
 
     React.useEffect(() => {
-        if (props.messages.length === 0) {
+        if (props.messages.length === 0 && !props.paused) {
             setOpen(false)
         }
-    }, [props.messages.length])
-
-    if (props.messages.length === 0) {
-        return null
-    }
+    }, [props.messages.length, props.paused])
 
     // Match the SHAPI queue entry: show the first pending prompt as the quick
     // preview, while the drawer remains the place for the complete list.
-    const preview = props.messages[0]?.text.trim() || t('queuedMessages.emptyPreview')
+    const preview = props.messages[0]
+        ? formatUserMessageForDisplay(props.messages[0].text).trim()
+        : t(props.paused ? 'recentCodex.control.queuePaused' : 'queuedMessages.emptyPreview')
 
     return (
-        <Dialog.Root open={open} onOpenChange={setOpen}>
-            <div className="pointer-events-none mx-auto flex w-full max-w-content justify-center px-3" data-testid="native-queued-messages-accessory">
-                <Dialog.Trigger asChild>
+        <>
+            {props.messages.length > 0 || props.paused ? <div className="pointer-events-none mx-auto flex w-full max-w-content justify-center px-3" data-testid="native-queued-messages-accessory">
+
                     <SessionDetailQueueTrigger
                         testId="native-queued-messages-trigger"
                         label={t('queuedMessages.open', { count: props.messages.length })}
-                        statusLabel={t('queuedMessages.label')}
+                        statusLabel={t(props.paused ? 'recentCodex.control.paused' : 'queuedMessages.label')}
                         preview={preview}
                         count={props.messages.length}
                         open={open}
+                        onClick={() => setOpen(true)}
                     />
-                </Dialog.Trigger>
-            </div>
 
-            <Dialog.Portal>
-                <Dialog.Overlay className="fixed inset-0 z-[60] bg-slate-950/25" />
-                <Dialog.Content
-                    data-testid="native-queued-messages-drawer"
-                    className="fixed inset-x-0 bottom-0 z-[61] flex max-h-[min(72dvh,38rem)] flex-col overflow-hidden rounded-t-[28px] border-x border-t border-[var(--app-border)] bg-[var(--app-bg)] pb-[max(var(--app-safe-area-bottom),0.75rem)] shadow-[0_-18px_48px_rgba(15,23,42,0.2)] animate-slide-up outline-none motion-reduce:animate-none"
-                >
-                    <div className="mx-auto mt-2 h-1 w-10 shrink-0 rounded-full bg-[var(--app-border)]" aria-hidden="true" />
-                    <div className="flex shrink-0 items-start gap-3 px-5 pb-3 pt-4">
-                        <div className="min-w-0 flex-1">
-                            <div className="flex items-center gap-2">
-                                <QueueIcon className="h-4 w-4 shrink-0 text-[var(--app-hint)]" />
-                                <Dialog.Title className="text-base font-bold text-[var(--app-fg)]">
-                                    {t('queuedMessages.drawerTitle')}
-                                </Dialog.Title>
-                                <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-[var(--app-subtle-bg)] px-1.5 text-[11px] font-bold tabular-nums text-[var(--app-hint)]">
-                                    {props.messages.length}
-                                </span>
-                            </div>
-                            <Dialog.Description className="mt-0.5 text-xs leading-5 text-[var(--app-hint)]">
-                                {t('recentCodex.queue.drawerDescription')}
-                            </Dialog.Description>
-                        </div>
-                        <Dialog.Close
-                            type="button"
-                            aria-label={t('button.close')}
-                            className="touch-manipulation -mr-2 -mt-1 flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-[var(--app-hint)] transition-colors hover:bg-[var(--app-subtle-bg)] hover:text-[var(--app-fg)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--app-link)]"
-                        >
-                            <X className="h-4 w-4" aria-hidden="true" />
-                        </Dialog.Close>
-                    </div>
-                    <ol className="min-h-0 flex-1 divide-y divide-[var(--app-divider)] overflow-y-auto overscroll-contain px-5 pb-2 [scrollbar-width:thin]">
+            </div> : null}
+
+            <BottomDrawer open={open && (props.messages.length > 0 || props.paused === true)} onOpenChange={setOpen}
+                title={t('queuedMessages.drawerTitle')}
+                subtitle={t(props.paused ? 'recentCodex.control.paused' : 'recentCodex.queue.drawerDescription')}
+                testId="native-queued-messages-drawer"
+                accessory={props.paused && props.onResume ? <div className="flex justify-end px-5 pb-2">
+                    <button type="button" aria-label={t('recentCodex.control.resumeQueue')}
+                        disabled={props.resuming || props.resumeDisabled} onClick={props.onResume}
+                        className="flex h-11 w-11 items-center justify-center text-[var(--app-link)] disabled:opacity-40">
+                        {props.resuming ? <Loader2 className="h-5 w-5 animate-spin motion-reduce:animate-none" aria-hidden="true" /> : <Play className="h-5 w-5" aria-hidden="true" />}
+                    </button>
+                </div> : null}
+            >
+                    <ol className="divide-y divide-[var(--app-divider)] pb-2">
                         {props.messages.map((message, index) => (
                             <li
                                 key={message.id}
@@ -96,20 +88,41 @@ export function NativeQueuedMessagesBar(props: {
                                     </span>
                                     <div className="min-w-0 flex-1">
                                         <p className="line-clamp-2 whitespace-pre-wrap break-words text-sm leading-5 text-[var(--app-fg)]">
-                                            {message.text}
+                                            {formatUserMessageForDisplay(message.text)}
                                         </p>
                                         {message.recoveryRequired ? (
-                                            <span className="mt-1.5 inline-flex items-center rounded-full bg-[color-mix(in_srgb,#f59e0b_12%,transparent)] px-2 py-0.5 text-[11px] font-semibold text-amber-700 dark:text-amber-400">
-                                                {t('recentCodex.queue.recoveryRequired')}
-                                            </span>
+                                            <div className="mt-1.5 text-xs text-[var(--app-hint)]">
+                                                <p>{t(message.recoveryReason === 'review_guard_failed'
+                                                    ? 'recentCodex.queue.reviewBlocked'
+                                                    : message.recoveryReason === 'launch_failed'
+                                                        ? 'recentCodex.queue.launchFailed'
+                                                        : 'recentCodex.queue.recoveryRequired')}</p>
+                                                {props.onRetry ? <button type="button"
+                                                    disabled={props.retryDisabled || props.retrying || props.retryMessageId !== message.id}
+                                                    onClick={props.onRetry}
+                                                    className="min-h-11 text-[var(--app-link)] disabled:opacity-40">
+                                                    {t(props.retrying && props.retryMessageId === message.id
+                                                        ? 'recentCodex.direct.recovery.pending'
+                                                        : message.recoveryReason === 'review_guard_failed' || message.recoveryReason === 'launch_failed'
+                                                            ? 'recentCodex.direct.recovery.retry'
+                                                            : 'recentCodex.direct.receipt.resend')}
+                                                </button> : null}
+                                                {props.retryDisabled || props.retryMessageId !== message.id ? <p>{t('recentCodex.queue.retryWhenIdle')}</p> : null}
+                                            </div>
                                         ) : null}
                                     </div>
+                                    {props.onCancel ? <button type="button"
+                                        aria-label={t('queuedMessages.cancel')}
+                                        disabled={props.cancelling}
+                                        onClick={() => props.onCancel?.(message)}
+                                        className="flex h-11 w-11 shrink-0 items-center justify-center text-[var(--app-hint)] disabled:opacity-40">
+                                        <X className="h-5 w-5" aria-hidden="true" />
+                                    </button> : null}
                                 </div>
                             </li>
                         ))}
                     </ol>
-                </Dialog.Content>
-            </Dialog.Portal>
-        </Dialog.Root>
+            </BottomDrawer>
+        </>
     )
 }

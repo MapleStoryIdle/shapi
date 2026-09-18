@@ -10,30 +10,41 @@ import { buildGeminiLiveSetupMessage, QWEN_REALTIME_MODEL } from '@hapi/protocol
 import { createQwenProxyWebSocketHandler } from './qwenProxyHandler'
 import { decodeVoiceSystemPromptParam } from '../voiceSystemPromptParam'
 import type { SyncEngine } from '../sync/syncEngine'
-import { createAuthMiddleware, type WebAppEnv } from './middleware/auth'
+import { createAuthMiddleware, DEVELOPMENT_WEB_SESSION_COOKIE, SECURE_WEB_SESSION_COOKIE, verifyWorkspaceJwt, WEB_SESSION_IDLE_TTL_MS, type WebAppEnv } from './middleware/auth'
 import { createAuthRoutes } from './routes/auth'
+import { createAuthV2ProtectedRoutes, createAuthV2PublicRoutes } from './routes/authV2'
 import { createBindRoutes } from './routes/bind'
 import { createEventsRoutes } from './routes/events'
 import { createSessionsRoutes } from './routes/sessions'
 import { createMessagesRoutes } from './routes/messages'
+import { createManagedSkillsRoutes } from './routes/managedSkills'
 import { createPermissionsRoutes } from './routes/permissions'
 import { createMachinesRoutes } from './routes/machines'
 import { createGitRoutes } from './routes/git'
-import { createLocalPreviewRoutes } from './routes/localPreview'
+import { createLocalServiceRoutes } from './routes/localServices'
+import { createWebReaderRoutes } from './routes/webReader'
+import type { LocalServiceManager } from '../localServices/manager'
+import type { LocalServiceHandler, LocalServiceWebSocket } from '../localServices/gateway'
 import { createOpenVikingRoutes } from './routes/openViking'
+import { createWorkspaceRoutes } from './routes/workspaces'
 import { createCliRoutes } from './routes/cli'
 import { createCodexDesktopRoutes } from './routes/codexDesktop'
+import { createSessionGroupRoutes } from './routes/sessionGroups'
+import { createSessionLabelRoutes } from './routes/sessionLabels'
+import { createSessionPinRoutes } from './routes/sessionPins'
+import { createKanbanOrderRoutes } from './routes/kanbanOrder'
 import { createPushRoutes } from './routes/push'
 import { createVoiceRoutes } from './routes/voice'
 import { createLegacyPublicShareTombstoneRoutes, createPublicShareRoutes } from './routes/shares'
 import { createShareManagementRoutes } from './routes/shareManagement'
 import { createPublicFeedbackRoutes } from './routes/feedback'
+import { createMonitorRoutes, createMonitorWebhookRoutes } from './routes/monitors'
+import type { MonitoringService } from '../monitoring/service'
 import type { PushService } from '../push/pushService'
 import type { SSEManager } from '../sse/sseManager'
 import type { VisibilityTracker } from '../visibility/visibilityTracker'
 import type { Server as BunServer, ServerWebSocket } from 'bun'
 import type { Server as SocketEngine } from '@socket.io/bun-engine'
-import { jwtVerify } from 'jose'
 import type { WebSocketData } from '@socket.io/bun-engine'
 import { loadEmbeddedAssetMap, type EmbeddedWebAsset } from './embeddedAssets'
 import { isBunCompiled } from '../utils/bunCompiled'
@@ -241,6 +252,7 @@ function serveEmbeddedAsset(asset: EmbeddedWebAsset): Response {
 }
 
 export function createWebApp(options: {
+    getMonitoring?: () => MonitoringService | null
     getSyncEngine: () => SyncEngine | null
     getSseManager: () => SSEManager | null
     getVisibilityTracker: () => VisibilityTracker | null
@@ -253,11 +265,20 @@ export function createWebApp(options: {
     webappDistDir?: string
     relayMode?: boolean
     officialWebUrl?: string
+    getLocalServices?: () => LocalServiceManager | null
 }): Hono<WebAppEnv> {
     const app = new Hono<WebAppEnv>()
 
     app.use('*', async (c, next) => {
-        if (c.req.path.startsWith('/s/') || c.req.path.startsWith('/a/') || c.req.path.startsWith('/f/')) return await next()
+        c.header('Referrer-Policy', 'no-referrer')
+        c.header('X-Content-Type-Options', 'nosniff')
+        c.header('X-Frame-Options', 'DENY')
+        c.header('Permissions-Policy', 'camera=(), geolocation=(), payment=()')
+        await next()
+    })
+
+    app.use('*', async (c, next) => {
+        if (c.req.path.startsWith('/s/') || c.req.path.startsWith('/a/') || c.req.path.startsWith('/f/') || c.req.path.startsWith('/hooks/')) return await next()
         return await logger()(c, next)
     })
 
@@ -269,29 +290,54 @@ export function createWebApp(options: {
     const corsOriginOption = corsOrigins.includes('*') ? '*' : corsOrigins
     const corsMiddleware = cors({
         origin: corsOriginOption,
-        allowMethods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-        allowHeaders: ['authorization', 'content-type']
+        allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+        allowHeaders: ['authorization', 'content-type', 'x-csrf-token']
     })
     app.use('/api/*', corsMiddleware)
     app.use('/cli/*', corsMiddleware)
 
-    app.route('/cli', createCliRoutes(options.getSyncEngine, options.store))
+    app.route('/cli', createCliRoutes(options.getSyncEngine, options.store, undefined, {
+        jwtSecret: options.jwtSecret,
+        publicUrl: configuration.publicUrl,
+    }))
     app.route('/s', createPublicShareRoutes(options.store))
     app.route('/f', createPublicFeedbackRoutes(options.store, undefined, options.pushService))
     app.route('/a', createLegacyPublicShareTombstoneRoutes())
+    app.route('/hooks', createMonitorWebhookRoutes(options.getMonitoring ?? (() => null), options.store))
 
     app.route('/api', createAuthRoutes(options.jwtSecret, options.store))
     app.route('/api', createBindRoutes(options.jwtSecret, options.store))
+    app.route('/api', createAuthV2PublicRoutes(
+        options.store,
+        configuration.cliApiToken,
+        options.jwtSecret,
+        configuration.publicUrl,
+        configuration.registrationSecret,
+        configuration.registrationMode,
+    ))
 
-    app.use('/api/*', createAuthMiddleware(options.jwtSecret))
+    app.use('/api/*', createAuthMiddleware(
+        options.jwtSecret,
+        options.store,
+        [configuration.publicUrl],
+    ))
+    app.route('/api', createAuthV2ProtectedRoutes(options.store))
+    app.route('/api', createWebReaderRoutes())
+    app.route('/api', createWorkspaceRoutes(options.store))
+    app.route('/api', createMonitorRoutes(options.store, options.getSyncEngine, options.getMonitoring ?? (() => null)))
     app.route('/api', createEventsRoutes(options.getSseManager, options.getSyncEngine, options.getVisibilityTracker))
-    app.route('/api', createSessionsRoutes(options.getSyncEngine))
-    app.route('/api', createMessagesRoutes(options.getSyncEngine))
+    app.route('/api', createSessionsRoutes(options.getSyncEngine, options.store))
+    app.route('/api', createSessionGroupRoutes(options.store, options.getSseManager))
+    app.route('/api', createSessionLabelRoutes(options.store, options.getSseManager))
+    app.route('/api', createSessionPinRoutes(options.store, options.getSseManager))
+    app.route('/api', createKanbanOrderRoutes(options.store, options.getSseManager))
+    app.route('/api', createMessagesRoutes(options.getSyncEngine, options.store))
+    app.route('/api', createManagedSkillsRoutes(options.getSyncEngine, options.store))
     app.route('/api', createPermissionsRoutes(options.getSyncEngine))
     app.route('/api', createMachinesRoutes(options.getSyncEngine))
     app.route('/api', createGitRoutes(options.getSyncEngine))
-    app.route('/api', createLocalPreviewRoutes(options.getSyncEngine))
-    app.route('/api', createOpenVikingRoutes(options.getSyncEngine))
+    app.route('/api', createLocalServiceRoutes(options.getSyncEngine, options.getLocalServices ?? (() => null)))
+    app.route('/api', createOpenVikingRoutes(options.getSyncEngine, options.store))
     app.route('/api', createShareManagementRoutes(options.store, undefined, options.getSyncEngine))
     // 中文注释：这里提供两类 Codex 辅助能力：扫描本地 transcript 以导入到 SHAPI，以及按需重启 Codex Desktop 客户端。
     app.route('/api', createCodexDesktopRoutes({
@@ -300,31 +346,6 @@ export function createWebApp(options: {
     }))
     app.route('/api', createPushRoutes(options.store, options.vapidPublicKey))
     app.route('/api', createVoiceRoutes())
-
-    // Skip static serving in relay mode, show helpful message on root
-    if (options.relayMode) {
-        const officialUrl = options.officialWebUrl || 'https://maplestoryidle.github.io/shapi'
-        app.get('/', (c) => {
-            return c.html(`<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><title>SHAPI Hub</title></head>
-<body style="font-family: system-ui; padding: 2rem; max-width: 600px;">
-<h1>SHAPI Hub</h1>
-<p>This hub is running in relay mode. Please use the configured web app:</p>
-<p><a href="${officialUrl}">${officialUrl}</a></p>
-<details>
-<summary>Why am I seeing this?</summary>
-<p style="margin-top: 0.5rem; color: #666;">
-When relay mode is enabled, all traffic flows through our relay infrastructure with end-to-end encryption.
-To reduce bandwidth and improve performance, the frontend is served separately
-from GitHub Pages instead of through the relay tunnel.
-</p>
-</details>
-</body>
-</html>`)
-        })
-        return app
-    }
 
     if (options.embeddedAssetMap) {
         const embeddedAssetMap = options.embeddedAssetMap
@@ -420,6 +441,7 @@ from GitHub Pages instead of through the relay tunnel.
 }
 
 export async function startWebServer(options: {
+    getMonitoring?: () => MonitoringService | null
     getSyncEngine: () => SyncEngine | null
     getSseManager: () => SSEManager | null
     getVisibilityTracker: () => VisibilityTracker | null
@@ -431,10 +453,13 @@ export async function startWebServer(options: {
     corsOrigins?: string[]
     relayMode?: boolean
     officialWebUrl?: string
+    getLocalServices?: () => LocalServiceManager | null
+    getLocalServiceHandler?: () => LocalServiceHandler | null
 }): Promise<BunServer<WebSocketData>> {
     const isCompiled = isBunCompiled()
     const embeddedAssetMap = isCompiled ? await loadEmbeddedAssetMap() : null
     const app = createWebApp({
+        getMonitoring: options.getMonitoring,
         getSyncEngine: options.getSyncEngine,
         getSseManager: options.getSseManager,
         getVisibilityTracker: options.getVisibilityTracker,
@@ -445,7 +470,8 @@ export async function startWebServer(options: {
         corsOrigins: options.corsOrigins,
         embeddedAssetMap,
         relayMode: options.relayMode,
-        officialWebUrl: options.officialWebUrl
+        officialWebUrl: options.officialWebUrl,
+        getLocalServices: options.getLocalServices
     })
 
     const configuration = getConfiguration()
@@ -466,7 +492,9 @@ export async function startWebServer(options: {
             ...originalWsHandler,
             open(ws: unknown) {
                 const wsAny = ws as ServerWebSocket<{ _qwenProxy?: boolean; _geminiProxy?: boolean }>
-                if (wsAny.data?._geminiProxy) {
+                if ((ws as ServerWebSocket<Partial<LocalServiceWebSocket>>).data?._localService) {
+                    options.getLocalServiceHandler?.()?.websocket.open(ws as ServerWebSocket<LocalServiceWebSocket>)
+                } else if (wsAny.data?._geminiProxy) {
                     geminiProxyHandler.open(wsAny)
                 } else if (wsAny.data?._qwenProxy) {
                     qwenProxyHandler.open(wsAny)
@@ -476,7 +504,14 @@ export async function startWebServer(options: {
             },
             message(ws: unknown, message: unknown) {
                 const wsAny = ws as ServerWebSocket<{ _qwenProxy?: boolean; _geminiProxy?: boolean }>
-                if (wsAny.data?._geminiProxy) {
+                if ((ws as ServerWebSocket<Partial<LocalServiceWebSocket>>).data?._localService) {
+                    // Enforce the preview-specific limits rather than increasing
+                    // Socket.IO / voice limits on this shared listener.
+                    const data = message as string | Buffer
+                    if (Buffer.byteLength(data) > 8 * 1024 * 1024) {
+                        (ws as ServerWebSocket<LocalServiceWebSocket>).data.lifetime.destroy()
+                    } else options.getLocalServiceHandler?.()?.websocket.message(ws as ServerWebSocket<LocalServiceWebSocket>, data)
+                } else if (wsAny.data?._geminiProxy) {
                     geminiProxyHandler.message(wsAny, message as string)
                 } else if (wsAny.data?._qwenProxy) {
                     qwenProxyHandler.message(wsAny, message as string)
@@ -486,7 +521,9 @@ export async function startWebServer(options: {
             },
             close(ws: unknown, code: number, reason: string) {
                 const wsAny = ws as ServerWebSocket<{ _qwenProxy?: boolean; _geminiProxy?: boolean }>
-                if (wsAny.data?._geminiProxy) {
+                if ((ws as ServerWebSocket<Partial<LocalServiceWebSocket>>).data?._localService) {
+                    options.getLocalServiceHandler?.()?.websocket.close(ws as ServerWebSocket<LocalServiceWebSocket>)
+                } else if (wsAny.data?._geminiProxy) {
                     geminiProxyHandler.close(wsAny, code, reason)
                 } else if (wsAny.data?._qwenProxy) {
                     qwenProxyHandler.close(wsAny, code, reason)
@@ -495,22 +532,37 @@ export async function startWebServer(options: {
                 }
             }
         },
-        fetch: async (req: Request, server: { upgrade: (req: Request, opts?: unknown) => boolean }) => {
+        fetch: async (req: Request, server: BunServer<LocalServiceWebSocket>) => {
             const url = new URL(req.url)
+            // Before the app logger, API middleware and SPA/static fallback:
+            // preview paths must neither enter the asset cache nor be logged.
+            if (url.pathname === '/preview' || url.pathname.startsWith('/preview/')) {
+                const handler = options.getLocalServiceHandler?.()
+                if (handler) return handler.fetch(req, server)
+                return new Response('Local service path access is not enabled / 未启用本地服务路径访问。', {
+                    status: 503, headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' }
+                })
+            }
             if (url.pathname.startsWith('/socket.io/')) {
                 return socketHandler.fetch(req, server as never)
             }
 
-            // Voice WebSocket proxies — require JWT auth via query param
-            // (browser WebSocket API cannot set custom headers)
+            // Voice WebSocket proxies use the same-origin HttpOnly session.
+            // Query JWT remains a migration-only fallback.
             if (url.pathname === '/api/voice/gemini-ws' || url.pathname === '/api/voice/qwen-ws') {
                 const token = url.searchParams.get('token')
-                if (!token) {
-                    return new Response('Missing authorization token', { status: 401 })
-                }
-                try {
-                    await jwtVerify(token, options.jwtSecret, { algorithms: ['HS256'] })
-                } catch {
+                const cookies = new Map((req.headers.get('cookie') ?? '').split(';').map((part) => {
+                    const separator = part.indexOf('=')
+                    return separator < 0 ? ['', ''] : [part.slice(0, separator).trim(), part.slice(separator + 1)]
+                }))
+                const sessionToken = cookies.get(SECURE_WEB_SESSION_COOKIE) ?? cookies.get(DEVELOPMENT_WEB_SESSION_COOKIE)
+                const session = sessionToken
+                    ? options.store.workspaces.authenticateWebSession(sessionToken, WEB_SESSION_IDLE_TTL_MS)
+                    : null
+                if (session) {
+                    const origin = req.headers.get('origin')
+                    if (!origin || origin !== url.origin) return new Response('Origin not allowed', { status: 403 })
+                } else if (!token || !await verifyWorkspaceJwt(token, options.jwtSecret, options.store)) {
                     return new Response('Invalid token', { status: 401 })
                 }
             }
@@ -552,7 +604,9 @@ export async function startWebServer(options: {
                 return undefined as unknown as Response
             }
 
-            return app.fetch(req)
+            return app.fetch(req, {
+                remoteAddress: server.requestIP(req)?.address,
+            })
         }
     })
 

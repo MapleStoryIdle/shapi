@@ -1,4 +1,11 @@
 import {
+    MachineGitBranchCreateRequestSchema,
+    MachineGitBranchCommitRequestSchema,
+    MachineGitBranchesRequestSchema,
+    MachineGitBranchFetchRequestSchema,
+    MachineGitBranchPushRequestSchema,
+    MachineGitBranchSwitchRequestSchema,
+    MachineGitBranchUpdateRequestSchema,
     MachineListDirectoryRequestSchema,
     MachinePathsExistsRequestSchema,
     SpawnSessionRequestSchema
@@ -8,8 +15,16 @@ import type { SyncEngine } from '../../sync/syncEngine'
 import type { WebAppEnv } from '../middleware/auth'
 import { requireMachine } from './guards'
 
+const SPAWN_REQUEST_TTL_MS = 5 * 60 * 1_000
+
+type SpawnRouteOutcome = {
+    result: Awaited<ReturnType<SyncEngine['spawnSession']>>
+    session: ReturnType<SyncEngine['getSessionByNamespace']> | null
+}
+
 export function createMachinesRoutes(getSyncEngine: () => SyncEngine | null): Hono<WebAppEnv> {
     const app = new Hono<WebAppEnv>()
+    const spawnRequests = new Map<string, Promise<SpawnRouteOutcome>>()
 
     app.get('/machines', (c) => {
         const engine = getSyncEngine()
@@ -40,23 +55,47 @@ export function createMachinesRoutes(getSyncEngine: () => SyncEngine | null): Ho
             return c.json({ error: 'Invalid body' }, 400)
         }
 
-        const result = await engine.spawnSession(
-            machineId,
-            parsed.data.directory,
-            parsed.data.agent,
-            parsed.data.model,
-            parsed.data.modelReasoningEffort,
-            parsed.data.yolo,
-            parsed.data.sessionType,
-            parsed.data.worktreeName,
-            undefined,
-            parsed.data.effort
-        )
-        if (result.type === 'success') {
-            const session = engine.getSessionByNamespace(result.sessionId, c.get('namespace'))
-            if (session) {
-                return c.json({ ...result, session })
-            }
+        const namespace = c.get('namespace')
+        const requestKey = `${namespace}\u0000${machineId}\u0000${parsed.data.requestId}`
+        let spawnRequest = spawnRequests.get(requestKey)
+        if (!spawnRequest) {
+            spawnRequest = (async (): Promise<SpawnRouteOutcome> => {
+                const result = await engine.spawnSession(
+                    machineId,
+                    parsed.data.directory,
+                    parsed.data.agent,
+                    parsed.data.model,
+                    parsed.data.modelReasoningEffort,
+                    parsed.data.yolo,
+                    parsed.data.sessionType,
+                    parsed.data.worktreeName,
+                    undefined,
+                    parsed.data.effort
+                )
+                return {
+                    result,
+                    session: result.type === 'success'
+                        ? engine.getSessionByNamespace(result.sessionId, namespace)
+                        : null
+                }
+            })()
+            spawnRequests.set(requestKey, spawnRequest)
+            const storedRequest = spawnRequest
+            setTimeout(() => {
+                if (spawnRequests.get(requestKey) === storedRequest) {
+                    spawnRequests.delete(requestKey)
+                }
+            }, SPAWN_REQUEST_TTL_MS)
+            void spawnRequest.catch(() => {
+                if (spawnRequests.get(requestKey) === storedRequest) {
+                    spawnRequests.delete(requestKey)
+                }
+            })
+        }
+
+        const { result, session } = await spawnRequest
+        if (result.type === 'success' && session) {
+            return c.json({ ...result, session })
         }
         return c.json(result)
     })
@@ -155,7 +194,7 @@ export function createMachinesRoutes(getSyncEngine: () => SyncEngine | null): Ho
 
         const model = c.req.query('model')?.trim() || null
         try {
-            const result = await engine.getCodexSubscriptionLimitsForMachine(machineId, model)
+            const result = await engine.getCodexSubscriptionLimitsForMachine(machineId, model, c.req.query('cwd') || undefined, c.req.query('provider') || undefined)
             return c.json(result)
         } catch (error) {
             return c.json({
@@ -217,6 +256,208 @@ export function createMachinesRoutes(getSyncEngine: () => SyncEngine | null): Ho
             return c.json({
                 success: false,
                 error: error instanceof Error ? error.message : 'Failed to read Git branch'
+            }, 500)
+        }
+    })
+
+    app.get('/machines/:id/git-branches', async (c) => {
+        const engine = getSyncEngine()
+        if (!engine) {
+            return c.json({ success: false, error: 'Not connected' }, 503)
+        }
+
+        const machineId = c.req.param('id')
+        const machine = requireMachine(c, engine, machineId)
+        if (machine instanceof Response) {
+            return machine
+        }
+
+        const parsed = MachineGitBranchesRequestSchema.safeParse({ cwd: c.req.query('cwd') })
+        if (!parsed.success) {
+            return c.json({ success: false, error: 'cwd query parameter is required' }, 400)
+        }
+
+        try {
+            const result = await engine.getMachineGitBranches(machineId, parsed.data.cwd)
+            return c.json(result)
+        } catch (error) {
+            return c.json({
+                success: false,
+                error: error instanceof Error ? error.message : 'Failed to list Git branches'
+            }, 500)
+        }
+    })
+
+    app.post('/machines/:id/git-branches/switch', async (c) => {
+        const engine = getSyncEngine()
+        if (!engine) {
+            return c.json({ success: false, error: 'Not connected' }, 503)
+        }
+
+        const machineId = c.req.param('id')
+        const machine = requireMachine(c, engine, machineId)
+        if (machine instanceof Response) {
+            return machine
+        }
+
+        const body = await c.req.json().catch(() => null)
+        const parsed = MachineGitBranchSwitchRequestSchema.safeParse(body)
+        if (!parsed.success) {
+            return c.json({ success: false, error: 'Invalid body' }, 400)
+        }
+
+        try {
+            const result = await engine.switchMachineGitBranch(machineId, parsed.data)
+            return c.json(result)
+        } catch (error) {
+            return c.json({
+                success: false,
+                error: error instanceof Error ? error.message : 'Failed to switch Git branch'
+            }, 500)
+        }
+    })
+
+    app.post('/machines/:id/git-branches', async (c) => {
+        const engine = getSyncEngine()
+        if (!engine) {
+            return c.json({ success: false, error: 'Not connected' }, 503)
+        }
+
+        const machineId = c.req.param('id')
+        const machine = requireMachine(c, engine, machineId)
+        if (machine instanceof Response) {
+            return machine
+        }
+
+        const body = await c.req.json().catch(() => null)
+        const parsed = MachineGitBranchCreateRequestSchema.safeParse(body)
+        if (!parsed.success) {
+            return c.json({ success: false, error: 'Invalid body' }, 400)
+        }
+
+        try {
+            const result = await engine.createMachineGitBranch(machineId, parsed.data)
+            return c.json(result)
+        } catch (error) {
+            return c.json({
+                success: false,
+                error: error instanceof Error ? error.message : 'Failed to create Git branch'
+            }, 500)
+        }
+    })
+
+    app.post('/machines/:id/git-branches/commit', async (c) => {
+        const engine = getSyncEngine()
+        if (!engine) {
+            return c.json({ success: false, error: 'Not connected' }, 503)
+        }
+
+        const machineId = c.req.param('id')
+        const machine = requireMachine(c, engine, machineId)
+        if (machine instanceof Response) {
+            return machine
+        }
+
+        const body = await c.req.json().catch(() => null)
+        const parsed = MachineGitBranchCommitRequestSchema.safeParse(body)
+        if (!parsed.success) {
+            return c.json({ success: false, error: 'Invalid body' }, 400)
+        }
+
+        try {
+            const result = await engine.commitMachineGitChanges(machineId, parsed.data)
+            return c.json(result)
+        } catch (error) {
+            return c.json({
+                success: false,
+                error: error instanceof Error ? error.message : 'Failed to commit Git changes'
+            }, 500)
+        }
+    })
+
+    app.post('/machines/:id/git-branches/push', async (c) => {
+        const engine = getSyncEngine()
+        if (!engine) {
+            return c.json({ success: false, error: 'Not connected' }, 503)
+        }
+
+        const machineId = c.req.param('id')
+        const machine = requireMachine(c, engine, machineId)
+        if (machine instanceof Response) {
+            return machine
+        }
+
+        const body = await c.req.json().catch(() => null)
+        const parsed = MachineGitBranchPushRequestSchema.safeParse(body)
+        if (!parsed.success) {
+            return c.json({ success: false, error: 'Invalid body' }, 400)
+        }
+
+        try {
+            const result = await engine.pushMachineGitBranch(machineId, parsed.data)
+            return c.json(result)
+        } catch (error) {
+            return c.json({
+                success: false,
+                error: error instanceof Error ? error.message : 'Failed to push Git branch'
+            }, 500)
+        }
+    })
+
+    app.post('/machines/:id/git-branches/fetch', async (c) => {
+        const engine = getSyncEngine()
+        if (!engine) {
+            return c.json({ success: false, error: 'Not connected' }, 503)
+        }
+
+        const machineId = c.req.param('id')
+        const machine = requireMachine(c, engine, machineId)
+        if (machine instanceof Response) {
+            return machine
+        }
+
+        const body = await c.req.json().catch(() => null)
+        const parsed = MachineGitBranchFetchRequestSchema.safeParse(body)
+        if (!parsed.success) {
+            return c.json({ success: false, error: 'Invalid body' }, 400)
+        }
+
+        try {
+            const result = await engine.fetchMachineGitBranches(machineId, parsed.data)
+            return c.json(result)
+        } catch (error) {
+            return c.json({
+                success: false,
+                error: error instanceof Error ? error.message : 'Failed to fetch Git branches'
+            }, 500)
+        }
+    })
+
+    app.post('/machines/:id/git-branches/update', async (c) => {
+        const engine = getSyncEngine()
+        if (!engine) {
+            return c.json({ success: false, error: 'Not connected' }, 503)
+        }
+
+        const machineId = c.req.param('id')
+        const machine = requireMachine(c, engine, machineId)
+        if (machine instanceof Response) {
+            return machine
+        }
+
+        const body = await c.req.json().catch(() => null)
+        const parsed = MachineGitBranchUpdateRequestSchema.safeParse(body)
+        if (!parsed.success) {
+            return c.json({ success: false, error: 'Invalid body' }, 400)
+        }
+
+        try {
+            const result = await engine.updateMachineGitBranch(machineId, parsed.data)
+            return c.json(result)
+        } catch (error) {
+            return c.json({
+                success: false,
+                error: error instanceof Error ? error.message : 'Failed to update Git branch'
             }, 500)
         }
     })

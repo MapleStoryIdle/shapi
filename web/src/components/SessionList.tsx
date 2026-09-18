@@ -6,7 +6,6 @@ import { useLongPress } from '@/hooks/useLongPress'
 import { usePlatform } from '@/hooks/usePlatform'
 import { useSessionActions } from '@/hooks/mutations/useSessionActions'
 import { SessionActionMenu } from '@/components/SessionActionMenu'
-import { RenameSessionDialog } from '@/components/RenameSessionDialog'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
 import { CopyIcon, CheckIcon, ScheduleIcon } from '@/components/icons'
 import { cn } from '@/lib/utils'
@@ -25,6 +24,7 @@ import { formatRelativeTime } from '@/lib/relativeTime'
 import { getDetachedBranchLabel } from '@/lib/files-i18n'
 import { useMachineGitBranch } from '@/hooks/queries/useGitBranch'
 import { MotionIcon, toMotionIcon } from '@/components/MotionIcon'
+import { getSessionDisplayTitle } from '@/lib/session-title'
 
 type SessionGroup = {
     key: string
@@ -597,17 +597,7 @@ function ChevronIcon(props: { className?: string; collapsed?: boolean }) {
 }
 
 export function getSessionTitle(session: SessionSummary): string {
-    if (session.metadata?.name) {
-        return session.metadata.name
-    }
-    if (session.metadata?.summary?.text) {
-        return session.metadata.summary.text
-    }
-    if (session.metadata?.path) {
-        const parts = session.metadata.path.split('/').filter(Boolean)
-        return parts.length > 0 ? parts[parts.length - 1] : session.id.slice(0, 8)
-    }
-    return session.id.slice(0, 8)
+    return getSessionDisplayTitle(session)
 }
 
 function getTodoProgress(session: SessionSummary): { completed: number; total: number } | null {
@@ -699,11 +689,10 @@ const SessionItem = memo(function SessionItem(props: {
     const { haptic } = usePlatform()
     const [menuOpen, setMenuOpen] = useState(false)
     const [menuAnchorPoint, setMenuAnchorPoint] = useState<{ x: number; y: number }>({ x: 0, y: 0 })
-    const [renameOpen, setRenameOpen] = useState(false)
     const [archiveOpen, setArchiveOpen] = useState(false)
     const [deleteOpen, setDeleteOpen] = useState(false)
 
-    const { archiveSession, reopenSession, renameSession, deleteSession, isPending } = useSessionActions(
+    const { archiveSession, reopenSession, deleteSession, isPending } = useSessionActions(
         api,
         s.id,
         s.metadata?.flavor ?? null
@@ -783,8 +772,9 @@ const SessionItem = memo(function SessionItem(props: {
                         statusClassName="bg-[#34C759] motion-safe:animate-pulse"
                     />
                     <div className="min-w-0 flex-1">
-                        <div className={`truncate font-medium tracking-normal text-[var(--app-fg)] ${nested ? 'text-[13px] leading-[17px]' : 'text-sm leading-5'}`}>
-                            {sessionName}
+                        <div className={`flex min-w-0 items-center gap-1.5 font-medium tracking-normal text-[var(--app-fg)] ${nested ? 'text-[13px] leading-[17px]' : 'text-sm leading-5'}`}>
+                            <span className="truncate">{sessionName}</span>
+                            {s.metadata?.monitorSession ? <span className="shrink-0 rounded-md bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold leading-none text-amber-800 dark:bg-amber-950/50 dark:text-amber-200" title={t('sessions.monitor.badgeTitle')}>{t('sessions.monitor.badge')}</span> : null}
                         </div>
                         {sessionSubtitle ? (
                             <div className="mt-0.5 truncate text-xs leading-4 text-[var(--app-hint)]">
@@ -865,7 +855,6 @@ const SessionItem = memo(function SessionItem(props: {
                 isOpen={menuOpen}
                 onClose={() => setMenuOpen(false)}
                 sessionActive={s.active}
-                onRename={() => setRenameOpen(true)}
                 onArchive={() => setArchiveOpen(true)}
                 onReopen={handleReopen}
                 onDelete={() => setDeleteOpen(true)}
@@ -884,14 +873,6 @@ const SessionItem = memo(function SessionItem(props: {
                     isPending={false}
                 />
             ) : null}
-
-            <RenameSessionDialog
-                isOpen={renameOpen}
-                onClose={() => setRenameOpen(false)}
-                currentName={sessionName}
-                onRename={renameSession}
-                isPending={isPending}
-            />
 
             <ConfirmDialog
                 isOpen={archiveOpen}

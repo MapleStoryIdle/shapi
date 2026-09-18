@@ -13,6 +13,15 @@ function makeMessage(content: unknown): DecryptedMessage {
 }
 
 describe('normalizeDecryptedMessage', () => {
+    it('normalizes native HTTP 403 status records as timeline events', () => {
+        const event = {
+            type: 'task-status', status: 'failed', source: 'codex',
+            code: 'http_forbidden', message: 'HTTP 403 Forbidden', recoverable: false
+        }
+        expect(normalizeDecryptedMessage(makeMessage({
+            role: 'agent', content: { type: 'codex', data: event }
+        }))).toMatchObject({ role: 'event', content: event })
+    })
     it('normalizes automation heartbeats into formatted status events', () => {
         const message = makeMessage({
             role: 'agent',
@@ -83,6 +92,16 @@ describe('normalizeDecryptedMessage', () => {
         })
 
         expect(normalizeDecryptedMessage(message)).toBeNull()
+
+        const reference = makeMessage({
+            role: 'user',
+            content: {
+                type: 'text',
+                text: '<shapi-managed-skill-ref id="git-merge-current-to-target" version="1.0.1">\nReuse it.\n</shapi-managed-skill-ref>\n\nUser request:\ntest again'
+            },
+            meta: { sentFrom: 'cli' }
+        })
+        expect(normalizeDecryptedMessage(reference)).toBeNull()
     })
 
     it('drops Claude init system output records', () => {
@@ -443,6 +462,26 @@ describe('normalizeDecryptedMessage', () => {
         })
     })
 
+    it('hides persisted SHAPI managed skill instructions from CLI user messages', () => {
+        const message = makeMessage({
+            role: 'user',
+            content: {
+                type: 'text',
+                text: [
+                    '<shapi-managed-skill id="git-merge-current-to-target" version="1.0.1">',
+                    'private managed skill instructions',
+                    '</shapi-managed-skill>',
+                    '',
+                    'User request:',
+                    'test'
+                ].join('\n')
+            },
+            meta: { sentFrom: 'cli' }
+        })
+
+        expect(normalizeDecryptedMessage(message)).toBeNull()
+    })
+
     it('treats sidechain user output with mixed tool_result + text array as sidechain', () => {
         const message = makeMessage({
             role: 'agent',
@@ -599,6 +638,81 @@ describe('normalizeDecryptedMessage', () => {
                     }]
                 }
             }]
+        })
+    })
+
+    it('normalizes Codex code-comment directives as structured review content', () => {
+        const message = makeMessage({
+            role: 'agent',
+            content: {
+                type: 'codex',
+                data: {
+                    type: 'message',
+                    message: `Review summary
+
+::code-comment{title="[P1] 三方调用期间持有工作流锁" body="submit 本身是事务方法，建议避免在行锁范围内执行网络请求。" file="
+JAVA
+/workspace/homebar/CabinetInventoryRecordServiceImpl.java
+" start=220 end=256 priority=1}`
+                }
+            }
+        })
+
+        expect(normalizeDecryptedMessage(message)).toMatchObject({
+            role: 'agent',
+            content: [{
+                type: 'codex-review',
+                review: {
+                    overallCorrectness: null,
+                    overallExplanation: 'Review summary',
+                    overallConfidenceScore: null,
+                    findings: [{
+                        title: '[P1] 三方调用期间持有工作流锁',
+                        body: 'submit 本身是事务方法，建议避免在行锁范围内执行网络请求。',
+                        priority: 1,
+                        confidenceScore: null,
+                        filePath: '/workspace/homebar/CabinetInventoryRecordServiceImpl.java',
+                        lineStart: 220,
+                        lineEnd: 256
+                    }]
+                }
+            }]
+        })
+    })
+
+    it('collects multiple code comments and leaves malformed directives as text', () => {
+        const structured = makeMessage({
+            role: 'agent',
+            content: {
+                type: 'codex',
+                data: {
+                    type: 'message',
+                    message: [
+                        '::code-comment{title="First" body="One" file="/repo/a.ts" start=2 priority=2}',
+                        '::code-comment{title="Second" body="Two" file="/repo/b.ts" start=4 priority=3}'
+                    ].join('\n')
+                }
+            }
+        })
+        const malformedText = '::code-comment{title="Missing fields"}'
+        const malformed = makeMessage({
+            role: 'agent',
+            content: { type: 'codex', data: { type: 'message', message: malformedText } }
+        })
+
+        expect(normalizeDecryptedMessage(structured)).toMatchObject({
+            content: [{
+                type: 'codex-review',
+                review: {
+                    findings: [
+                        { title: 'First', lineStart: 2, lineEnd: 2, priority: 2 },
+                        { title: 'Second', lineStart: 4, lineEnd: 4, priority: 3 }
+                    ]
+                }
+            }]
+        })
+        expect(normalizeDecryptedMessage(malformed)).toMatchObject({
+            content: [{ type: 'text', text: malformedText }]
         })
     })
 
@@ -865,6 +979,36 @@ describe('normalizeDecryptedMessage', () => {
                 context_window: 258400,
                 thread_id: 'child-thread',
                 scope_role: 'child'
+            }
+        })
+    })
+
+    it('keeps turn usage attached to a native Codex final reply', () => {
+        const message = makeMessage({
+            role: 'agent',
+            content: {
+                type: 'codex',
+                data: {
+                    type: 'message',
+                    message: 'Done',
+                    final: true,
+                    usage: {
+                        input_tokens: 80,
+                        output_tokens: 12,
+                        cache_read_input_tokens: 40,
+                        context_window: 258_400
+                    }
+                }
+            }
+        })
+
+        expect(normalizeDecryptedMessage(message)).toMatchObject({
+            role: 'agent',
+            usage: {
+                input_tokens: 80,
+                output_tokens: 12,
+                cache_read_input_tokens: 40,
+                context_window: 258_400
             }
         })
     })

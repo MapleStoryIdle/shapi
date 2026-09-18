@@ -1,7 +1,7 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { isPermissionModeAllowedForFlavor } from '@hapi/protocol'
 import type { ApiClient } from '@/api/client'
-import type { CodexCollaborationMode, PermissionMode } from '@/types/api'
+import type { CodexCollaborationMode, PermissionMode, SessionResponse, SessionsResponse } from '@/types/api'
 import type { ReopenSessionResponse } from '@hapi/protocol/apiTypes'
 import { queryKeys } from '@/lib/query-keys'
 import { clearMessageWindow } from '@/lib/message-window-store'
@@ -15,6 +15,7 @@ export function useSessionActions(
 ): {
     abortSession: () => Promise<void>
     archiveSession: () => Promise<void>
+    releaseSessionControl: () => Promise<void>
     reopenSession: () => Promise<ReopenSessionResponse>
     switchSession: () => Promise<void>
     setPermissionMode: (mode: PermissionMode) => Promise<void>
@@ -57,6 +58,16 @@ export function useSessionActions(
                 throw new Error('Session unavailable')
             }
             await api.archiveSession(sessionId)
+        },
+        onSuccess: () => void invalidateSession(),
+    })
+
+    const releaseControlMutation = useMutation({
+        mutationFn: async () => {
+            if (!api || !sessionId) {
+                throw new Error('Session unavailable')
+            }
+            await api.releaseSessionControl(sessionId)
         },
         onSuccess: () => void invalidateSession(),
     })
@@ -174,7 +185,27 @@ export function useSessionActions(
             }
             await api.renameSession(sessionId, name)
         },
-        onSuccess: () => void invalidateSession(),
+        onSuccess: async (_result, name) => {
+            if (!sessionId) return
+            queryClient.setQueryData<SessionResponse | undefined>(queryKeys.session(sessionId), (current) => current
+                ? {
+                    ...current,
+                    session: {
+                        ...current.session,
+                        metadata: current.session.metadata ? { ...current.session.metadata, name } : null
+                    }
+                }
+                : current)
+            queryClient.setQueryData<SessionsResponse | undefined>(queryKeys.sessions, (current) => current
+                ? {
+                    ...current,
+                    sessions: current.sessions.map((session) => session.id === sessionId
+                        ? { ...session, metadata: session.metadata ? { ...session.metadata, name } : null }
+                        : session)
+                }
+                : current)
+            await invalidateSession()
+        },
     })
 
     const deleteMutation = useMutation({
@@ -195,6 +226,7 @@ export function useSessionActions(
     return {
         abortSession: abortMutation.mutateAsync,
         archiveSession: archiveMutation.mutateAsync,
+        releaseSessionControl: releaseControlMutation.mutateAsync,
         reopenSession: reopenMutation.mutateAsync,
         switchSession: switchMutation.mutateAsync,
         setPermissionMode: permissionMutation.mutateAsync,
@@ -207,6 +239,7 @@ export function useSessionActions(
         deleteSession: deleteMutation.mutateAsync,
         isPending: abortMutation.isPending
             || archiveMutation.isPending
+            || releaseControlMutation.isPending
             || reopenMutation.isPending
             || switchMutation.isPending
             || permissionMutation.isPending

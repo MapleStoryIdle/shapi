@@ -87,6 +87,13 @@ function chatProviderProbe(onPlugins: (plugins: ReturnType<typeof useMarkdownRem
 }
 
 describe('MarkdownRenderer', () => {
+    it.each(['http://localhost:8317/settings?a=1', 'http://127.0.0.1:3000/', 'http://[::1]:4321/'])('routes plain local HTTP text through the launcher: %s', (url) => {
+        const view = renderInChat(`Open ${url} now`)
+        const link = view.container.querySelector<HTMLAnchorElement>('a[data-local-service-link]')
+        expect(link, view.container.innerHTML).not.toBeNull()
+        expect(link?.getAttribute('href')).toMatch(/^\/local-service#/)
+    })
+
     it('renders standalone markdown outside assistant message context', () => {
         render(
             <MarkdownRenderer
@@ -114,6 +121,7 @@ describe('MarkdownRenderer', () => {
         expect(link).toHaveAttribute('title', '/workspace/project/docs/README.md:42')
         expect(link).toHaveClass('text-[var(--app-markdown-link)]')
         expect(link?.querySelector('[data-markdown-link-icon="file"]')).not.toBeNull()
+        expect(link?.querySelector('.message-content-link-label')).toHaveTextContent('README.md:42')
     })
 
     it('shows external Markdown links with a link icon and content-link color', () => {
@@ -123,6 +131,36 @@ describe('MarkdownRenderer', () => {
         expect(link).toHaveAttribute('data-hapi-external-link', 'true')
         expect(link).toHaveClass('text-[var(--app-markdown-link)]')
         expect(link.querySelector('[data-markdown-link-icon="external"]')).not.toBeNull()
+        expect(link.querySelector('.message-content-link-label')).toHaveTextContent('SHAPI docs')
+    })
+
+    it('keeps clickable file links transparent without changing ordinary code', () => {
+        const view = renderInChat('[`Local file`](docs/README.md) and [`External file`](https://example.com/README.md) alongside `plain code`')
+
+        for (const name of ['Local file', 'External file']) {
+            const link = screen.getByRole('link', { name })
+            expect(link).toHaveClass('bg-transparent', '[&_code]:bg-transparent')
+            expect(link).not.toHaveClass('bg-[var(--app-inline-code-bg)]', 'hover:bg-[var(--app-code-copy-hover-bg)]')
+            expect(link.querySelector('code')).not.toBeNull()
+        }
+
+        const code = screen.getByText('plain code')
+        expect(code).toHaveClass('bg-[var(--app-inline-code-bg)]')
+        expect(code.closest('a')).toBeNull()
+        view.unmount()
+    })
+
+    it('shares unadorned inline-link styling across user-facing destinations', () => {
+        renderInChat('[识别规则 (line 306)](src/rules.ts:306) · [网页](https://example.com) · [下载文档](https://example.com/review.md) · [站内](/settings) · [应用](vscode://file/rules.ts)')
+
+        for (const link of screen.getAllByRole('link')) {
+            expect(link).toHaveClass('message-content-link', 'bg-transparent', 'no-underline')
+            expect(link).not.toHaveClass('underline', 'font-mono', 'truncate', 'border')
+            expect(link.querySelector('svg')).toHaveAttribute('aria-hidden', 'true')
+        }
+        expect(screen.getByRole('link', { name: '识别规则 (line 306)' }).querySelector('[data-file-type="ts"]')).not.toBeNull()
+        expect(screen.getByRole('link', { name: '下载文档' })).toHaveAttribute('href', 'https://example.com/review.md')
+        expect(screen.getByRole('link', { name: '应用' })).toHaveAttribute('href', '#')
     })
 
     it('keeps remark plugins stable when the chat provider value is recreated', () => {

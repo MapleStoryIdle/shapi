@@ -13,12 +13,137 @@ import {
     getCodexTranscriptUserInputState,
     getLocalCodexSessionData,
     getLocalCodexSessionRunState,
+    listLocalCodexSessionSubagents,
     listLocalCodexSessions,
     normalizeCodexCustomToolOutput,
     readLocalCodexSessionSummary
 } from './codexTranscript'
+import { formatNativeCodexAttachmentPrompt } from './nativeCodexAttachments'
 
 const originalCodexHome = process.env.CODEX_HOME
+
+describe('native completion evidence', () => {
+    const lifecycle = (type: string, turnId: string) => JSON.stringify({ type: 'event_msg', payload: { type, turn_id: turnId } })
+    const assistant = (text: string) => JSON.stringify({ type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] } })
+
+    it('ignores an older turn completion and preserves the current abort across incremental imports', () => {
+        const state = createCodexTranscriptImportAccumulator()
+        appendCodexTranscriptImportLines(state, [lifecycle('task_started', 'a'), assistant('A'), lifecycle('task_started', 'b'), assistant('B partial')])
+        appendCodexTranscriptImportLines(state, [lifecycle('task_complete', 'a')])
+        expect(state.messages.at(-1)?.content.data?.turnOutcome).toBeUndefined()
+        appendCodexTranscriptImportLines(state, [lifecycle('turn_aborted', 'b'), lifecycle('task_complete', 'b')])
+        expect(state.messages.at(-1)?.content.data?.turnOutcome).toBe('aborted')
+    })
+
+    it('never attaches a new empty turn completion to previous output', () => {
+        const state = createCodexTranscriptImportAccumulator()
+        appendCodexTranscriptImportLines(state, [lifecycle('task_started', 'a'), assistant('A'), lifecycle('task_started', 'b'), lifecycle('task_complete', 'b')])
+        expect(state.messages.at(-1)?.content.data?.turnOutcome).toBeUndefined()
+    })
+
+    it('records a matching completion without adding a visible message', () => {
+        const state = createCodexTranscriptImportAccumulator()
+        appendCodexTranscriptImportLines(state, [lifecycle('task_started', 'a'), assistant('Plan'), lifecycle('task_complete', 'a')])
+        expect(state.messages).toHaveLength(1)
+        expect(state.messages[0]?.content.data).toMatchObject({ final: true, turnOutcome: 'completed' })
+    })
+    it('attaches the completed turn usage to its final assistant message', () => {
+        const state = createCodexTranscriptImportAccumulator()
+        const usage = JSON.stringify({
+            type: 'event_msg',
+            payload: {
+                type: 'token_count',
+                info: {
+                    total_token_usage: { input_tokens: 120, output_tokens: 20 },
+                    last_token_usage: { input_tokens: 80, cached_input_tokens: 40, output_tokens: 12 },
+                    model_context_window: 258_400
+                }
+            }
+        })
+        appendCodexTranscriptImportLines(state, [
+            lifecycle('task_started', 'a'),
+            assistant('Done'),
+            usage,
+            lifecycle('task_complete', 'a')
+        ])
+
+        expect(state.messages[0]?.content.data).toMatchObject({
+            usage: {
+                input_tokens: 80,
+                output_tokens: 12,
+                cache_read_input_tokens: 40,
+                context_tokens: 80,
+                context_window: 258_400
+            }
+        })
+    })
+    it('keeps usage on every historical turn when Codex reports tokens after completion', () => {
+        const state = createCodexTranscriptImportAccumulator()
+        const usage = (input: number, output: number, cached: number) => JSON.stringify({
+            type: 'event_msg',
+            payload: {
+                type: 'token_count',
+                info: {
+                    total_token_usage: { input_tokens: input, output_tokens: output },
+                    last_token_usage: { input_tokens: input, cached_input_tokens: cached, output_tokens: output }
+                }
+            }
+        })
+
+        appendCodexTranscriptImportLines(state, [
+            lifecycle('task_started', 'a'),
+            assistant('First'),
+            lifecycle('task_complete', 'a'),
+            usage(10, 2, 6),
+            lifecycle('task_started', 'b'),
+            assistant('Second'),
+            lifecycle('task_complete', 'b'),
+            usage(20, 4, 12)
+        ])
+
+        const assistantMessages = state.messages.filter((message) => message.content.data?.type === 'message')
+        expect(assistantMessages[0]?.content.data).toMatchObject({
+            usage: { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 6 }
+        })
+        expect(assistantMessages[1]?.content.data).toMatchObject({
+            usage: { input_tokens: 20, output_tokens: 4, cache_read_input_tokens: 12 }
+        })
+    })
+    it('derives each historical turn from cumulative-only token counters', () => {
+        const state = createCodexTranscriptImportAccumulator()
+        const cumulativeUsage = (input: number, output: number, cached: number) => JSON.stringify({
+            type: 'event_msg',
+            payload: {
+                type: 'token_count',
+                info: { total_token_usage: { input_tokens: input, output_tokens: output, cached_input_tokens: cached } }
+            }
+        })
+
+        appendCodexTranscriptImportLines(state, [
+            lifecycle('task_started', 'a'),
+            assistant('First'),
+            cumulativeUsage(100, 10, 80),
+            lifecycle('task_complete', 'a'),
+            lifecycle('task_started', 'b'),
+            assistant('Second'),
+            cumulativeUsage(160, 18, 125),
+            lifecycle('task_complete', 'b')
+        ])
+
+        const assistantMessages = state.messages.filter((message) => message.content.data?.type === 'message')
+        expect(assistantMessages[0]?.content.data).toMatchObject({
+            usage: { input_tokens: 100, output_tokens: 10, cache_read_input_tokens: 80 }
+        })
+        expect(assistantMessages[1]?.content.data).toMatchObject({
+            usage: { input_tokens: 60, output_tokens: 8, cache_read_input_tokens: 45 }
+        })
+    })
+    it('does not treat an unscoped completion as proof for a scoped turn', () => {
+        const state = createCodexTranscriptImportAccumulator()
+        appendCodexTranscriptImportLines(state, [lifecycle('task_started', 'a'), assistant('Partial'), JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete' } })])
+        expect(state.messages[0]?.content.data?.turnOutcome).toBeUndefined()
+    })
+})
 
 afterEach(() => {
     if (originalCodexHome === undefined) {
@@ -42,6 +167,193 @@ describe('getCodexSessionDisplayTitle', () => {
 })
 
 describe('getLocalCodexSessionData', () => {
+    it.each(['task_complete', 'task_failed'])('imports a %s HTTP 403 without its HTML response', (type) => {
+        const accumulator = createCodexTranscriptImportAccumulator()
+        appendCodexTranscriptImportLines(accumulator, [JSON.stringify({
+            type: 'event_msg',
+            timestamp: '2026-09-05T09:52:05.089Z',
+            payload: { type, error: { message: 'unexpected status 403 Forbidden: <html>private server response</html>' } }
+        })])
+        expect(accumulator.messages).toHaveLength(1)
+        expect(accumulator.messages[0]).toMatchObject({
+            createdAt: Date.parse('2026-09-05T09:52:05.089Z'),
+            content: { data: {
+                type: 'task-status', status: 'failed', code: 'http_forbidden',
+                source: 'codex', message: 'HTTP 403 Forbidden', recoverable: false
+            } }
+        })
+        expect(JSON.stringify(accumulator.messages)).not.toContain('private server response')
+    })
+
+    it('imports string 403 errors but not successful or interrupted turns', () => {
+        const accumulator = createCodexTranscriptImportAccumulator()
+        appendCodexTranscriptImportLines(accumulator, [
+            { type: 'task_complete' },
+            { type: 'task_complete', error: null },
+            { type: 'turn_aborted', reason: 'interrupted' },
+            { type: 'task_failed', error: 'HTTP 403 Forbidden' }
+        ].map((payload) => JSON.stringify({ type: 'event_msg', payload })))
+        expect(accumulator.messages).toHaveLength(1)
+        expect(accumulator.messages[0].content).toMatchObject({ data: { code: 'http_forbidden' } })
+    })
+
+    it('imports nested native failures with their original provider message', () => {
+        const accumulator = createCodexTranscriptImportAccumulator()
+        appendCodexTranscriptImportLines(accumulator, [JSON.stringify({
+            type: 'event_msg',
+            payload: {
+                type: 'task_failed',
+                error: { detail: { message: 'Selected model is at capacity. Please try a different model.' } }
+            }
+        })])
+
+        expect(accumulator.messages).toHaveLength(1)
+        expect(accumulator.messages[0]?.content).toMatchObject({ data: {
+            type: 'task-status',
+            status: 'failed',
+            code: 'model_capacity',
+            message: 'Selected model is at capacity. Please try a different model.',
+        } })
+    })
+
+    it.each([
+        'HTTP 401 Unauthorized',
+        'Authentication required; please run codex login',
+        'Your access token has expired'
+    ])('imports a signed-out Codex failure as a safe authentication status: %s', (error) => {
+        const accumulator = createCodexTranscriptImportAccumulator()
+        appendCodexTranscriptImportLines(accumulator, [JSON.stringify({
+            type: 'event_msg',
+            payload: { type: 'task_failed', error }
+        })])
+
+        expect(accumulator.messages).toHaveLength(1)
+        expect(accumulator.messages[0]?.content).toMatchObject({ data: {
+            type: 'task-status', status: 'failed', code: 'authentication',
+            source: 'codex', message: 'Codex authentication required', recoverable: false
+        } })
+    })
+
+    it('bounds large child traces while retaining its model and latest terminal', () => {
+        const root = mkdtempSync(join(tmpdir(), 'hapi-bounded-child-'))
+        const parentId = '10101010-1010-4010-8010-101010101010'
+        const childId = '20202020-2020-4020-8020-202020202020'
+        const dir = join(root, 'sessions')
+        mkdirSync(dir)
+        writeFileSync(join(dir, `rollout-${childId}.jsonl`), [
+            { type: 'session_meta', payload: { id: childId, source: { subagent: { thread_spawn: { parent_thread_id: parentId } } } } },
+            { type: 'turn_context', payload: { model: 'gpt-5.6-terra', effort: 'high' } },
+            { type: 'event_msg', payload: { type: 'task_started', turn_id: 'old-turn' } },
+            { type: 'event_msg', payload: { type: 'agent_message', message: 'Old output ' + 'x'.repeat(2 * 1024 * 1024) } },
+            { type: 'event_msg', payload: { type: 'agent_message', message: 'Large tool output ' + 'x'.repeat(80 * 1024) } },
+            { type: 'event_msg', payload: { type: 'agent_message', message: 'Latest answer' } },
+            { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'new-turn' } }
+        ].map((record) => JSON.stringify(record)).join('\n') + '\n')
+        process.env.CODEX_HOME = root
+        try {
+            const [child] = listLocalCodexSessionSubagents(parentId)
+            expect(child).toMatchObject({ model: 'gpt-5.6-terra', modelReasoningEffort: 'high', status: 'completed' })
+            expect(child.traceMessages).toHaveLength(1)
+            expect(child.traceMessages[0].content).toMatchObject({ data: { message: 'Latest answer' } })
+        } finally {
+            rmSync(root, { recursive: true, force: true })
+        }
+    })
+    it('associates native child rollouts with their direct parent only', () => {
+        const codexHome = mkdtempSync(join(tmpdir(), 'hapi-codex-native-subagent-test-'))
+        const parentId = '10101010-1010-4010-8010-101010101010'
+        const childId = '20202020-2020-4020-8020-202020202020'
+        const nestedId = '30303030-3030-4030-8030-303030303030'
+        const turnId = '40404040-4040-4040-8040-404040404040'
+        const sessionDir = join(codexHome, 'sessions', '2026', '09', '04')
+        const parentFile = join(sessionDir, `rollout-${parentId}.jsonl`)
+        const childFile = join(sessionDir, `rollout-2026-09-04T10-00-00-${childId}.jsonl`)
+        const childRotation = join(sessionDir, `rollout-2026-09-04T10-01-00-${childId}_${turnId}.jsonl`)
+        const nestedFile = join(sessionDir, `rollout-${nestedId}.jsonl`)
+        mkdirSync(sessionDir, { recursive: true })
+        writeFileSync(parentFile, `${JSON.stringify({
+            type: 'session_meta',
+            payload: { id: parentId, cwd: '/workspace/project' }
+        })}\n`, 'utf8')
+        writeFileSync(childFile, [
+            {
+                type: 'session_meta',
+                payload: {
+                    id: childId,
+                    parent_thread_id: parentId,
+                    source: {
+                        subagent: {
+                            thread_spawn: {
+                                parent_thread_id: parentId,
+                                agent_nickname: 'Peirce',
+                                agent_role: 'reviewer',
+                                agent_path: '/root/reviewer'
+                            }
+                        }
+                    }
+                }
+            },
+            {
+                type: 'turn_context',
+                payload: { model: 'gpt-5.6-terra', effort: 'max' }
+            },
+            {
+                timestamp: '2026-09-04T10:00:00.000Z',
+                type: 'event_msg',
+                payload: { type: 'task_started', turn_id: turnId }
+            },
+            {
+                timestamp: '2026-09-04T10:00:01.000Z',
+                type: 'response_item',
+                payload: {
+                    type: 'message',
+                    role: 'assistant',
+                    content: [{ type: 'output_text', text: 'I will inspect the implementation.' }]
+                }
+            }
+        ].map((record) => JSON.stringify(record)).join('\n') + '\n', 'utf8')
+        writeFileSync(childRotation, [
+            {
+                timestamp: '2026-09-04T10:00:02.000Z',
+                type: 'event_msg',
+                payload: { type: 'task_complete', turn_id: turnId }
+            }
+        ].map((record) => JSON.stringify(record)).join('\n') + '\n', 'utf8')
+        writeFileSync(nestedFile, `${JSON.stringify({
+            type: 'session_meta',
+            payload: {
+                id: nestedId,
+                parent_thread_id: childId,
+                source: { subagent: { thread_spawn: { parent_thread_id: childId } } }
+            }
+        })}\n`, 'utf8')
+        process.env.CODEX_HOME = codexHome
+
+        try {
+            const subagents = listLocalCodexSessionSubagents(parentId)
+            expect(subagents).toHaveLength(1)
+            expect(subagents[0]).toMatchObject({
+                id: childId,
+                parentSessionId: parentId,
+                name: 'Peirce',
+                role: 'reviewer',
+                agentPath: '/root/reviewer',
+                model: 'gpt-5.6-terra',
+                modelReasoningEffort: 'max',
+                status: 'completed',
+                statusText: 'Completed',
+                startedAt: Date.parse('2026-09-04T10:00:00.000Z'),
+                completedAt: Date.parse('2026-09-04T10:00:02.000Z')
+            })
+            expect(subagents[0]?.traceMessages).toMatchObject([
+                { role: 'agent', content: { data: { type: 'message', message: 'I will inspect the implementation.' } } }
+            ])
+            expect(getLocalCodexSessionData(parentId, { limit: 50 })?.subagents.map((subagent) => subagent.id)).toEqual([childId])
+        } finally {
+            rmSync(codexHome, { recursive: true, force: true })
+        }
+    })
+
     it('keeps only a confirmed, turn-scoped native update_plan outside the message page', () => {
         const accumulator = createCodexTranscriptImportAccumulator()
         const line = (record: unknown) => JSON.stringify(record)
@@ -718,6 +1030,17 @@ describe('getLocalCodexSessionRunState', () => {
 })
 
 describe('getCodexTranscriptTailSummary', () => {
+    it('keeps the latest active turn start and clears it at a terminal event', () => {
+        const startedAt = '2026-09-14T03:00:00.000Z'
+        expect(getCodexTranscriptTailSummary([
+            JSON.stringify({ timestamp: startedAt, type: 'event_msg', payload: { type: 'task_started' } })
+        ])).toMatchObject({ runState: 'processing', runStartedAt: Date.parse(startedAt) })
+        expect(getCodexTranscriptTailSummary([
+            JSON.stringify({ timestamp: startedAt, type: 'event_msg', payload: { type: 'task_started' } }),
+            JSON.stringify({ timestamp: '2026-09-14T03:01:00.000Z', type: 'event_msg', payload: { type: 'task_complete' } })
+        ])).toEqual(expect.objectContaining({ runState: 'idle' }))
+    })
+
     it('uses the extracted request for the latest user preview', () => {
         const wrapper = [
             '# Applications mentioned by the user:',
@@ -737,6 +1060,42 @@ describe('getCodexTranscriptTailSummary', () => {
         ])
 
         expect(summary.lastUserMessage).toBe('Open the selected application.')
+    })
+
+    it('keeps native attachment metadata but strips the Runner-private path', () => {
+        const privatePath = '/Users/example/.shapi/native-codex-attachments/aabbccddeeff00112233445566778899/content'
+        const prompt = formatNativeCodexAttachmentPrompt('Please review this file.', [{
+            id: 'aabbccddeeff00112233445566778899',
+            filename: 'review.md',
+            mimeType: 'text/markdown',
+            size: 42,
+            kind: 'file',
+            path: privatePath
+        }], { includeImagePaths: true })
+        const record = JSON.stringify({
+            type: 'response_item',
+            payload: {
+                type: 'message',
+                role: 'user',
+                content: [{ type: 'input_text', text: prompt }]
+            }
+        })
+        const accumulator = createCodexTranscriptImportAccumulator()
+        appendCodexTranscriptImportLines(accumulator, [record])
+
+        expect(getCodexTranscriptTailSummary([record]).lastUserMessage).toBe('Please review this file.')
+        expect(accumulator.messages).toMatchObject([{
+            role: 'user',
+            content: {
+                type: 'text',
+                text: 'Please review this file.',
+                attachments: [{
+                    id: 'aabbccddeeff00112233445566778899',
+                    filename: 'review.md'
+                }]
+            }
+        }])
+        expect(JSON.stringify(accumulator.messages)).not.toContain(privatePath)
     })
 })
 
@@ -793,7 +1152,7 @@ describe('native request_user_input lifecycle', () => {
 
         const accumulator = createCodexTranscriptImportAccumulator()
         appendCodexTranscriptImportLines(accumulator, [request, answer])
-        expect(accumulator.messages).toEqual([])
+        expect(accumulator.messages).toHaveLength(2)
     })
 
     it('clears a pending request when its turn terminates', () => {

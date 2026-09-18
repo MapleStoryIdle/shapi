@@ -2,6 +2,7 @@ import { createConfiguration, type ConfigSource } from './configuration'
 import { Store } from './store'
 import { SyncEngine, type SyncEvent } from './sync/syncEngine'
 import { NotificationHub } from './notifications/notificationHub'
+import { MonitoringService } from './monitoring/service'
 import type { NotificationChannel } from './notifications/notificationTypes'
 import { HappyBot } from './telegram/bot'
 import { startWebServer } from './web/server'
@@ -22,6 +23,7 @@ import type { WebSocketData } from '@socket.io/bun-engine'
 import { join } from 'node:path'
 import { GeneratedImageStore } from './generatedImages/store'
 import { ArtifactService } from './artifacts/service'
+import { startLocalServices } from './localServices/start'
 
 /** Format config source for logging */
 function formatSource(source: ConfigSource | 'generated'): string {
@@ -125,6 +127,7 @@ export async function startHub(options: StartHubOptions = {}): Promise<HubInstan
     let visibilityTracker: VisibilityTracker | null = null
     let notificationHub: NotificationHub | null = null
     let tunnelManager: TunnelManager | null = null
+    let localServices: Awaited<ReturnType<typeof startLocalServices>> = null
 
     // Load configuration (async - loads from env/file with persistence)
     const relayApiDomain = process.env.HAPI_RELAY_API || 'relay.hapi.run'
@@ -184,12 +187,13 @@ export async function startHub(options: StartHubOptions = {}): Promise<HubInstan
     }
 
     const store = new Store(config.dbPath)
+    store.workspaces.bootstrapLegacyCredentials(config.cliApiToken)
     const generatedImageStore = new GeneratedImageStore(join(config.dataDir, 'generated-images'))
     const artifactService = new ArtifactService(store, config.dataDir)
     const jwtSecret = await getOrCreateJwtSecret()
     const vapidKeys = await getOrCreateVapidKeys(config.dataDir)
     const vapidSubject = process.env.VAPID_SUBJECT ?? 'https://github.com/MapleStoryIdle/shapi'
-    const pushService = new PushService(vapidKeys, vapidSubject, store)
+    const pushService = new PushService(vapidKeys, vapidSubject, store, config.publicUrl)
     const externalCodexPushNotifier = new ExternalCodexPushNotifier(pushService)
 
     visibilityTracker = new VisibilityTracker()
@@ -225,7 +229,6 @@ export async function startHub(options: StartHubOptions = {}): Promise<HubInstan
         },
         onBackgroundTaskDelta: (sessionId, delta) => syncEngine?.handleBackgroundTaskDelta(sessionId, delta),
         onSessionActivity: (sessionId, updatedAt) => syncEngine?.recordSessionActivity(sessionId, updatedAt),
-        onSweepImmediateQueued: (sessionId, now) => syncEngine?.sweepImmediateQueuedOnSessionEnd(sessionId, now),
         onMessagesConsumed: (sessionId) => syncEngine?.clearQueuedThinkingGrace(sessionId),
         generatedImageStore
     })
@@ -255,9 +258,14 @@ export async function startHub(options: StartHubOptions = {}): Promise<HubInstan
     }
 
     notificationHub = new NotificationHub(syncEngine, notificationChannels)
+    const monitoring = new MonitoringService(store, () => syncEngine, pushService)
 
     // Start HTTP service first (before tunnel, so tunnel has something to forward to)
+    localServices = await startLocalServices(() => syncEngine, config.publicUrl, process.env, [
+        ...config.corsOrigins.map(normalizeOrigin).filter(Boolean), ...(relayFlag.enabled && relayCorsOrigin ? [relayCorsOrigin] : [])
+    ])
     webServer = await startWebServer({
+        getMonitoring: () => monitoring,
         getSyncEngine: () => syncEngine,
         getSseManager: () => sseManager,
         getVisibilityTracker: () => visibilityTracker,
@@ -268,8 +276,12 @@ export async function startHub(options: StartHubOptions = {}): Promise<HubInstan
         socketEngine: socketServer.engine,
         corsOrigins,
         relayMode: relayFlag.enabled,
-        officialWebUrl
+        officialWebUrl,
+        getLocalServices: () => localServices?.manager ?? null,
+        getLocalServiceHandler: () => localServices?.pathHandler ?? null
     })
+
+    monitoring.start()
 
     // Start the bot if configured
     if (happyBot) {
@@ -310,12 +322,9 @@ export async function startHub(options: StartHubOptions = {}): Promise<HubInstan
 
             console.log('[Web] Public: ' + tunnelUrl)
 
-            // Generate direct access link with hub and token
-            const params = new URLSearchParams({
-                hub: tunnelUrl,
-                token: config.cliApiToken
-            })
-            const directAccessUrl = `${officialWebUrl}/?${params.toString()}`
+            // Authenticated PWA must share the Hub origin so HttpOnly cookies work.
+            // Never put long-lived credentials in URLs, QR codes, history, or Referer.
+            const directAccessUrl = tunnelUrl
 
             console.log('')
             console.log('Open in browser:')
@@ -345,6 +354,8 @@ export async function startHub(options: StartHubOptions = {}): Promise<HubInstan
 
     return {
         stop: async () => {
+            await monitoring.stop()
+            await localServices?.stop()
             await tunnelManager?.stop()
             await happyBot?.stop()
             notificationHub?.stop()

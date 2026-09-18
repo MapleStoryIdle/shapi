@@ -1,5 +1,7 @@
 @import "tailwindcss";
 @import "katex/dist/katex.min.css";
+@import "./styles/chat-overlays.css";
+@import "./styles/thinking-indicator.css";
 @config "../tailwind.config.ts";
 
 :root {
@@ -16,9 +18,18 @@
     --app-mobile-header-shell-background: transparent;
     --app-mobile-header-shell-backdrop-filter: none;
     --app-mobile-composer-expanded-keyboard-offset: 4px;
+    /* Editable-detail dialogs stay above the software keyboard. */
+    --app-mobile-input-dialog-keyboard-gap: 8px;
+    --app-mobile-input-dialog-edge-gap: 12px;
     --app-mobile-standalone-top-safe-area-min: 50px;
     --app-mobile-standalone-bottom-safe-area-min: 34px;
     --app-mobile-composer-touch-safe-area-min: 12px;
+    --app-mobile-detail-sheet-ratio: 0.7;
+    --app-detail-sheet-duration: 500ms;
+    --app-detail-sheet-exit-duration: 400ms;
+    --app-detail-sheet-settle-duration: 300ms;
+    --app-detail-sheet-ease: cubic-bezier(0.32, 0.72, 0, 1);
+    --app-detail-background-return-ease: cubic-bezier(0.42, 0, 0.58, 1);
 
     --app-safe-area-top: env(safe-area-inset-top, 0px);
     --app-safe-area-right: env(safe-area-inset-right, 0px);
@@ -37,8 +48,8 @@
     --app-link: var(--tg-theme-link-color, #111827);
     /* Content links stay recognizably blue even when Telegram supplies a
      * neutral --app-link color for buttons and controls. */
-    --app-markdown-link: #2563eb;
-    --app-markdown-link-hover: #1d4ed8;
+    --app-markdown-link: #0b5fcc;
+    --app-markdown-link-hover: #084ca3;
     --app-markdown-link-muted: color-mix(in srgb, var(--app-markdown-link) 48%, transparent);
     --app-button: var(--tg-theme-button-color, #111827);
     --app-button-text: var(--tg-theme-button-text-color, #ffffff);
@@ -58,6 +69,7 @@
     --app-chat-user-border: rgba(15, 23, 42, 0.07);
     --app-chat-user-chip-bg: #e3e3e3;
     --app-chat-user-chip-fg: #202020;
+    --app-chat-user-skill-fg: #245fa8;
     --app-tool-card-bg: #f2f4f6;
     --app-tool-group-bg: var(--app-tool-card-bg);
     --app-tool-card-hover-bg: #e9edf2;
@@ -75,9 +87,9 @@
     --app-md-table-bg: #f5f6f7;
     --app-md-table-head-bg: #e3e7eb;
     --app-reasoning-bg: #f2f4f6;
-    --app-composer-compact-border: rgba(15, 23, 42, 0.12);
+    --app-composer-compact-border: var(--chat-sheet-input-border);
     --app-composer-compact-shadow: 0 8px 24px rgba(15, 23, 42, 0.10);
-    --app-composer-expanded-border: rgba(15, 23, 42, 0.14);
+    --app-composer-expanded-border: var(--chat-sheet-input-border);
     --app-composer-expanded-bg: var(--app-bg);
     --app-composer-expanded-shadow: 0 14px 36px rgba(15, 23, 42, 0.12);
     --app-mermaid-node-fill: #f8fbff;
@@ -195,6 +207,7 @@ html[data-app-keyboard-open="true"] {
     --app-chat-user-border: rgba(255, 255, 255, 0.10);
     --app-chat-user-chip-bg: #414141;
     --app-chat-user-chip-fg: #f5f5f5;
+    --app-chat-user-skill-fg: #8fc1ff;
     --app-tool-card-bg: #2b2f34;
     --app-tool-group-bg: var(--app-tool-card-bg);
     --app-tool-card-hover-bg: #343a41;
@@ -212,9 +225,9 @@ html[data-app-keyboard-open="true"] {
     --app-md-table-bg: #2a2f35;
     --app-md-table-head-bg: #3d4550;
     --app-reasoning-bg: #2b3036;
-    --app-composer-compact-border: rgba(255, 255, 255, 0.14);
+    --app-composer-compact-border: var(--chat-sheet-input-border);
     --app-composer-compact-shadow: 0 10px 28px rgba(0, 0, 0, 0.34);
-    --app-composer-expanded-border: rgba(255, 255, 255, 0.16);
+    --app-composer-expanded-border: var(--chat-sheet-input-border);
     --app-composer-expanded-bg: var(--app-bg);
     --app-composer-expanded-shadow: 0 14px 36px rgba(0, 0, 0, 0.34);
     --app-mermaid-node-fill: #323843;
@@ -283,6 +296,7 @@ html[data-app-keyboard-open="true"] {
     --app-chat-user-border: rgba(255, 255, 255, 0.12);
     --app-chat-user-chip-bg: #363636;
     --app-chat-user-chip-fg: #f5f5f5;
+    --app-chat-user-skill-fg: #8fc1ff;
     --app-tool-card-bg: #0e0e10;
     --app-tool-group-bg: var(--app-tool-card-bg);
     --app-tool-card-hover-bg: #161618;
@@ -300,9 +314,9 @@ html[data-app-keyboard-open="true"] {
     --app-md-table-bg: #0e0e10;
     --app-md-table-head-bg: #1f2024;
     --app-reasoning-bg: #0e0e10;
-    --app-composer-compact-border: rgba(255, 255, 255, 0.16);
+    --app-composer-compact-border: var(--chat-sheet-input-border);
     --app-composer-compact-shadow: 0 10px 30px rgba(0, 0, 0, 0.58);
-    --app-composer-expanded-border: rgba(255, 255, 255, 0.18);
+    --app-composer-expanded-border: var(--chat-sheet-input-border);
     --app-composer-expanded-bg: var(--app-bg);
     --app-composer-expanded-shadow: 0 14px 36px rgba(0, 0, 0, 0.60);
     --app-mermaid-node-fill: #16181d;
@@ -453,6 +467,69 @@ select {
     -webkit-font-smoothing: antialiased;
 }
 
+/* Shared iOS-style text controls. Components keep their own dimensions and
+ * layout, while color, border and focus feedback stay consistent everywhere. */
+.ios-form-control,
+.ios-input-shell {
+    border: 1px solid var(--chat-sheet-input-border);
+    border-radius: 14px;
+    background-color: var(--chat-sheet-group);
+    color: var(--chat-sheet-fg);
+    outline: none;
+    box-shadow: 0 1px 2px rgb(0 0 0 / 3%);
+    transition:
+        border-color var(--chat-sheet-feedback-duration),
+        box-shadow var(--chat-sheet-feedback-duration),
+        background-color var(--chat-sheet-feedback-duration);
+}
+
+.ios-form-control:is(input, textarea) {
+    appearance: none;
+    caret-color: var(--chat-sheet-accent);
+}
+
+.ios-form-control::placeholder,
+.ios-input-shell :is(input, textarea)::placeholder {
+    color: var(--chat-sheet-secondary);
+    opacity: .72;
+}
+
+.ios-form-control:focus,
+.ios-form-control:focus-visible,
+.ios-input-shell:focus-within {
+    border-color: var(--chat-sheet-accent);
+    box-shadow: var(--chat-sheet-focus);
+}
+
+.ios-composer-control:focus-within {
+    border-color: var(--chat-sheet-accent);
+}
+
+/* Center ordinary dialogs inside the usable safe-area rectangle. Supplying
+ * both edges plus an intrinsic height lets auto block margins center short
+ * dialogs while max-height keeps long content out of iOS system chrome. */
+.app-safe-dialog {
+    top: calc(var(--app-safe-area-top) + 12px);
+    bottom: calc(var(--app-safe-area-bottom) + 12px);
+    height: fit-content;
+    max-height: calc(var(--app-viewport-height, 100dvh) - var(--app-safe-area-top) - var(--app-safe-area-bottom) - 24px);
+    margin-block: auto;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+}
+
+.ios-form-control:disabled {
+    background-color: var(--chat-sheet-muted-bg);
+    opacity: .55;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .ios-form-control,
+    .ios-input-shell {
+        transition: none;
+    }
+}
+
 #root {
     height: 100%;
 }
@@ -462,6 +539,12 @@ select {
     overscroll-behavior-y: contain;
     -webkit-overflow-scrolling: touch;
     touch-action: pan-y;
+}
+
+@media (min-width: 1024px) {
+    .cupertino-session-index .cupertino-session-list.app-scroll-y {
+        overflow-anchor: none;
+    }
 }
 
 @media (hover: hover) and (pointer: fine) {
@@ -734,6 +817,10 @@ select {
     color: var(--cupertino-session-secondary-label);
 }
 
+.cupertino-session-index .cupertino-session-list[data-session-list-presentation="cupertino"] [data-session-ssh-controlled="true"] .cupertino-session-source-glyph {
+    color: #F5A524;
+}
+
 @keyframes cupertino-session-live-signal {
     0%, 100% {
         box-shadow: 0 0 0 2px color-mix(in srgb, var(--cupertino-session-active) 16%, transparent);
@@ -765,7 +852,8 @@ select {
 /* Both session presentations share the same iOS surface language. List mode
  * stays directory-first; Kanban keeps richer metadata and task actions. */
 .cupertino-session-index .cupertino-session-list[data-session-list-view="kanban"] .cupertino-session-board {
-    gap: 1.75rem;
+    --kanban-heading-icon-size: 0.875rem;
+    gap: 1rem;
     padding-top: 0.625rem;
 }
 
@@ -774,11 +862,46 @@ select {
     color: var(--cupertino-session-secondary-label);
 }
 
-.cupertino-session-index .cupertino-session-list[data-session-list-view="kanban"] .cupertino-kanban-heading h2 {
+.cupertino-session-index .cupertino-session-list[data-session-list-view="kanban"] .cupertino-kanban-heading h2,
+.cupertino-session-index .cupertino-session-list[data-session-list-view="kanban"] .cupertino-kanban-date-heading {
     color: var(--cupertino-session-label);
     font-size: 0.9375rem;
     font-weight: 600;
     letter-spacing: -0.01em;
+    line-height: 1.5rem;
+}
+
+.cupertino-session-board :is([data-kanban-group-icon], [data-kanban-date-emoji], .cupertino-kanban-heading .session-thinking__glyph) {
+    width: var(--kanban-heading-icon-size, 0.875rem);
+    height: var(--kanban-heading-icon-size, 0.875rem);
+    flex-shrink: 0;
+}
+
+.cupertino-session-board [data-kanban-date-emoji] {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: var(--kanban-heading-icon-size, 0.875rem);
+    line-height: 1;
+}
+
+.cupertino-session-board .cupertino-kanban-heading .session-thinking {
+    min-height: 1.5rem;
+    gap: 0.5rem;
+    font-size: inherit;
+    line-height: inherit;
+}
+
+.cupertino-session-board .cupertino-kanban-heading .session-thinking__label {
+    font-weight: inherit;
+}
+
+.kanban-sort-row {
+    transition: transform 180ms ease, box-shadow 180ms ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .kanban-sort-row { transition: none; }
 }
 
 .cupertino-session-index .cupertino-session-list[data-session-list-view="kanban"] .cupertino-kanban-card-column {
@@ -793,16 +916,20 @@ select {
     background: var(--cupertino-session-surface);
     box-shadow: var(--cupertino-session-shadow);
     color: var(--cupertino-session-label);
-    padding: 0.625rem 3.25rem 0.625rem 0.75rem;
+    padding: 0.625rem 0.75rem;
 }
 
-.cupertino-session-index .cupertino-session-list[data-session-list-view="kanban"] .cupertino-session-card[aria-current="page"] {
+.cupertino-session-index .cupertino-session-list[data-session-list-view="kanban"] .cupertino-session-card[data-session-selected="true"] {
     background: var(--cupertino-session-selected-fill);
     box-shadow: inset 3px 0 0 var(--cupertino-session-accent), var(--cupertino-session-shadow);
+    transition-property: transform;
 }
 
 .cupertino-session-index .cupertino-session-list[data-session-list-view="kanban"] .cupertino-session-card[data-kanban-card-status="processing"] {
-    border-left-color: #34C759;
+    /* Thinking owns the full animated outline. Hide the static project rail
+       without clipping the animated left edge. */
+    border-left-width: 1px;
+    border-left-color: var(--cupertino-session-separator);
 }
 
 .cupertino-session-index .cupertino-session-list[data-session-list-view="kanban"] .cupertino-session-card[data-kanban-card-status="pending"] {
@@ -837,23 +964,12 @@ select {
 .cupertino-session-index .cupertino-session-list[data-session-list-view="kanban"] .cupertino-kanban-card-time {
     color: var(--cupertino-session-secondary-label);
     font-size: 0.6875rem;
-    font-weight: 500;
+    font-weight: 400;
     line-height: 1rem;
 }
 
-.cupertino-session-index .cupertino-session-list[data-session-list-view="kanban"] [data-kanban-archive],
 .cupertino-session-index .cupertino-session-list[data-session-list-view="kanban"] .session-kanban-card + button {
     color: var(--cupertino-session-secondary-label);
-}
-
-.cupertino-session-index .cupertino-session-list[data-session-list-view="kanban"] .cupertino-kanban-completed-divider h2 {
-    color: var(--cupertino-session-secondary-label);
-    font-size: 0.75rem;
-}
-
-.cupertino-session-index .cupertino-session-list[data-session-list-view="kanban"] .cupertino-kanban-date-heading {
-    color: var(--cupertino-session-secondary-label);
-    letter-spacing: -0.01em;
 }
 
 .cupertino-session-index .cupertino-session-list[data-session-list-view="list"] .cupertino-session-row .cupertino-session-source {
@@ -1191,31 +1307,95 @@ html[data-theme="oled"] .aui-md > .aui-md-ul:not(.contains-task-list):nth-of-typ
     color: inherit;
 }
 
-.happy-user-bubble .aui-md-a {
-    color: var(--app-chat-user-fg);
-    text-decoration-color: color-mix(in srgb, var(--app-chat-user-fg) 70%, transparent);
-}
-
-.happy-user-bubble .aui-md-a:hover {
-    text-decoration-color: var(--app-chat-user-fg);
-}
-
-.happy-user-bubble .aui-md-file-link,
-.happy-user-bubble .aui-md-file-link:hover {
-    color: var(--app-inline-code-fg);
+/* A skill is a static prompt directive, not a navigable message link. Keep
+ * its blue language distinct from .message-content-link and from command
+ * chips: no underline, surface, border, hover treatment, or pointer cursor. */
+.happy-user-skill-directive {
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    color: var(--app-chat-user-skill-fg);
+    font-weight: 500;
     text-decoration: none;
 }
 
-.happy-user-bubble .aui-md-a[data-hapi-external-link="true"],
-.happy-user-bubble .aui-md-file-link[data-hapi-file-link="true"] {
+/* One inline-link treatment across assistant/user text and message actions.
+ * No chip surface; linked code inherits the same font and color as its label.
+ * Move icon + label to the next line as one unit. Long labels may wrap
+ * inside that unit, without overflowing narrow message bubbles. */
+.message-content-link {
+    display: inline-flex;
+    align-items: baseline;
+    max-width: 100%;
+    vertical-align: baseline;
+    border: 0;
+    border-radius: 2px;
+    padding: 0;
+    background: transparent;
     color: var(--app-markdown-link);
-    text-decoration-color: var(--app-markdown-link-muted);
+    font: inherit;
+    text-decoration: none;
+    overflow-wrap: anywhere;
+    cursor: pointer;
+    touch-action: manipulation;
+    transition: color 150ms ease;
 }
 
-.happy-user-bubble .aui-md-a[data-hapi-external-link="true"]:hover,
-.happy-user-bubble .aui-md-file-link[data-hapi-file-link="true"]:hover {
+.message-content-link:hover,
+.message-content-link:active {
     color: var(--app-markdown-link-hover);
-    text-decoration-color: var(--app-markdown-link-hover);
+    text-decoration: none;
+}
+
+.message-content-link:focus-visible {
+    outline: 2px solid currentColor;
+    outline-offset: 3px;
+}
+
+.message-content-link[aria-disabled="true"] {
+    color: var(--app-hint);
+    cursor: not-allowed;
+}
+
+/* Unavailable files retain their disabled icon, but their text uses link blue. */
+.aui-md-file-link[aria-disabled="true"] .message-content-link-label {
+    color: var(--app-markdown-link);
+}
+
+.message-content-link code {
+    border: 0;
+    border-radius: 0;
+    padding: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-decoration: none;
+}
+
+.message-content-link strong,
+.message-content-link em {
+    color: inherit;
+}
+
+.message-content-link-label {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.message-content-link-icon {
+    display: inline-block;
+    flex-shrink: 0;
+    width: 0.85em;
+    height: 0.85em;
+    margin-right: 0.32em;
+    vertical-align: -0.08em;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .message-content-link {
+        transition: none;
+    }
 }
 
 .aui-md-codeblock pre.shiki {
@@ -1294,7 +1474,89 @@ html[data-theme="oled"] .shiki span {
 }
 
 .animate-slide-up {
-  animation: slide-up 0.3s ease-out;
+    animation: slide-up 0.3s ease-out;
+}
+
+/* Question sheets: drag only the handle/header, leaving the body free to scroll. */
+.question-drawer {
+    --drawer-expanded-height: max(0px, calc(var(--drawer-viewport-height, 100dvh) - var(--app-safe-area-top, 0px) - 12px));
+    bottom: var(--drawer-bottom, 0px);
+    height: auto;
+    max-height: min(calc(var(--drawer-viewport-height, 100dvh) * var(--app-mobile-detail-sheet-ratio)), calc(var(--drawer-viewport-height, 100dvh) - var(--app-safe-area-top, 0px)));
+    padding-bottom: max(var(--app-safe-area-bottom), 12px);
+    padding-left: var(--app-safe-area-left);
+    padding-right: var(--app-safe-area-right);
+    transform: translateY(var(--drawer-drag, 0px));
+    /* The entrance keyframe owns transform until it finishes. Enabling the
+       drag-settle transition at the same time makes some WebKit builds play a
+       second rise when the keyframe is removed. */
+    transition: none;
+}
+.question-drawer[data-entered='true'] { transition: transform var(--app-detail-sheet-settle-duration) var(--app-detail-sheet-ease); }
+.question-drawer[data-expanded='true'] { max-height: var(--drawer-expanded-height); }
+.question-drawer[data-state='open']:not([data-entered='true']) { animation: question-drawer-in var(--app-detail-sheet-duration) var(--app-detail-sheet-ease); }
+.question-drawer[data-state='closed'] { animation: question-drawer-out var(--app-detail-sheet-exit-duration) ease-in; }
+.question-drawer[data-dragging='true'] { animation: none; transition: none; }
+.question-drawer-overlay { opacity: var(--drawer-overlay-opacity, 1); transition: opacity var(--app-detail-sheet-duration) var(--app-detail-sheet-ease); }
+.question-drawer-overlay[data-dragging='true'] { animation: none; transition: none; }
+.question-drawer-overlay[data-state='open'] { animation: question-overlay-in var(--app-detail-sheet-duration) var(--app-detail-sheet-ease); }
+.question-drawer-overlay[data-state='closed'] { animation: question-overlay-out var(--app-detail-sheet-exit-duration) ease-in; }
+@keyframes question-drawer-in {
+    from { transform: translateY(calc(100% + var(--drawer-bottom, 0px))); }
+    to { transform: translateY(0); }
+}
+@keyframes question-drawer-out {
+    from { transform: translateY(var(--drawer-drag, 0px)); }
+    to { transform: translateY(calc(100% + var(--drawer-bottom, 0px))); }
+}
+@keyframes question-overlay-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes question-overlay-out { from { opacity: var(--drawer-overlay-opacity, 1); } to { opacity: 0; } }
+/* Vaul-inspired page recession, visual only: never resize the composer. */
+/* Paint only: no safe-area, status-bar mode, header or composer geometry changes. */
+html[data-drawer-chrome='true'], html[data-drawer-chrome='true'] body {
+    background-color: var(--drawer-chrome-color, var(--app-bg));
+    transition: background-color var(--app-detail-sheet-duration) var(--app-detail-sheet-ease);
+}
+html[data-drawer-chrome-dragging='true'], html[data-drawer-chrome-dragging='true'] body { transition: none; }
+html[data-drawer-chrome-closing='true'], html[data-drawer-chrome-closing='true'] body {
+    transition-duration: var(--app-detail-sheet-exit-duration);
+    transition-timing-function: var(--app-detail-background-return-ease);
+}
+@media (max-width: 639px), (max-width: 1023px) and (pointer: coarse) {
+    .chat-drawer-stage {
+        background: var(--app-bg);
+        transition: background-color var(--app-detail-sheet-duration) var(--app-detail-sheet-ease);
+    }
+    .chat-drawer-stage:has([data-drawer-active='true']) { background: var(--drawer-chrome-color, var(--app-bg)); }
+    .chat-drawer-stage:has([data-drawer-closing='true']) {
+        transition-duration: var(--app-detail-sheet-exit-duration);
+        transition-timing-function: var(--app-detail-background-return-ease);
+    }
+    :is([data-chat-drawer-background], [data-drawer-page-background]) {
+        transform-origin: center top;
+        transition: transform var(--app-detail-sheet-duration) var(--app-detail-sheet-ease), border-radius var(--app-detail-sheet-duration) var(--app-detail-sheet-ease);
+    }
+    :is([data-chat-drawer-background], [data-drawer-page-background])[data-drawer-active='true'] {
+        transform: translateY(calc(10px * var(--drawer-background-progress, 0))) scale(calc(1 - 0.04 * var(--drawer-background-progress, 0)));
+        border-radius: calc(16px * var(--drawer-background-progress, 0));
+    }
+    :is([data-chat-drawer-background], [data-drawer-page-background])[data-drawer-dragging='true'] { transition: none; }
+    :is([data-chat-drawer-background], [data-drawer-page-background])[data-drawer-closing='true'] {
+        transition-duration: var(--app-detail-sheet-exit-duration);
+        transition-timing-function: var(--app-detail-background-return-ease);
+    }
+    /* The sheet body owns vertical scrolling; retain horizontal code scrolling. */
+    [data-chat-detail-drawer] [data-chat-drawer-body] > div { max-height: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+    html[data-drawer-chrome='true'], html[data-drawer-chrome='true'] body { transition: none; }
+    .chat-drawer-stage { transition: none; }
+    .chat-drawer-stage:has([data-drawer-active='true']) { background: var(--app-bg); }
+    :is([data-chat-drawer-background], [data-drawer-page-background])[data-drawer-active='true'] { transform: none; border-radius: 0; transition: none; }
+    .question-drawer, .question-drawer[data-state='open']:not([data-entered='true']), .question-drawer[data-state='closed'], .question-drawer-overlay[data-state] {
+        animation: none;
+        transition: none;
+    }
 }
 
 @keyframes menu-pop {
@@ -1394,45 +1656,57 @@ html[data-theme="oled"] .shiki span {
   animation: stop-button-breathe 1.7s ease-in-out infinite;
 }
 
-/* A running Kanban task stays readable while its card quietly breathes. */
+/* A thinking card uses one continuous animated outline on all four sides. */
+@property --session-kanban-border-angle {
+  syntax: '<angle>';
+  initial-value: 0deg;
+  inherits: false;
+}
+
 @keyframes session-kanban-thinking-breathe {
   0%, 100% {
-    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04), 0 0 0 rgba(245, 158, 11, 0);
   }
   50% {
-    box-shadow: 0 4px 14px rgba(52, 199, 89, 0.16);
+    box-shadow: 0 4px 14px rgba(245, 158, 11, 0.16), 0 0 18px rgba(245, 158, 11, 0.08);
   }
+}
+
+@keyframes session-kanban-thinking-border {
+  to { --session-kanban-border-angle: 360deg; }
 }
 
 .session-kanban-card-thinking {
+  position: relative;
+  isolation: isolate;
+  border-top-color: color-mix(in srgb, #f59e0b 28%, var(--app-border));
+  border-right-color: color-mix(in srgb, #f59e0b 28%, var(--app-border));
+  border-bottom-color: color-mix(in srgb, #f59e0b 28%, var(--app-border));
+  background-color: color-mix(in srgb, var(--app-bg) 96%, #f59e0b);
   animation: session-kanban-thinking-breathe 2.4s ease-in-out infinite;
 }
 
-/* Keep the label width stable while the ellipsis cycles through 1–3 dots. */
-@keyframes session-kanban-thinking-dot-second {
-  0%, 32% {
-    opacity: 0;
-  }
-  33%, 100% {
-    opacity: 1;
-  }
+.session-kanban-card-thinking::after {
+  content: '';
+  position: absolute;
+  z-index: 2;
+  inset: -1px;
+  border-radius: inherit;
+  padding: 1.5px;
+  pointer-events: none;
+  background: conic-gradient(from var(--session-kanban-border-angle), transparent 0 68%, rgba(245, 158, 11, 0.15) 75%, #f59e0b 84%, rgba(245, 158, 11, 0.15) 92%, transparent 100%);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  animation: session-kanban-thinking-border 2.4s linear infinite;
 }
 
-@keyframes session-kanban-thinking-dot-third {
-  0%, 65% {
-    opacity: 0;
-  }
-  66%, 100% {
-    opacity: 1;
-  }
-}
-
-.session-kanban-thinking-dot-second {
-  animation: session-kanban-thinking-dot-second 1.2s steps(1, end) infinite;
-}
-
-.session-kanban-thinking-dot-third {
-  animation: session-kanban-thinking-dot-third 1.2s steps(1, end) infinite;
+.session-kanban-card-unviewed:not([data-session-selected="true"]),
+.session-kanban-card-recent-completed:not([data-session-selected="true"]) {
+  outline: 1px solid color-mix(in srgb, var(--app-link) 72%, transparent);
+  outline-offset: 1px;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--app-link) 18%, transparent), 0 4px 14px color-mix(in srgb, var(--app-link) 13%, transparent);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1441,10 +1715,9 @@ html[data-theme="oled"] .shiki span {
     animation: none;
   }
 
-  .session-kanban-thinking-dot-second,
-  .session-kanban-thinking-dot-third {
+  .session-kanban-card-thinking::after {
     animation: none;
-    opacity: 1;
+    background: color-mix(in srgb, #f59e0b 58%, transparent);
   }
 }
 
@@ -1509,4 +1782,112 @@ html[data-theme="oled"] .shiki span {
 
 body:has(.session-list-screen) .tsqd-open-btn-container {
   display: none !important;
+}
+
+/* Compact iOS-style session metadata popover. Keep motion subtle because the
+   trigger sits in the persistent navigation bar. */
+.session-title-popover {
+  left: calc(var(--app-safe-area-left) + 0.75rem);
+  top: calc(var(--app-safe-area-top) + 4.25rem);
+  width: min(calc(100vw - var(--app-safe-area-left) - var(--app-safe-area-right) - 1.5rem), 24rem);
+  max-height: calc(var(--app-viewport-height, 100dvh) - var(--app-safe-area-top) - var(--app-safe-area-bottom) - 5.25rem);
+  transform-origin: top left;
+  animation: session-title-popover-in 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+@keyframes session-title-popover-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .session-title-popover {
+    animation: none;
+  }
+}
+
+/* Session-list skeletons preserve the final list/card geometry, preventing
+   iOS PWA content jumps while native and managed sessions merge. */
+.session-list-skeleton {
+  background: linear-gradient(
+    105deg,
+    var(--app-subtle-bg) 0%,
+    color-mix(in srgb, var(--app-subtle-bg) 55%, var(--app-bg)) 46%,
+    var(--app-subtle-bg) 100%
+  );
+  background-size: 220% 100%;
+  animation: session-list-skeleton-wave 1.8s ease-in-out infinite;
+}
+
+@keyframes session-list-skeleton-wave {
+  0%, 100% { background-position: 100% 0; }
+  50% { background-position: 0 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .session-list-skeleton {
+    animation: none;
+    background-position: 50% 0;
+  }
+}
+
+/* Shared inset-grouped browsing surface: session files and directory pickers. */
+.file-browser-surface {
+  background: var(--chat-sheet-bg);
+  color: var(--chat-sheet-fg);
+}
+.file-browser-search {
+  background: var(--chat-sheet-muted-bg);
+}
+.file-browser-group {
+  overflow: hidden;
+  border-radius: 16px;
+  background: var(--chat-sheet-group);
+}
+.file-browser-row {
+  position: relative;
+  display: flex;
+  width: 100%;
+  min-height: 52px;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  text-align: left;
+  font-size: 16px;
+  line-height: 1.4;
+  touch-action: manipulation;
+  cursor: pointer;
+}
+.file-browser-row + .file-browser-row {
+  border-top: 1px solid color-mix(in srgb, var(--chat-sheet-border) 60%, transparent);
+}
+.file-browser-surface .chat-segment { font-size: 15px; }
+.directory-picker-body > div > .file-browser-surface { padding-inline: 0; }
+.chat-overlay:has(> .file-browser-surface) {
+  container-name: file-browser;
+  container-type: size;
+}
+@container file-browser (max-height: 420px) {
+  .chat-overlay:not([data-desktop-dialog]) > .file-browser-surface[data-chat-drawer-body] { display: block; }
+  .directory-picker-body > div > .file-browser-surface { height: auto; }
+}
+/* With the keyboard open or in landscape, let the whole body scroll instead
+   of allowing the fixed toolbar to squeeze the file list down to zero. */
+@media (max-width: 767px) and (max-height: 600px) {
+  [data-testid="session-files-drawer"] > .file-browser-surface,
+  .directory-picker-body { display: block; }
+  .directory-picker-body > div > .file-browser-surface { height: auto; }
+}
+.file-browser-row:active {
+  background: var(--chat-sheet-muted-bg);
+}
+.file-browser-row:focus-visible {
+  outline: 2px solid var(--app-link);
+  outline-offset: -3px;
 }

@@ -3,7 +3,10 @@ import { render, screen, fireEvent, waitFor, act, cleanup } from '@testing-libra
 import { I18nContext, I18nProvider } from '@/lib/i18n-context'
 import { en } from '@/lib/locales'
 import { PROTOCOL_VERSION } from '@hapi/protocol'
-import SettingsPage from './index'
+import SettingsPage, { SettingsPageContent } from './index'
+
+// Bark's authenticated persistence/notification behavior has its own component tests.
+vi.mock('@/components/settings/BarkSettings', () => ({ BarkSettings: () => <div>Bark notifications</div> }))
 
 vi.mock('@hapi/protocol', () => ({
     PROTOCOL_VERSION: 1,
@@ -170,6 +173,16 @@ function renderWithSpyT(ui: React.ReactElement) {
     return spyT
 }
 
+function renderAdvancedSettings() {
+    const view = renderWithProviders(<SettingsPage />)
+    fireEvent.click(screen.getByRole('button', { name: 'Advanced settings' }))
+    return view
+}
+
+function renderVoicePlugin() {
+    return renderWithProviders(<SettingsPageContent mode="voice" />)
+}
+
 describe('SettingsPage', () => {
     beforeEach(() => {
         vi.clearAllMocks()
@@ -244,93 +257,91 @@ describe('SettingsPage', () => {
 
     it('uses correct i18n keys for Appearance setting', () => {
         const spyT = renderWithSpyT(<SettingsPage />)
+        fireEvent.click(screen.getByRole('button', { name: 'Advanced settings' }))
         const calledKeys = spyT.mock.calls.map((call) => call[0])
         expect(calledKeys).toContain('settings.display.appearance')
         expect(calledKeys).toContain('settings.display.appearance.system')
         expect(calledKeys).toContain('settings.display.sessionPreviewLimit')
         expect(calledKeys).toContain('settings.display.sessionPreviewLimit.decrease')
         expect(calledKeys).toContain('settings.display.sessionPreviewLimit.increase')
+        expect(calledKeys).toContain('settings.display.kanbanRecentMinutes')
+        expect(calledKeys).toContain('settings.display.kanbanRecentAutoRemove')
         expect(calledKeys).toContain('settings.display.sessionListStatus')
         expect(calledKeys).toContain('settings.display.sessionListStatus.standard')
     })
 
-    it('renders the Terminal Font Size setting', () => {
-        renderWithProviders(<SettingsPage />)
-        expect(screen.getAllByText('Terminal Font Size').length).toBeGreaterThanOrEqual(1)
-        expect(screen.getAllByText('13px').length).toBeGreaterThanOrEqual(1)
-    })
-
     it('renders the Session Preview Limit setting', () => {
-        renderWithProviders(<SettingsPage />)
+        renderAdvancedSettings()
         expect(screen.getAllByText('Sessions Before Folding').length).toBeGreaterThanOrEqual(1)
         expect(screen.getByLabelText('Sessions Before Folding')).toHaveValue(8)
         expect(screen.getAllByLabelText('Show fewer sessions before folding').length).toBeGreaterThanOrEqual(1)
         expect(screen.getAllByLabelText('Show more sessions before folding').length).toBeGreaterThanOrEqual(1)
     })
 
+    it('renders Kanban Recent preferences with the product defaults', () => {
+        renderAdvancedSettings()
+        expect(screen.getByLabelText('Kanban Recent Window')).toHaveValue(15)
+        expect(screen.getByRole('checkbox', { name: 'Remove from Recent when opened' })).toBeChecked()
+    })
+
     it('renders the Session list status setting', () => {
-        renderWithProviders(<SettingsPage />)
+        renderAdvancedSettings()
         expect(screen.getAllByText('Session list status').length).toBeGreaterThanOrEqual(1)
         expect(screen.getAllByText('Standard').length).toBeGreaterThanOrEqual(1)
     })
 
     it('renders the Enter Key setting', () => {
-        renderWithProviders(<SettingsPage />)
+        renderAdvancedSettings()
         expect(screen.getAllByText('Enter Key').length).toBeGreaterThanOrEqual(1)
         expect(screen.getAllByText('Send message').length).toBeGreaterThanOrEqual(1)
     })
 
-    it('renders the Terminal Tool Display setting', () => {
-        renderWithProviders(<SettingsPage />)
-        expect(screen.getAllByText('Terminal Tool Cards').length).toBeGreaterThanOrEqual(1)
-        expect(screen.getAllByText('Compact (command only)').length).toBeGreaterThanOrEqual(1)
+    it('moves terminal settings out of general settings', () => {
+        renderAdvancedSettings()
+        expect(screen.queryByText('Terminal Font Size')).toBeNull()
+        expect(screen.queryByText('Terminal Tool Cards')).toBeNull()
     })
 
-    it('renders grouped tool and user message background settings', () => {
+    it('removes custom color controls from settings', () => {
         renderWithProviders(<SettingsPage />)
-        expect(screen.getAllByText('Grouped Tool Use Background').length).toBeGreaterThanOrEqual(1)
-        expect(screen.getAllByText('User Message Background').length).toBeGreaterThanOrEqual(1)
-        expect(screen.getAllByText('Default color').length).toBeGreaterThanOrEqual(1)
-        expect(screen.getAllByText('Soft blue').length).toBeGreaterThanOrEqual(1)
-        expect(screen.getAllByText('Soft green').length).toBeGreaterThanOrEqual(1)
-        expect(screen.getAllByText('Soft yellow').length).toBeGreaterThanOrEqual(1)
-        expect(screen.getAllByLabelText('Custom color').length).toBeGreaterThanOrEqual(2)
+        expect(screen.queryByText('Custom Theme Colors')).toBeNull()
+        expect(screen.queryByText('Grouped Tool Use Background')).toBeNull()
+        expect(screen.queryByText('User Message Background')).toBeNull()
     })
 
     it('uses correct i18n keys for the Enter Key setting', () => {
         const spyT = renderWithSpyT(<SettingsPage />)
+        fireEvent.click(screen.getByRole('button', { name: 'Advanced settings' }))
         const calledKeys = spyT.mock.calls.map((call) => call[0])
         expect(calledKeys).toContain('settings.chat.title')
         expect(calledKeys).toContain('settings.chat.enterBehavior')
         expect(calledKeys).toContain('settings.chat.enterBehavior.send')
-        expect(calledKeys).toContain('settings.chat.terminalToolDisplay')
-        expect(calledKeys).toContain('settings.chat.terminalToolDisplay.compact')
-        expect(calledKeys).toContain('settings.chat.groupedToolBackground')
-        expect(calledKeys).toContain('settings.chat.userMessageBackground')
-        expect(calledKeys).toContain('settings.chat.surfaceColor.default')
+        expect(calledKeys).not.toContain('settings.chat.terminalToolDisplay')
+        expect(calledKeys).not.toContain('settings.chat.groupedToolBackground')
+        expect(calledKeys).not.toContain('settings.chat.userMessageBackground')
     })
 
     // Voice picker tests
     it('renders the Voice section with "Voice" label', () => {
-        renderWithProviders(<SettingsPage />)
+        renderVoicePlugin()
         expect(screen.getAllByText('Voice').length).toBeGreaterThanOrEqual(1)
     })
 
     it('uses correct i18n keys for the voice picker', () => {
-        const spyT = renderWithSpyT(<SettingsPage />)
+        const spyT = renderWithSpyT(<SettingsPageContent mode="voice" />)
         const calledKeys = spyT.mock.calls.map((call) => call[0])
         expect(calledKeys).toContain('settings.voice.voice')
         expect(calledKeys).toContain('settings.voice.voiceDefault')
     })
 
     it('voice picker shows "Default" option when opened', () => {
-        renderWithProviders(<SettingsPage />)
+        renderVoicePlugin()
         // The current value "Default" is shown in the closed picker button
         expect(screen.getAllByText('Default').length).toBeGreaterThanOrEqual(1)
     })
 
     it('opens voice picker and shows "Default" option in the list', () => {
-        renderWithProviders(<SettingsPage />)
+        renderVoicePlugin()
         // Click the voice picker button (aria-label target via the label text)
         const voiceButtons = screen.getAllByRole('button', { name: /Default/i })
         // Find the button that has aria-haspopup — that's the voice picker trigger
@@ -349,7 +360,7 @@ describe('SettingsPage', () => {
             { id: 'dyn2', name: 'Bob', previewUrl: 'https://example.com/bob.mp3', category: 'premade' },
         ])
 
-        renderWithProviders(<SettingsPage />)
+        renderVoicePlugin()
 
         const pickerButton = screen.getByRole('button', { name: /Voice\s*Default/i })
         fireEvent.click(pickerButton)
@@ -366,7 +377,7 @@ describe('SettingsPage', () => {
             { id: 'dyn1', name: 'Alice', previewUrl: '', category: 'premade' },
         ])
 
-        renderWithProviders(<SettingsPage />)
+        renderVoicePlugin()
 
         const pickerButton = screen.getByRole('button', { name: /Voice\s*Default/i })
         fireEvent.click(pickerButton)
@@ -381,7 +392,7 @@ describe('SettingsPage', () => {
             { id: 'dyn1', name: 'Alice', previewUrl: 'https://example.com/alice.mp3', category: 'premade' },
         ])
 
-        renderWithProviders(<SettingsPage />)
+        renderVoicePlugin()
 
         const pickerButton = screen.getByRole('button', { name: /Voice\s*Default/i })
         fireEvent.click(pickerButton)
@@ -412,7 +423,7 @@ describe('SettingsPage', () => {
         // @ts-expect-error test override
         window.Audio = MockAudio
 
-        const view = renderWithProviders(<SettingsPage />)
+        const view = renderVoicePlugin()
         const pickerButton = screen.getByRole('button', { name: /Voice\s*Default/i })
         fireEvent.click(pickerButton)
         const aliceLabel = await screen.findByText('Alice')
@@ -435,7 +446,7 @@ describe('SettingsPage', () => {
             { id: 'dyn1', name: 'Alice', previewUrl: '', category: 'premade' },
         ])
 
-        renderWithProviders(<SettingsPage />)
+        renderVoicePlugin()
 
         const pickerButton = screen.getByRole('button', { name: /Voice\s*Default/i })
         fireEvent.click(pickerButton)
@@ -448,7 +459,7 @@ describe('SettingsPage', () => {
     it('shows Gemini static voices when hub backend is gemini-live', async () => {
         mockFetchVoiceBackend.mockResolvedValue({ backend: 'gemini-live', backends: ['gemini-live'] })
 
-        renderWithProviders(<SettingsPage />)
+        renderVoicePlugin()
 
         const pickerButton = await screen.findByRole('button', { name: /Voice\s*Default/i })
         fireEvent.click(pickerButton)
@@ -464,7 +475,7 @@ describe('SettingsPage', () => {
     it('shows static catalog hint when Gemini backend is selected', async () => {
         mockFetchVoiceBackend.mockResolvedValue({ backend: 'gemini-live', backends: ['gemini-live'] })
 
-        renderWithProviders(<SettingsPage />)
+        renderVoicePlugin()
 
         await waitFor(() => {
             expect(screen.getByText('Open the list to see voice character notes. Audio preview is ElevenLabs only.')).toBeInTheDocument()
@@ -474,7 +485,7 @@ describe('SettingsPage', () => {
     it('persists Gemini voice selection under gemini storage key', async () => {
         mockFetchVoiceBackend.mockResolvedValue({ backend: 'gemini-live', backends: ['gemini-live'] })
 
-        renderWithProviders(<SettingsPage />)
+        renderVoicePlugin()
 
         const pickerButton = await screen.findByRole('button', { name: /Voice\s*Default/i })
         fireEvent.click(pickerButton)
@@ -494,7 +505,7 @@ describe('SettingsPage', () => {
             return null
         })
 
-        renderWithProviders(<SettingsPage />)
+        renderVoicePlugin()
 
         await waitFor(() => {
             expect(screen.getByText('Voice backend')).toBeInTheDocument()
@@ -518,7 +529,7 @@ describe('SettingsPage', () => {
             { id: 'dyn1', name: 'Alice', previewUrl: '', category: 'premade' },
         ])
 
-        renderWithProviders(<SettingsPage />)
+        renderVoicePlugin()
 
         const backendButton = await screen.findByRole('button', { name: /Voice backend/i })
         fireEvent.click(backendButton)

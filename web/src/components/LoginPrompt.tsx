@@ -10,6 +10,7 @@ import type { ServerUrlResult } from '@/hooks/useServerUrl'
 type LoginPromptProps = {
     mode?: 'login' | 'bind'
     onLogin?: (token: string) => void
+    onCookieLogin?: () => void
     onBind?: (token: string) => Promise<void>
     baseUrl: string
     serverUrl: string | null
@@ -55,15 +56,24 @@ export function LoginPrompt(props: LoginPromptProps) {
                 }
                 await props.onBind(trimmedToken)
             } else {
-                // Validate token by attempting to authenticate
                 const client = new ApiClient('', { baseUrl: props.baseUrl })
-                await client.authenticate({ accessToken: trimmedToken })
-                // If successful, pass token to parent
-                if (!props.onLogin) {
+                if (new URL(props.baseUrl, window.location.origin).origin === window.location.origin) {
+                    await client.createWebSession(trimmedToken)
+                    if (!props.onCookieLogin) {
+                        setError(t('login.error.loginUnavailable'))
+                        return
+                    }
+                    props.onCookieLogin()
+                } else if (trimmedToken.startsWith('spw')) {
+                        throw new Error('Open the Web app directly from your Hub URL to use an spw credential.')
+                } else if (!props.onLogin) {
                     setError(t('login.error.loginUnavailable'))
                     return
+                } else {
+                    // Legacy migration path. New spw credentials are never persisted here.
+                    await client.authenticate({ accessToken: trimmedToken })
+                    props.onLogin(trimmedToken)
                 }
-                props.onLogin(trimmedToken)
             }
         } catch (e) {
             const fallbackMessage = isBindMode ? t('login.error.bindFailed') : t('login.error.authFailed')
@@ -138,7 +148,7 @@ export function LoginPrompt(props: LoginPromptProps) {
                             placeholder={t('login.placeholder')}
                             autoComplete="current-password"
                             disabled={isLoading}
-                            className="w-full px-3 py-2.5 rounded-lg border border-[var(--app-border)] bg-[var(--app-bg)] text-[var(--app-fg)] placeholder:text-[var(--app-hint)] focus:outline-none focus:ring-2 focus:ring-[var(--app-button)] focus:border-transparent disabled:opacity-50"
+                            className="ios-form-control w-full px-3 py-2.5 text-base"
                         />
                     </div>
 
@@ -167,10 +177,13 @@ export function LoginPrompt(props: LoginPromptProps) {
 
                 {/* Help links */}
                 {!isBindMode && (
-                    <div className="flex items-center justify-between text-xs text-[var(--app-hint)]">
-                        <a href="https://github.com/MapleStoryIdle/shapi/tree/main/docs" target="_blank" rel="noopener noreferrer" className="underline hover:text-[var(--app-fg)]">
-                            {t('login.help')}
-                        </a>
+                    <div className="flex items-center justify-between gap-3 text-xs text-[var(--app-hint)]">
+                        <div className="flex gap-3">
+                            <a href="/install" className="underline hover:text-[var(--app-fg)]">Install runner</a>
+                            <a href="https://github.com/MapleStoryIdle/shapi/tree/main/docs" target="_blank" rel="noopener noreferrer" className="underline hover:text-[var(--app-fg)]">
+                                {t('login.help')}
+                            </a>
+                        </div>
                         <Dialog open={isServerDialogOpen} onOpenChange={handleServerDialogOpenChange}>
                             <DialogTrigger asChild>
                                 <button type="button" className="underline hover:text-[var(--app-fg)]">
@@ -198,7 +211,7 @@ export function LoginPrompt(props: LoginPromptProps) {
                                                 setServerError(null)
                                             }}
                                             placeholder={t('login.server.placeholder')}
-                                            className="w-full px-3 py-2.5 rounded-lg border border-[var(--app-border)] bg-[var(--app-bg)] text-[var(--app-fg)] placeholder:text-[var(--app-hint)] focus:outline-none focus:ring-2 focus:ring-[var(--app-button)] focus:border-transparent"
+                                            className="ios-form-control w-full px-3 py-2.5 text-base"
                                         />
                                         <div className="text-[11px] text-[var(--app-hint)]">
                                             {t('login.server.hint')}

@@ -216,6 +216,9 @@ describe('ApiMachineClient native file handler', () => {
             on: vi.fn((event: string, listener: (...args: unknown[]) => void) => {
                 listeners.set(event, listener)
             }),
+            off: vi.fn((event: string, listener: (...args: unknown[]) => void) => {
+                if (listeners.get(event) === listener) listeners.delete(event)
+            }),
             emit: vi.fn(),
             close: vi.fn()
         }
@@ -347,6 +350,62 @@ describe('ApiMachineClient Codex local transcript handlers', () => {
         }
     })
 
+    it('emits explicit SSH ownership acquire and release summaries', async () => {
+        const machine = makeMachine('machine-codex-ssh-ownership')
+        const sessionId = '18345678-1234-4234-8234-123456789012'
+        const transcriptDir = join(codexHome, 'sessions', '2026', '08', '13')
+        mkdirSync(transcriptDir, { recursive: true })
+        writeFileSync(join(transcriptDir, `rollout-${sessionId}.jsonl`), [
+            JSON.stringify({ type: 'session_meta', payload: { id: sessionId, cwd: '/workspace/project' } }),
+            JSON.stringify({ type: 'event_msg', payload: { type: 'task_started' } }),
+            JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete' } })
+        ].join('\n'))
+
+        let cachedHeld = new Set<string>()
+        let nextHeld = new Set<string>([sessionId])
+        const client = new ApiMachineClient('cli-token', machine)
+        const emit = vi.fn()
+        const internals = client as unknown as {
+            socket: { emit: typeof emit; close: () => void }
+            nativeCodexSshOwnership: {
+                getCachedHeldSessionIds: () => ReadonlySet<string>
+                getHeldSessionIds: (options?: { forceRefresh?: boolean }) => Promise<ReadonlySet<string>>
+            }
+            refreshNativeCodexSshOwnership: (options?: { forceRefresh?: boolean }) => Promise<ReadonlySet<string>>
+        }
+        internals.socket = { emit, close: () => {} }
+        internals.nativeCodexSshOwnership = {
+            getCachedHeldSessionIds: () => new Set(cachedHeld),
+            getHeldSessionIds: async () => {
+                cachedHeld = new Set(nextHeld)
+                return new Set(cachedHeld)
+            }
+        }
+
+        try {
+            await internals.refreshNativeCodexSshOwnership({ forceRefresh: true })
+            nextHeld = new Set()
+            await internals.refreshNativeCodexSshOwnership({ forceRefresh: true })
+
+            const updates = emit.mock.calls
+                .filter(([event]) => event === 'codex-session-updated')
+                .map(([, payload]) => payload)
+            expect(updates).toHaveLength(2)
+            expect(updates[0]).toEqual(expect.objectContaining({
+                machineId: machine.id,
+                codexSessionId: sessionId,
+                summary: expect.objectContaining({ controlledByCodexSsh: true })
+            }))
+            expect(updates[1]).toEqual(expect.objectContaining({
+                machineId: machine.id,
+                codexSessionId: sessionId,
+                summary: expect.objectContaining({ controlledByCodexSsh: false })
+            }))
+        } finally {
+            client.shutdown()
+        }
+    })
+
     it('returns one cached native snapshot for context and lifecycle state', async () => {
         const machine = makeMachine('machine-codex-snapshot')
         const sessionId = '22345678-1234-4234-8234-123456789012'
@@ -458,6 +517,7 @@ describe('ApiMachineClient Codex local transcript handlers', () => {
                     getStatus: () => {
                         success: true
                         status: 'processing'
+                        activeClientMessageId: string
                         queuedMessages: Array<{
                             id: string
                             text: string
@@ -470,10 +530,12 @@ describe('ApiMachineClient Codex local transcript handlers', () => {
             }).nativeCodexSessionDirectSender.getStatus = () => ({
                 success: true,
                 status: 'processing',
+                activeClientMessageId: 'native:active-1',
                 queuedMessages: [{
                     id: 'queued-1',
                     text: 'This text must never enter global SSE',
                     queuedAt: 42,
+                    cancelBlocked: true,
                     recoveryRequired: true,
                     recoveryReason: 'codex_timeout'
                 }]
@@ -488,8 +550,10 @@ describe('ApiMachineClient Codex local transcript handlers', () => {
                 revision: first.snapshot?.revision,
                 status: {
                     status: 'processing',
+                    activeClientMessageId: 'native:active-1',
                     queuedMessageRefs: [{
                         id: 'queued-1',
+                        cancelBlocked: true,
                         recoveryRequired: true,
                         recoveryReason: 'codex_timeout'
                     }]
@@ -690,6 +754,89 @@ describe('ApiMachineClient Codex local transcript handlers', () => {
         }
     })
 
+    it('renames a running native thread without resuming it and refreshes both cached titles and list events', async () => {
+        const machine = makeMachine('machine-codex-rename')
+        const sessionId = '52345678-1234-4234-8234-123456789012'
+        const transcriptDir = join(codexHome, 'sessions', '2026', '08', '28')
+        mkdirSync(transcriptDir, { recursive: true })
+        writeFileSync(join(transcriptDir, `rollout-${sessionId}.jsonl`), [
+            JSON.stringify({ type: 'session_meta', payload: { id: sessionId, cwd: codexHome } }),
+            JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload: { type: 'task_started' } })
+        ].join('\n'))
+        let title = 'Original name'
+        const setThreadName = vi.fn(async (_params: { threadId: string; name: string }) => {})
+        const setCachedTitle = vi.fn((sessionId: string, name: string) => { title = name })
+        const disconnect = vi.fn(async () => {})
+        const client = new ApiMachineClient('cli-token', machine, undefined, undefined, undefined, () => ({
+            connect: async () => {}, initialize: async () => ({}), setThreadName, disconnect
+        }))
+        const resolveTitles = vi.fn(() => new Map([[sessionId, title]]))
+        const emit = vi.fn()
+        const internals = client as unknown as {
+            nativeCodexSessionTitleCache: { resolve: typeof resolveTitles; set: typeof setCachedTitle }
+            socket: { emit: typeof emit; close: () => void }
+        }
+        internals.nativeCodexSessionTitleCache.resolve = resolveTitles
+        internals.nativeCodexSessionTitleCache.set = setCachedTitle
+        internals.socket = { emit, close: () => {} }
+        try {
+            await callMachineRpc(client, machine.id, 'readCodexLocalSessionSnapshot', { sessionId })
+            expect(await callMachineRpc(client, machine.id, 'renameCodexLocalSession', { sessionId, name: '  新名称  ' }))
+                .toEqual({ success: true, name: '新名称' })
+            expect(setThreadName).toHaveBeenCalledExactlyOnceWith({ threadId: sessionId, name: '新名称' })
+            expect(disconnect).toHaveBeenCalledTimes(1)
+            expect(setCachedTitle).toHaveBeenCalledWith(sessionId, '新名称')
+            expect(emit).toHaveBeenCalledWith('codex-session-updated', expect.objectContaining({
+                codexSessionId: sessionId, summary: expect.objectContaining({ title: '新名称' })
+            }))
+            expect(await callMachineRpc(client, machine.id, 'listCodexLocalSessions', { limit: 5 }))
+                .toMatchObject({ success: true, sessions: [expect.objectContaining({ id: sessionId, title: '新名称' })] })
+            expect(await callMachineRpc(client, machine.id, 'readCodexLocalSessionSnapshot', { sessionId }))
+                .toMatchObject({ success: true, snapshot: { data: { session: { title: '新名称' } }, status: { status: 'processing' } } })
+        } finally { client.shutdown() }
+    })
+
+    it('rejects invalid rename input and missing native threads before starting Codex', async () => {
+        const factory = vi.fn()
+        const machine = makeMachine('machine-codex-rename-invalid')
+        const client = new ApiMachineClient('cli-token', machine, undefined, undefined, undefined, factory)
+        try {
+            for (const name of ['', '  ', 'x'.repeat(256), 123, null]) {
+                expect(await callMachineRpc(client, machine.id, 'renameCodexLocalSession', { sessionId: 'missing', name }))
+                    .toMatchObject({ success: false, code: 'invalid_request' })
+            }
+            expect(await callMachineRpc(client, machine.id, 'renameCodexLocalSession', { sessionId: 'missing', name: 'Name' }))
+                .toMatchObject({ success: false, code: 'session_not_found' })
+            expect(factory).not.toHaveBeenCalled()
+        } finally { client.shutdown() }
+    })
+
+    it.each([
+        ['Method not found: thread/name/set', 'rename_unsupported'],
+        ['Database is locked', 'rename_failed']
+    ])('reports rename errors and closes its own connection: %s', async (message, code) => {
+        const machine = makeMachine('machine-codex-rename-error')
+        const sessionId = '62345678-1234-4234-8234-123456789012'
+        const transcriptDir = join(codexHome, 'sessions', '2026', '08', '28')
+        mkdirSync(transcriptDir, { recursive: true })
+        writeFileSync(join(transcriptDir, `rollout-${sessionId}.jsonl`), JSON.stringify({
+            type: 'session_meta', payload: { id: sessionId, cwd: codexHome }
+        }))
+        const disconnect = vi.fn(async () => {})
+        const client = new ApiMachineClient('cli-token', machine, undefined, undefined, undefined, () => ({
+            connect: async () => {}, initialize: async () => ({}),
+            setThreadName: async () => { throw new Error(message) }, disconnect
+        }))
+        const emit = vi.fn()
+        ;(client as unknown as { socket: { emit: typeof emit; close: () => void } }).socket = { emit, close: () => {} }
+        try {
+            expect(await callMachineRpc(client, machine.id, 'renameCodexLocalSession', { sessionId, name: 'New name' }))
+                .toMatchObject({ success: false, code })
+            expect(disconnect).toHaveBeenCalledTimes(1)
+            expect(emit).not.toHaveBeenCalledWith('codex-session-updated', expect.anything())
+        } finally { client.shutdown() }
+    })
+
     it('archives an idle native thread through Codex, evicts caches, and emits an invalidation', async () => {
         const machine = makeMachine('machine-codex-archive')
         const sessionId = '42345678-1234-4234-8234-123456789012'
@@ -787,6 +934,7 @@ describe('ApiMachineClient runner metadata sync', () => {
             host: 'Mac-mini.local',
             platform: 'darwin',
             happyCliVersion: '0.20.2',
+            runnerVersion: '1.0.3',
             homeDir: '/Users/alice',
             happyHomeDir: '/Users/alice/.hapi',
             happyLibDir: '/opt/hapi',
@@ -797,6 +945,7 @@ describe('ApiMachineClient runner metadata sync', () => {
             host: 'Mac-mini.local',
             platform: 'darwin',
             happyCliVersion: '0.20.2',
+            runnerVersion: '1.0.4',
             homeDir: '/Users/alice',
             codexHome: '/Users/alice/.codex',
             happyHomeDir: '/Users/alice/.hapi',
@@ -807,6 +956,9 @@ describe('ApiMachineClient runner metadata sync', () => {
         const socket = {
             on: vi.fn((event: string, listener: (...args: unknown[]) => void) => {
                 listeners.set(event, listener)
+            }),
+            off: vi.fn((event: string, listener: (...args: unknown[]) => void) => {
+                if (listeners.get(event) === listener) listeners.delete(event)
             }),
             emit: vi.fn(),
             emitWithAck: vi.fn(async (event: string, data: { runnerState?: unknown; metadata?: MachineMetadata }) => {
@@ -832,6 +984,7 @@ describe('ApiMachineClient runner metadata sync', () => {
 
         expect(machine.metadata).toMatchObject({
             codexHome: '/Users/alice/.codex',
+            runnerVersion: '1.0.4',
             displayName: 'My runner'
         })
         client.shutdown()

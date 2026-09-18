@@ -1,12 +1,12 @@
 import { createElement, type ReactNode } from 'react'
-import { act, cleanup, renderHook } from '@testing-library/react'
+import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { markUserInteraction, resetInteractionPriorityForTests } from '@/lib/interaction-priority'
 import { subscribeNativeCodexSessionUpdated } from '@/lib/native-codex-realtime-events'
 import { queryKeys } from '@/lib/query-keys'
 import type { SessionSummary, SessionsResponse } from '@/types/api'
-import { isGlobalScopedMessageStreamEvent, useSSE } from './useSSE'
+import { coalesceSessionCacheEvents, isGlobalScopedMessageStreamEvent, useSSE } from './useSSE'
 
 class MockEventSource {
     static readonly CONNECTING = 0
@@ -136,6 +136,20 @@ describe('useSSE skills updates', () => {
     })
 })
 
+describe('useSSE pin updates', () => {
+    it.each([['session-pins-updated', 'session-pins'], ['session-labels-updated', 'session-labels'], ['kanban-order-updated', 'kanban-order']] as const)('invalidates %s on the global connection while another session is selected', async (type, key) => {
+        Object.defineProperty(globalThis, 'EventSource', { value: MockEventSource, configurable: true, writable: true })
+        const invalidateQueries = vi.spyOn(QueryClient.prototype, 'invalidateQueries')
+        renderHook(() => useSSE({ enabled: true, token: 'test-token', baseUrl: 'http://hub.test', subscription: { sessionId: 'other-session' }, scope: 'global', onEvent: vi.fn() }), { wrapper: createWrapper() })
+        act(() => {
+            MockEventSource.instances[0]?.onmessage?.({
+                data: JSON.stringify({ type, namespace: 'default' }), lastEventId: '1'
+            } as MessageEvent<string>)
+        })
+        await waitFor(() => expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: [key] }))
+    })
+})
+
 describe('useSSE reconnect handling', () => {
     it('actively rebuilds an EventSource that errors while still connecting', () => {
         vi.useFakeTimers()
@@ -198,14 +212,14 @@ describe('useSSE reconnect handling', () => {
 
         act(() => {
             setVisibilityState('hidden')
-            setVisibilityState('visible')
             document.dispatchEvent(new Event('visibilitychange'))
         })
 
         expect(source?.close).toHaveBeenCalledTimes(1)
 
         act(() => {
-            vi.advanceTimersByTime(1_000)
+            setVisibilityState('visible')
+            document.dispatchEvent(new Event('visibilitychange'))
         })
 
         expect(MockEventSource.instances).toHaveLength(2)
@@ -627,6 +641,17 @@ describe('useSSE native Codex session events', () => {
 })
 
 describe('useSSE session update batching', () => {
+    it('coalesces repeated patches without losing their final fields or order', () => {
+        expect(coalesceSessionCacheEvents([
+            { type: 'session-updated', sessionId: 'session-1', data: { thinking: true } },
+            { type: 'session-updated', sessionId: 'session-2', data: { active: false } },
+            { type: 'session-updated', sessionId: 'session-1', data: { updatedAt: 3 } }
+        ])).toEqual([
+            { type: 'session-updated', sessionId: 'session-2', data: { active: false } },
+            { type: 'session-updated', sessionId: 'session-1', data: { thinking: true, updatedAt: 3 } }
+        ])
+    })
+
     it('applies bursty session patches together after the short interaction window', () => {
         vi.useFakeTimers()
         Object.defineProperty(globalThis, 'EventSource', {

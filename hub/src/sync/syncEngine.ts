@@ -9,16 +9,28 @@
 
 import { AGENT_MESSAGE_PAYLOAD_TYPE, isKnownFlavor, MAX_UPLOAD_BYTES, type LocalResumeTarget, type ResumableSession } from '@hapi/protocol'
 import { RPC_METHODS } from '@hapi/protocol/rpcMethods'
+import type { NativeCodexSessionControlAction, NativeCodexSessionControlResponse } from '@hapi/protocol/codexTranscript'
+import type { RecoverCodexLocalSessionControlRequest, CodexLocalSessionRecoveryResponse } from '@hapi/protocol/codexTranscript'
+import type { LocalServiceTunnelRequest } from '@hapi/protocol/localServices'
+import type { LocalServiceTunnel } from '../localServices/socketTransport'
 import type {
     CreateSideSessionResponse,
+    RenameNativeCodexSessionResponse,
     CursorMigrateOutcome,
     CursorMigrateToAcpRequest,
     LocalPreviewHttpRequest,
     LocalPreviewHttpResponse,
     LocalPreviewProbeRequest,
     LocalPreviewProbeResponse,
+    MachineGitBranchCreateRequest,
+    MachineGitBranchCommitRequest,
+    MachineGitBranchFetchRequest,
+    MachineGitBranchPushRequest,
+    MachineGitBranchSwitchRequest,
+    MachineGitBranchUpdateRequest,
     OpenVikingContextListRequest,
     OpenVikingContextReadRequest,
+    OpenVikingSearchRequest,
     SlashCommandsResponse,
 } from '@hapi/protocol/apiTypes'
 import type {
@@ -28,6 +40,7 @@ import type {
     PermissionMode,
     Session,
     SideSessionMetadata,
+    MonitorSessionMetadata,
     SyncEvent
 } from '@hapi/protocol/types'
 import { unwrapRoleWrappedRecordEnvelope } from '@hapi/protocol/messages'
@@ -44,6 +57,7 @@ import { MachineCache, type Machine } from './machineCache'
 import { MessageService } from './messageService'
 import {
     RpcGateway,
+    HandoffRejectedError,
     RpcTargetMissingError,
     type RpcCodexModel,
     type RpcCommandResponse,
@@ -52,6 +66,7 @@ import {
     type RpcGeneratedImageFileReference,
     type RpcGeneratedImageResponse,
     type RpcGitBranchResponse,
+    type RpcGitBranchesResponse,
     type RpcGetCodexSubscriptionLimitsResponse,
     type RpcListDirectoryResponse,
     type RpcListCodexModelsResponse,
@@ -62,6 +77,9 @@ import {
     type RpcLocalPreviewProbeResponse,
     type RpcOpenVikingContextListResponse,
     type RpcOpenVikingContextReadResponse,
+    type RpcOpenVikingMetricsResponse,
+    type RpcOpenVikingQualityResponse,
+    type RpcOpenVikingSearchResponse,
     type RpcOpenVikingStatusResponse,
     type RpcCursorModel,
     type RpcCodexLocalSessionComposerCapabilitiesResponse,
@@ -69,6 +87,8 @@ import {
     type RpcDiscardCodexLocalSessionMessageResponse,
     type RpcNativeKanbanFeedbackDeleteResponse,
     type RpcNativeKanbanFeedbackStageResponse,
+    type RpcNativeCodexAttachmentDeleteResponse,
+    type RpcNativeCodexAttachmentStageResponse,
     type RpcCodexLocalSessionSnapshotResponse,
     type RpcCodexLocalSessionStatusResponse,
     type RpcArchiveCodexLocalSessionResponse,
@@ -79,7 +99,12 @@ import {
     type RpcUploadFileResponse,
     type RpcSendCodexLocalSessionMessageResponse
 } from './rpcGateway'
-import type { NativeKanbanFeedbackDeleteRequest, NativeKanbanFeedbackStageRequest } from '@hapi/protocol'
+import type {
+    NativeKanbanFeedbackDeleteRequest,
+    NativeKanbanFeedbackStageRequest,
+    NativeCodexAttachmentDeleteRequest,
+    NativeCodexAttachmentStageRequest
+} from '@hapi/protocol'
 import type {
     CodexLocalSessionSnapshotReadOptions,
     NativeCodexDeliveryPolicy,
@@ -98,6 +123,7 @@ export type {
     RpcGeneratedImageFileReference,
     RpcGeneratedImageResponse,
     RpcGitBranchResponse,
+    RpcGitBranchesResponse,
     RpcGetCodexSubscriptionLimitsResponse,
     RpcListDirectoryResponse,
     RpcListCodexModelsResponse,
@@ -115,6 +141,8 @@ export type {
     RpcDiscardCodexLocalSessionMessageResponse,
     RpcNativeKanbanFeedbackDeleteResponse,
     RpcNativeKanbanFeedbackStageResponse,
+    RpcNativeCodexAttachmentDeleteResponse,
+    RpcNativeCodexAttachmentStageResponse,
     RpcCodexLocalSessionSnapshotResponse,
     RpcCodexLocalSessionStatusResponse,
     RpcArchiveCodexLocalSessionResponse,
@@ -141,7 +169,15 @@ export type LocalResumeTargetResult =
 
 export type LocalHandoffResult =
     | { type: 'success' }
-    | { type: 'error'; message: string; code: 'session_not_found' | 'access_denied' | 'already_local' | 'handoff_failed' }
+    | { type: 'error'; message: string; code: 'session_not_found' | 'access_denied' | 'already_local' | 'externally_controlled' | 'handoff_failed' }
+
+export type ControlReleaseResult =
+    | { type: 'success' }
+    | {
+        type: 'error'
+        message: string
+        code: 'session_not_found' | 'access_denied' | 'release_unavailable' | 'release_in_progress' | 'session_busy' | 'queued_messages' | 'release_failed' | 'release_uncertain'
+    }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
     return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -268,6 +304,8 @@ export class SyncEngine {
     private generatedImageCleanupTimer: NodeJS.Timeout | null = null
     /** Sessions that emitted `session-ready` (Cursor ACP load/newSession complete). */
     private readonly sessionReadyIds = new Set<string>()
+    /** Transient gate; durable `metadata.controlOwner` is authoritative after restart. */
+    private readonly controlReleaseSessionIds = new Set<string>()
 
     constructor(
         private readonly store: Store,
@@ -403,7 +441,11 @@ export class SyncEngine {
 
     getMessagesPage(
         sessionId: string,
-        options: { limit: number; before?: { at: number; seq: number } | null }
+        options: {
+            limit: number
+            before?: { at: number; seq: number } | null
+            after?: { at: number; seq: number } | null
+        }
     ): {
         messages: DecryptedMessage[]
         page: {
@@ -411,6 +453,9 @@ export class SyncEngine {
             nextBeforeSeq: number | null
             nextBeforeAt: number | null
             hasMore: boolean
+            nextAfterSeq?: number | null
+            nextAfterAt?: number | null
+            hasMoreAfter?: boolean
         }
     } {
         return this.messageService.getMessagesPage(sessionId, options)
@@ -578,6 +623,13 @@ export class SyncEngine {
             scheduledAt?: number | null
         }
     ): Promise<void> {
+        const session = this.getSession(sessionId)
+        if (this.controlReleaseSessionIds.has(sessionId)) {
+            throw new Error('SHAPI is releasing control of this session')
+        }
+        if (session?.metadata?.controlOwner === 'external') {
+            throw new Error('This session is controlled by another program and is read-only in SHAPI')
+        }
         await this.messageService.sendMessage(sessionId, payload)
         this.sessionCache.markMessageQueued(sessionId)
         this.sessionCache.recordSessionActivity(sessionId, Date.now())
@@ -588,10 +640,6 @@ export class SyncEngine {
         messageId: string
     ): Promise<CancelQueuedMessageResult> {
         return this.messageService.cancelQueuedMessage(sessionId, messageId)
-    }
-
-    sweepImmediateQueuedOnSessionEnd(sessionId: string, invokedAt: number): void {
-        this.messageService.sweepImmediateQueuedOnSessionEnd(sessionId, invokedAt)
     }
 
     async approvePermission(
@@ -891,7 +939,8 @@ export class SyncEngine {
         effort?: string,
         permissionMode?: PermissionMode,
         serviceTier?: string,
-        forkSessionId?: string
+        forkSessionId?: string,
+        approvedNewDirectoryCreation?: boolean
     ): Promise<{ type: 'success'; sessionId: string } | { type: 'error'; message: string }> {
         return await this.rpcGateway.spawnSession(
             machineId,
@@ -906,8 +955,13 @@ export class SyncEngine {
             effort,
             permissionMode,
             serviceTier,
-            forkSessionId
+            forkSessionId,
+            approvedNewDirectoryCreation
         )
+    }
+
+    async setMonitorSessionMetadata(sessionId: string, monitorSession: MonitorSessionMetadata): Promise<void> {
+        await this.sessionCache.setMonitorSessionMetadata(sessionId, monitorSession)
     }
 
     async createSideSession(sessionId: string, namespace: string): Promise<CreateSideSessionResponse> {
@@ -1053,6 +1107,13 @@ export class SyncEngine {
 
         const session = access.session
         const metadata = session.metadata
+        if (metadata?.controlOwner === 'external') {
+            return {
+                type: 'error',
+                message: 'This session is controlled by another program and is read-only in SHAPI',
+                code: 'resume_unavailable'
+            }
+        }
         if (!metadata || typeof metadata.path !== 'string' || metadata.path.length === 0) {
             return { type: 'error', message: 'Session metadata missing path', code: 'resume_unavailable' }
         }
@@ -1399,6 +1460,12 @@ export class SyncEngine {
         }
 
         const initialSession = access.session
+        if (this.controlReleaseSessionIds.has(access.sessionId)) {
+            return { type: 'error', message: 'SHAPI is releasing control of this session', code: 'resume_unavailable' }
+        }
+        if (initialSession.metadata?.controlOwner === 'external') {
+            return { type: 'error', message: 'This session is controlled by another program and is read-only in SHAPI', code: 'resume_unavailable' }
+        }
         if (initialSession.active) {
             return { type: 'success', sessionId: access.sessionId }
         }
@@ -1550,6 +1617,13 @@ export class SyncEngine {
         const session = access.session
         const metadata = session.metadata
 
+        if (this.controlReleaseSessionIds.has(access.sessionId)) {
+            return { type: 'error', message: 'SHAPI is releasing control of this session', code: 'resume_unavailable' }
+        }
+        if (metadata?.controlOwner === 'external') {
+            return { type: 'error', message: 'This session is controlled by another program and is read-only in SHAPI', code: 'resume_unavailable' }
+        }
+
         if (session.active) {
             return { type: 'success', sessionId: access.sessionId, resumed: false }
         }
@@ -1626,6 +1700,14 @@ export class SyncEngine {
             }
         }
 
+        if (access.session.metadata?.controlOwner === 'external') {
+            return {
+                type: 'error',
+                message: 'This session is controlled by another program and cannot be handed to a SHAPI terminal',
+                code: 'externally_controlled'
+            }
+        }
+
         if (!access.session.active) {
             return { type: 'success' }
         }
@@ -1658,6 +1740,174 @@ export class SyncEngine {
         }
 
         return { type: 'success' }
+    }
+
+    /**
+     * Stop only the SHAPI-owned Codex runner process so another program can
+     * reopen the persisted native thread.  This deliberately does not start
+     * or launch another controller. Refusing while a turn or queued delivery exists
+     * is safer than claiming a message was delivered during the handoff.
+     */
+    async releaseSessionControl(sessionId: string, namespace: string): Promise<ControlReleaseResult> {
+        const access = this.sessionCache.resolveSessionAccess(sessionId, namespace)
+        if (!access.ok) {
+            return {
+                type: 'error',
+                message: access.reason === 'access-denied' ? 'Session access denied' : 'Session not found',
+                code: access.reason === 'access-denied' ? 'access_denied' : 'session_not_found'
+            }
+        }
+
+        const session = access.session
+        if (this.controlReleaseSessionIds.has(access.sessionId)) {
+            return {
+                type: 'error',
+                message: 'SHAPI is already releasing control for this session',
+                code: 'release_in_progress'
+            }
+        }
+        if (session.metadata?.controlOwner === 'external' && !session.active) {
+            // Durable, inactive external ownership makes retries idempotent.
+            // An active row must still contact the runner: the marker may be
+            // left behind by a lost acknowledgement before teardown.
+            return { type: 'success' }
+        }
+        this.controlReleaseSessionIds.add(access.sessionId)
+
+        try {
+            if (session.metadata?.flavor !== 'codex' || session.metadata.startedFromRunner !== true) {
+                return {
+                    type: 'error',
+                    message: 'Only SHAPI-managed Codex sessions can be released from SHAPI control',
+                    code: 'release_unavailable'
+                }
+            }
+
+            if (!session.active) {
+                try {
+                    await this.sessionCache.setSessionControlOwner(access.sessionId, 'external')
+                } catch (error) {
+                    return {
+                        type: 'error',
+                        message: error instanceof Error ? error.message : 'Failed to reserve external control',
+                        code: 'release_failed'
+                    }
+                }
+                return { type: 'success' }
+            }
+
+            if (session.agentState?.controlledByUser === true) {
+                return {
+                    type: 'error',
+                    message: 'Session is already controlled by a local terminal',
+                    code: 'release_unavailable'
+                }
+            }
+
+            const pendingRequests = Object.keys(session.agentState?.requests ?? {}).length
+            if (session.thinking || session.backgroundTaskCount || pendingRequests > 0) {
+                return {
+                    type: 'error',
+                    message: 'Wait for the current Codex turn to finish before releasing control',
+                    code: 'session_busy'
+                }
+            }
+
+            const queued = this.store.messages.getUninvokedLocalMessages(access.sessionId)
+            if (queued.length > 0) {
+                return {
+                    type: 'error',
+                    message: 'Send or cancel all queued messages before releasing control',
+                    code: 'queued_messages'
+                }
+            }
+
+            // Claim ownership before sending the RPC. Every web send/resume path
+            // now consults this durable marker, so a lost acknowledgement cannot
+            // race a new SHAPI-controlled turn into the same Codex thread.
+            try {
+                await this.sessionCache.setSessionControlOwner(access.sessionId, 'external')
+            } catch (error) {
+                return {
+                    type: 'error',
+                    message: error instanceof Error ? error.message : 'Failed to reserve external control',
+                    code: 'release_failed'
+                }
+            }
+
+            // A send that began immediately before the gate was set can finish
+            // during the version-safe metadata write. This point is still before
+            // the RPC, so clear our provisional marker and refuse safely.
+            if (this.store.messages.getUninvokedLocalMessages(access.sessionId).length > 0) {
+                try {
+                    await this.sessionCache.clearSessionControlOwner(access.sessionId, 'external')
+                } catch {
+                    return {
+                        type: 'error',
+                        message: 'Queued messages appeared while releasing control; SHAPI kept the session read-only to avoid duplicate delivery',
+                        code: 'release_uncertain'
+                    }
+                }
+                return {
+                    type: 'error',
+                    message: 'Send or cancel all queued messages before releasing control',
+                    code: 'queued_messages'
+                }
+            }
+
+            try {
+                await this.rpcGateway.handoffSessionToLocal(access.sessionId, 'external')
+            } catch (error) {
+                // Only an explicit runner refusal or a missing target is known to
+                // be pre-handoff. Timeouts/protocol failures are ambiguous, so
+                // retain the marker and make SHAPI read-only.
+                if (error instanceof HandoffRejectedError || error instanceof RpcTargetMissingError) {
+                    try {
+                        await this.sessionCache.clearSessionControlOwner(access.sessionId, 'external')
+                    } catch {
+                        return {
+                            type: 'error',
+                            message: 'Runner refused release, but SHAPI could not safely clear the external ownership marker',
+                            code: 'release_uncertain'
+                        }
+                    }
+                    return {
+                        type: 'error',
+                        message: error.message,
+                        code: 'release_failed'
+                    }
+                }
+                return {
+                    type: 'error',
+                    message: 'Release status was not confirmed; SHAPI kept this session read-only for another program',
+                    code: 'release_uncertain'
+                }
+            }
+
+            // After the runner acknowledgement it is unsafe to roll ownership
+            // back. If a late queued row exists, leave it visibly unsent and
+            // require a future explicit recovery rather than falsely delivering.
+            if (this.store.messages.getUninvokedLocalMessages(access.sessionId).length > 0) {
+                return {
+                    type: 'error',
+                    message: 'A queued message was detected during release; SHAPI kept the session read-only and did not mark it delivered',
+                    code: 'release_uncertain'
+                }
+            }
+
+            const inactive = await this.waitForSessionInactive(access.sessionId)
+            if (!inactive) {
+                return {
+                    type: 'error',
+                    message: 'Release status was not confirmed; SHAPI kept this session read-only for another program',
+                    code: 'release_uncertain'
+                }
+            }
+
+            return { type: 'success' }
+        } finally {
+            this.controlReleaseSessionIds.delete(access.sessionId)
+        }
     }
 
     private recoverClaudeSessionIdFromMessages(sessionId: string, namespace: string): string | null {
@@ -1814,8 +2064,58 @@ export class SyncEngine {
         return await this.rpcGateway.listMachineDirectory(machineId, path)
     }
 
+    async browseSessionFiles(machineId: string, cwd: string, request: import('@hapi/protocol/apiTypes').SessionFileBrowserRequest): Promise<import('@hapi/protocol/apiTypes').SessionFileBrowserResponse> {
+        return this.rpcGateway.browseSessionFiles(machineId, cwd, request)
+    }
+
     async getMachineGitBranch(machineId: string, cwd: string): Promise<RpcGitBranchResponse> {
         return await this.rpcGateway.getMachineGitBranch(machineId, cwd)
+    }
+
+    async getMachineGitBranches(machineId: string, cwd: string): Promise<RpcGitBranchesResponse> {
+        return await this.rpcGateway.getMachineGitBranches(machineId, cwd)
+    }
+
+    async switchMachineGitBranch(
+        machineId: string,
+        request: MachineGitBranchSwitchRequest
+    ): Promise<RpcGitBranchesResponse> {
+        return await this.rpcGateway.switchMachineGitBranch(machineId, request)
+    }
+
+    async createMachineGitBranch(
+        machineId: string,
+        request: MachineGitBranchCreateRequest
+    ): Promise<RpcGitBranchesResponse> {
+        return await this.rpcGateway.createMachineGitBranch(machineId, request)
+    }
+
+    async commitMachineGitChanges(
+        machineId: string,
+        request: MachineGitBranchCommitRequest
+    ): Promise<RpcGitBranchesResponse> {
+        return await this.rpcGateway.commitMachineGitChanges(machineId, request)
+    }
+
+    async pushMachineGitBranch(
+        machineId: string,
+        request: MachineGitBranchPushRequest
+    ): Promise<RpcGitBranchesResponse> {
+        return await this.rpcGateway.pushMachineGitBranch(machineId, request)
+    }
+
+    async fetchMachineGitBranches(
+        machineId: string,
+        request: MachineGitBranchFetchRequest
+    ): Promise<RpcGitBranchesResponse> {
+        return await this.rpcGateway.fetchMachineGitBranches(machineId, request)
+    }
+
+    async updateMachineGitBranch(
+        machineId: string,
+        request: MachineGitBranchUpdateRequest
+    ): Promise<RpcGitBranchesResponse> {
+        return await this.rpcGateway.updateMachineGitBranch(machineId, request)
     }
 
     async readMachineFile(machineId: string, cwd: string, path: string): Promise<RpcReadFileResponse> {
@@ -1857,6 +2157,26 @@ export class SyncEngine {
         return await this.rpcGateway.getCodexLocalSessionStatus(machineId, sessionId)
     }
 
+    async recoverCodexLocalSessionControl(machineId: string, request: RecoverCodexLocalSessionControlRequest): Promise<CodexLocalSessionRecoveryResponse> {
+        return await this.rpcGateway.recoverCodexLocalSessionControl(machineId, request)
+    }
+
+    async getCodexLocalSessionRecovery(machineId: string, sessionId: string): Promise<CodexLocalSessionRecoveryResponse> {
+        return await this.rpcGateway.getCodexLocalSessionRecovery(machineId, sessionId)
+    }
+
+    async renameCodexLocalSession(machineId: string, sessionId: string, name: string): Promise<RenameNativeCodexSessionResponse> {
+        return await this.rpcGateway.renameCodexLocalSession(machineId, sessionId, name)
+    }
+
+    async controlCodexLocalSession(
+        machineId: string,
+        sessionId: string,
+        action: NativeCodexSessionControlAction
+    ): Promise<NativeCodexSessionControlResponse> {
+        return await this.rpcGateway.controlCodexLocalSession(machineId, sessionId, action)
+    }
+
     async getCodexLocalSessionComposerCapabilities(
         machineId: string,
         sessionId: string
@@ -1872,9 +2192,11 @@ export class SyncEngine {
         clientMessageId?: string,
         forceRecovery?: boolean,
         deliveryPolicy?: NativeCodexDeliveryPolicy,
-        reviewGuard?: NativeKanbanFeedbackReviewGuard
+        reviewGuard?: NativeKanbanFeedbackReviewGuard,
+        attachmentIds?: readonly string[],
+        allowHapiInitiated = false
     ): Promise<RpcSendCodexLocalSessionMessageResponse> {
-        return await this.rpcGateway.sendCodexLocalSessionMessage(
+        const args = [
             machineId,
             sessionId,
             message,
@@ -1882,8 +2204,12 @@ export class SyncEngine {
             clientMessageId,
             forceRecovery,
             deliveryPolicy,
-            reviewGuard
-        )
+            reviewGuard,
+            attachmentIds
+        ] as const
+        return allowHapiInitiated
+            ? await this.rpcGateway.sendCodexLocalSessionMessage(...args, true)
+            : await this.rpcGateway.sendCodexLocalSessionMessage(...args)
     }
 
     async discardCodexLocalSessionMessage(
@@ -1913,6 +2239,20 @@ export class SyncEngine {
         request: NativeKanbanFeedbackDeleteRequest
     ): Promise<RpcNativeKanbanFeedbackDeleteResponse> {
         return await this.rpcGateway.deleteNativeKanbanFeedback(machineId, request)
+    }
+
+    async stageNativeCodexAttachment(
+        machineId: string,
+        request: NativeCodexAttachmentStageRequest
+    ): Promise<RpcNativeCodexAttachmentStageResponse> {
+        return await this.rpcGateway.stageNativeCodexAttachment(machineId, request)
+    }
+
+    async deleteNativeCodexAttachment(
+        machineId: string,
+        request: NativeCodexAttachmentDeleteRequest
+    ): Promise<RpcNativeCodexAttachmentDeleteResponse> {
+        return await this.rpcGateway.deleteNativeCodexAttachment(machineId, request)
     }
 
     async getGitStatus(sessionId: string, cwd?: string): Promise<RpcCommandResponse> {
@@ -2023,10 +2363,18 @@ export class SyncEngine {
 
     async listSkills(sessionId: string, flavor?: string): Promise<{
         success: boolean
-        skills?: Array<{ name: string; description?: string; scope?: 'project' | 'user' | 'plugin' | 'system' | 'admin' }>
+        skills?: Array<{ name: string; description?: string; scope?: 'hub' | 'project' | 'user' | 'plugin' | 'system' | 'admin' }>
         error?: string
     }> {
         return await this.rpcGateway.listSkills(sessionId, flavor)
+    }
+
+    async reconcileManagedSkill(machineId: string, payload: unknown): Promise<unknown> {
+        return await this.rpcGateway.reconcileManagedSkill(machineId, payload)
+    }
+
+    async removeManagedSkill(machineId: string, id: string): Promise<unknown> {
+        return await this.rpcGateway.removeManagedSkill(machineId, id)
     }
 
     async listCodexModelsForSession(sessionId: string): Promise<RpcListCodexModelsResponse> {
@@ -2037,7 +2385,7 @@ export class SyncEngine {
         const session = this.getSession(sessionId)
         const model = session?.model ?? null
         try {
-            return await this.rpcGateway.getCodexSubscriptionLimitsForSession(sessionId, model)
+            return await this.rpcGateway.getCodexSubscriptionLimitsForSession(sessionId, model, session?.metadata?.path, session?.metadata?.codexModelProvider)
         } catch (error) {
             if (!(error instanceof RpcTargetMissingError)) {
                 throw error
@@ -2050,20 +2398,20 @@ export class SyncEngine {
             const targetMachine = (() => {
                 if (metadata?.machineId) {
                     const exact = onlineMachines.find((machine) => machine.id === metadata.machineId)
-                    if (exact) return exact
+                    return exact ?? null
                 }
                 if (metadata?.host) {
-                    const hostMatch = onlineMachines.find((machine) => machine.metadata?.host === metadata.host)
-                    if (hostMatch) return hostMatch
+                    const matches = onlineMachines.filter((machine) => machine.metadata?.host === metadata.host)
+                    return matches.length === 1 ? matches[0] : null
                 }
-                return onlineMachines.length === 1 ? onlineMachines[0] : null
+                return null
             })()
 
             if (!targetMachine) {
                 throw error
             }
 
-            return await this.rpcGateway.getCodexSubscriptionLimitsForMachine(targetMachine.id, model)
+            return await this.rpcGateway.getCodexSubscriptionLimitsForMachine(targetMachine.id, model, metadata?.path, metadata?.codexModelProvider)
         }
     }
 
@@ -2073,9 +2421,11 @@ export class SyncEngine {
 
     async getCodexSubscriptionLimitsForMachine(
         machineId: string,
-        model?: string | null
+        model?: string | null,
+        cwd?: string | null,
+        provider?: string | null
     ): Promise<RpcGetCodexSubscriptionLimitsResponse> {
-        return await this.rpcGateway.getCodexSubscriptionLimitsForMachine(machineId, model)
+        return await this.rpcGateway.getCodexSubscriptionLimitsForMachine(machineId, model, cwd, provider)
     }
 
     async listCursorModelsForSession(sessionId: string): Promise<RpcListCursorModelsResponse> {
@@ -2098,6 +2448,10 @@ export class SyncEngine {
         return await this.rpcGateway.checkLocalPreview(machineId, request)
     }
 
+    async openLocalServiceTunnel(machineId: string, request: LocalServiceTunnelRequest, namespace: string): Promise<LocalServiceTunnel> {
+        return await this.rpcGateway.openLocalServiceTunnel(machineId, request, namespace)
+    }
+
     async proxyLocalPreviewRequest(machineId: string, request: LocalPreviewHttpRequest): Promise<LocalPreviewHttpResponse> {
         return await this.rpcGateway.proxyLocalPreviewRequest(machineId, request)
     }
@@ -2112,6 +2466,18 @@ export class SyncEngine {
 
     async readOpenVikingContext(machineId: string, request: OpenVikingContextReadRequest): Promise<RpcOpenVikingContextReadResponse> {
         return await this.rpcGateway.readOpenVikingContext(machineId, request)
+    }
+
+    async getOpenVikingMetrics(machineId: string): Promise<RpcOpenVikingMetricsResponse> {
+        return await this.rpcGateway.getOpenVikingMetrics(machineId)
+    }
+
+    async searchOpenViking(machineId: string, request: OpenVikingSearchRequest): Promise<RpcOpenVikingSearchResponse> {
+        return await this.rpcGateway.searchOpenViking(machineId, request)
+    }
+
+    async getOpenVikingQuality(machineId: string): Promise<RpcOpenVikingQualityResponse> {
+        return await this.rpcGateway.getOpenVikingQuality(machineId)
     }
 
     /** Generic Pi RPC — delegates to rpcGateway.callPiRpc. */

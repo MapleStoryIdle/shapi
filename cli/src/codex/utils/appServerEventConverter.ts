@@ -1,4 +1,5 @@
 import { logger } from '@/ui/logger';
+import { extractCodexFailureMessage } from '@hapi/protocol';
 
 type ConvertedEvent = {
     type: string;
@@ -54,6 +55,17 @@ function extractCommand(value: unknown): string | null {
         return parts.length > 0 ? parts.join(' ') : null;
     }
     return null;
+}
+
+function extractCommandMeta(item: Record<string, unknown>): Record<string, unknown> {
+    const command = extractCommand(item.command ?? item.cmd ?? item.args);
+    const cwd = asString(item.cwd ?? item.workingDirectory ?? item.working_directory);
+    const autoApproved = asBoolean(item.autoApproved ?? item.auto_approved);
+    const meta: Record<string, unknown> = {};
+    if (command) meta.command = command;
+    if (cwd) meta.cwd = cwd;
+    if (autoApproved !== null) meta.auto_approved = autoApproved;
+    return meta;
 }
 
 function extractGeneratedImagePath(item: Record<string, unknown>): string | null {
@@ -355,6 +367,51 @@ function extractStringArray(value: unknown): string[] {
         : [];
 }
 
+function getFirstConfigString(
+    records: Array<Record<string, unknown> | null>,
+    keys: string[]
+): string | null {
+    for (const record of records) {
+        if (!record) continue;
+        for (const key of keys) {
+            const value = asString(record[key]);
+            if (value) return value;
+        }
+    }
+    return null;
+}
+
+/** Preserve a child thread's effective configuration for the HAPI subagent card. */
+function extractThreadConfiguration(
+    params: Record<string, unknown>,
+    thread: Record<string, unknown>
+): Record<string, string> {
+    const turn = asRecord(params.turn);
+    const records = [
+        turn,
+        asRecord(turn?.config),
+        asRecord(turn?.configuration),
+        thread,
+        asRecord(thread.config),
+        asRecord(thread.configuration),
+        asRecord(params.config),
+        asRecord(params.configuration),
+        params
+    ];
+    const model = getFirstConfigString(records, ['model', 'modelId', 'model_id']);
+    const reasoningEffort = getFirstConfigString(records, [
+        'reasoningEffort',
+        'reasoning_effort',
+        'modelReasoningEffort',
+        'model_reasoning_effort'
+    ]);
+
+    return {
+        ...(model ? { model } : {}),
+        ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {})
+    };
+}
+
 function buildCollabAgentInput(item: Record<string, unknown>, toolName: string): Record<string, unknown> {
     const targets = extractStringArray(item.receiverThreadIds ?? item.receiver_thread_ids ?? item.targets);
     const input: Record<string, unknown> = {};
@@ -552,7 +609,7 @@ export class AppServerEventConverter {
                 event.thread_id = threadId;
             }
             if (msgType === 'task_failed') {
-                const error = asString(msg.error ?? msg.message ?? asRecord(msg.error)?.message);
+                const error = extractCodexFailureMessage([msg.error, msg.message, msg.reason]);
                 if (error) {
                     event.error = error;
                 }
@@ -601,7 +658,7 @@ export class AppServerEventConverter {
             if (willRetry) {
                 return [];
             }
-            const error = asString(msg.message ?? msg.reason ?? errorRecord?.message);
+            const error = extractCodexFailureMessage([msg.error, msg.message, msg.reason, errorRecord]);
             return error ? addEventScope([{ type: 'task_failed', error }], msgScope) : [];
         }
 
@@ -720,7 +777,11 @@ export class AppServerEventConverter {
             const thread = asRecord(paramsRecord.thread) ?? paramsRecord;
             const threadId = asString(thread.threadId ?? thread.thread_id ?? thread.id);
             if (threadId) {
-                events.push({ type: 'thread_started', thread_id: threadId });
+                events.push({
+                    type: 'thread_started',
+                    thread_id: threadId,
+                    ...extractThreadConfiguration(paramsRecord, thread)
+                });
             }
             return events;
         }
@@ -731,7 +792,12 @@ export class AppServerEventConverter {
             const status = asRecord(paramsRecord.status ?? thread.status);
             const statusType = asString(status?.type ?? paramsRecord.statusType ?? paramsRecord.status_type);
             if (statusType === 'systemError') {
-                const error = asString(status?.message ?? status?.error ?? paramsRecord.message ?? paramsRecord.error)
+                const error = extractCodexFailureMessage([
+                    status?.error,
+                    status?.message,
+                    paramsRecord.error,
+                    paramsRecord.message,
+                ])
                     ?? 'Codex thread entered systemError';
                 events.push(scoped({
                     type: 'task_failed',
@@ -746,7 +812,21 @@ export class AppServerEventConverter {
         if (method === 'turn/started') {
             const turn = asRecord(paramsRecord.turn) ?? paramsRecord;
             const turnId = asString(turn.turnId ?? turn.turn_id ?? turn.id);
-            events.push(scoped({ type: 'task_started', ...(turnId ? { turn_id: turnId } : {}) }));
+            const thread = asRecord(paramsRecord.thread) ?? paramsRecord;
+            const threadId = asString(
+                turn.threadId
+                ?? turn.thread_id
+                ?? thread.threadId
+                ?? thread.thread_id
+                ?? thread.id
+                ?? eventScope.thread_id
+            );
+            events.push(scoped({
+                type: 'task_started',
+                ...(threadId ? { thread_id: threadId } : {}),
+                ...(turnId ? { turn_id: turnId } : {}),
+                ...extractThreadConfiguration(paramsRecord, thread)
+            }));
             return events;
         }
 
@@ -755,7 +835,14 @@ export class AppServerEventConverter {
             const statusRaw = asString(paramsRecord.status ?? turn.status);
             const status = statusRaw?.toLowerCase();
             const turnId = asString(turn.turnId ?? turn.turn_id ?? turn.id);
-            const errorMessage = asString(paramsRecord.error ?? paramsRecord.message ?? paramsRecord.reason);
+            const errorMessage = extractCodexFailureMessage([
+                paramsRecord.error,
+                turn.error,
+                paramsRecord.message,
+                turn.message,
+                paramsRecord.reason,
+                turn.reason,
+            ]);
 
             if (status === 'interrupted' || status === 'cancelled' || status === 'canceled') {
                 events.push(scoped({ type: 'turn_aborted', ...(turnId ? { turn_id: turnId } : {}) }));
@@ -788,7 +875,7 @@ export class AppServerEventConverter {
         if (method === 'error') {
             const willRetry = asBoolean(paramsRecord.will_retry ?? paramsRecord.willRetry) ?? false;
             if (willRetry) return events;
-            const message = asString(paramsRecord.message) ?? asString(asRecord(paramsRecord.error)?.message);
+            const message = extractCodexFailureMessage([paramsRecord.error, paramsRecord.message, paramsRecord.reason]);
             if (message) {
                 events.push(scoped({ type: 'task_failed', error: message }));
             }
@@ -916,13 +1003,7 @@ export class AppServerEventConverter {
 
             if (itemType === 'commandexecution') {
                 if (method === 'item/started') {
-                    const command = extractCommand(item.command ?? item.cmd ?? item.args);
-                    const cwd = asString(item.cwd ?? item.workingDirectory ?? item.working_directory);
-                    const autoApproved = asBoolean(item.autoApproved ?? item.auto_approved);
-                    const meta: Record<string, unknown> = {};
-                    if (command) meta.command = command;
-                    if (cwd) meta.cwd = cwd;
-                    if (autoApproved !== null) meta.auto_approved = autoApproved;
+                    const meta = extractCommandMeta(item);
                     this.commandMeta.set(itemId, meta);
 
                     events.push(scoped({
@@ -933,12 +1014,25 @@ export class AppServerEventConverter {
                 }
 
                 if (method === 'item/completed') {
-                    const meta = this.commandMeta.get(itemId) ?? {};
+                    const hadStarted = this.commandMeta.has(itemId);
+                    const meta = this.commandMeta.get(itemId) ?? extractCommandMeta(item);
                     const output = asString(item.output ?? item.result ?? item.stdout) ?? this.commandOutputBuffers.get(itemId);
                     const stderr = asString(item.stderr);
                     const error = asString(item.error);
                     const exitCode = asNumber(item.exitCode ?? item.exit_code ?? item.exitcode);
                     const status = asString(item.status);
+
+                    // App-server recovery can report a command completion after a
+                    // restart without replaying its start event. Emit a nearby
+                    // begin event so paginated clients can still pair the result
+                    // with the command name and input.
+                    if (!hadStarted) {
+                        events.push(scoped({
+                            type: 'exec_command_begin',
+                            call_id: itemId,
+                            ...meta
+                        }));
+                    }
 
                     events.push(scoped({
                         type: 'exec_command_end',

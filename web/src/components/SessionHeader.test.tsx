@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { ReactNode } from 'react'
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { I18nContext, I18nProvider } from '@/lib/i18n-context'
 import { MOBILE_LAYOUT_CONTRACT } from '@/lib/mobileLayoutContract'
@@ -8,7 +8,7 @@ import { SessionConnectionProvider } from '@/lib/session-connection-context'
 import { ToastProvider } from '@/lib/toast-context'
 import type { ApiClient } from '@/api/client'
 import type { Session } from '@/types/api'
-import { SessionConnectionRecoveryControl, SessionHeader, SessionTitleDetails } from './SessionHeader'
+import { buildSessionHeaderDetails, CodexSubscriptionLimitsBadge, SessionConnectionRecoveryControl, SessionHeader, SessionTitleDetails } from './SessionHeader'
 
 afterEach(() => {
     cleanup()
@@ -43,6 +43,49 @@ function createSession(): Session {
 }
 
 describe('mobile layout contract', () => {
+    it('shows the native Codex ID separately for a managed Codex session', () => {
+        const details = buildSessionHeaderDetails({
+            title: 'Task',
+            sessionId: 'shapi-session',
+            codexSessionId: 'codex-thread'
+        }, key => key)
+
+        expect(details).toEqual(expect.arrayContaining([
+            expect.objectContaining({ key: 'session-id', value: 'shapi-session' }),
+            expect.objectContaining({ key: 'codex-session-id', value: 'codex-thread' })
+        ]))
+    })
+
+    it('keeps the quota badge hidden until quota data is available', () => {
+        const { container } = render(<I18nProvider><CodexSubscriptionLimitsBadge limits={null} isFetching error={null} /></I18nProvider>)
+        expect(container.querySelector('button')).toBeNull()
+    })
+    it('keeps group in title details and refreshes it without altering the title', () => {
+        const onSetGroup = vi.fn()
+        const detailsRef = { current: buildSessionHeaderDetails({ title: 'Task', sessionId: 's', group: { id: 'g', name: 'Release', emoji: '🚀' }, onSetGroup }, key => key) }
+        const { rerender } = render(<I18nProvider><SessionTitleDetails title="Task" detailsRef={detailsRef} detailsRevision="Release" /></I18nProvider>)
+        fireEvent.click(screen.getByTitle('Task'))
+        expect(screen.getByRole('button', { name: '🚀 Release' })).toBeInTheDocument()
+        detailsRef.current = buildSessionHeaderDetails({ title: 'Task', sessionId: 's', group: { id: 'g', name: 'Review', emoji: '🔎' }, onSetGroup }, key => key)
+        rerender(<I18nProvider><SessionTitleDetails title="Task" detailsRef={detailsRef} detailsRevision="Review" /></I18nProvider>)
+        fireEvent.click(screen.getByRole('button', { name: '🔎 Review' }))
+        expect(onSetGroup).toHaveBeenCalledOnce()
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+        expect(screen.getByTitle('Task')).toHaveTextContent('Task')
+    })
+
+    it('opens rename from the title details popover', () => {
+        const onRename = vi.fn()
+        render(<I18nProvider><SessionTitleDetails title="Task" onRename={onRename} /></I18nProvider>)
+
+        fireEvent.click(screen.getByTitle('Task'))
+        expect(screen.queryByRole('button', { name: 'Copy Full name' })).toBeNull()
+        fireEvent.click(within(screen.getByRole('dialog', { name: 'Session details' })).getByRole('button', { name: 'Rename' }))
+
+        expect(onRename).toHaveBeenCalledOnce()
+        expect(screen.queryByRole('dialog', { name: 'Session details' })).toBeNull()
+    })
+
     it('keeps the full title-bar shell transparent without changing the control surface', () => {
         const queryClient = new QueryClient({
             defaultOptions: {
@@ -73,13 +116,27 @@ describe('mobile layout contract', () => {
         expect(shell).toHaveClass('pointer-events-none', 'z-40', 'isolate')
 
         const controls = screen.getByTestId('session-header-controls')
-        expect(controls).toHaveClass('pointer-events-auto', 'h-11', 'gap-0', 'bg-[var(--app-bg)]')
-        expect(screen.getByRole('button', { name: 'hapi' })).toHaveClass('pl-1', 'pr-2')
+        expect(controls).toHaveClass('pointer-events-auto', 'h-11', 'gap-0', 'pl-1', 'pr-5', 'bg-[var(--app-bg)]')
+        expect(screen.getByRole('button', { name: 'hapi' })).toHaveClass('px-1')
         expect(screen.getByTestId('session-header-row')).toHaveClass('h-14')
     })
 })
 
 describe('SessionHeader back action', () => {
+    it('truncates the title inside a shrinkable text element while keeping the full accessible name', () => {
+        const title = '这里有什么新功能是我之前 fork 出来就脱离主版本的，需要继续确认完整标题'
+        render(
+            <I18nProvider>
+                <SessionTitleDetails title={title} />
+            </I18nProvider>
+        )
+
+        const button = screen.getByRole('button', { name: title })
+        expect(button).toHaveClass('w-full', 'min-w-0')
+        expect(button).toHaveAttribute('title', title)
+        expect(button.querySelector('span')).toHaveClass('min-w-0', 'flex-1', 'truncate')
+    })
+
     it('uses the explicit back callback from the floating header control', () => {
         const queryClient = new QueryClient({
             defaultOptions: {
@@ -198,6 +255,48 @@ describe('SessionHeader back action', () => {
 
         expect(screen.getByText('/workspace/latest')).toBeInTheDocument()
         expect(screen.queryByText('/workspace/old')).not.toBeInTheDocument()
+    })
+
+    it('groups title metadata into compact iOS-style sections inside the safe area', () => {
+        const onSetGroup = vi.fn()
+        render(
+            <I18nProvider>
+                <SessionTitleDetails
+                    title="Investigate production API latency"
+                    sessionId="ios-grouped-details"
+                    details={[
+                        { key: 'title', label: 'Full name', value: 'Investigate production API latency' },
+                        { key: 'group', label: 'Group', value: '🚀 Release', onSelect: onSetGroup },
+                        { key: 'label', label: 'Label', value: 'Urgent' },
+                        { key: 'path', label: 'Project path', value: '/workspace/hapi' },
+                        { key: 'last-activity', label: 'Last activity', value: '9/13/2026, 7:30 PM' },
+                        { key: 'agent', label: 'Agent', value: 'Codex · Model: gpt-5.6 · Reasoning: high', isAgentInfo: true },
+                        { key: 'session-id', label: 'Session ID', value: 'ios-grouped-details' }
+                    ]}
+                />
+            </I18nProvider>
+        )
+
+        fireEvent.click(screen.getByRole('button', { name: 'Investigate production API latency' }))
+
+        const popover = screen.getByTestId('session-title-details-popover')
+        expect(popover).toHaveClass(
+            'overflow-y-auto',
+            'session-title-popover'
+        )
+        expect(popover.querySelectorAll('[data-session-detail-group]')).toHaveLength(4)
+        expect(screen.getByText('gpt-5.6')).toBeInTheDocument()
+        expect(screen.queryByText('ios-grouped-details')).not.toBeInTheDocument()
+
+        fireEvent.click(screen.getByRole('tab', { name: 'Technical' }))
+        expect(screen.getByText('ios-grouped-details')).toBeInTheDocument()
+        expect(screen.queryByText('gpt-5.6')).not.toBeInTheDocument()
+
+        fireEvent.click(screen.getByRole('tab', { name: 'Overview' }))
+
+        fireEvent.click(screen.getByRole('button', { name: '🚀 Release' }))
+        expect(onSetGroup).toHaveBeenCalledOnce()
+        expect(screen.queryByTestId('session-title-details-popover')).not.toBeInTheDocument()
     })
 
     it('opens title details after a cancelled touch falls back to click', () => {
@@ -360,7 +459,7 @@ describe('SessionHeader back action', () => {
         expect(screen.queryByRole('menu')).not.toBeInTheDocument()
     })
 
-    it('exposes the same refresh action when the detail page supplies one', () => {
+    it('omits refresh, outline and export from the detail menu', () => {
         const queryClient = new QueryClient({
             defaultOptions: {
                 queries: { retry: false },
@@ -386,9 +485,10 @@ describe('SessionHeader back action', () => {
         )
 
         fireEvent.click(screen.getByTitle('More actions'))
-        fireEvent.click(screen.getByRole('menuitem', { name: 'Refresh' }))
-
-        expect(onRefresh).toHaveBeenCalledTimes(1)
+        expect(screen.queryByRole('menuitem', { name: 'Refresh' })).toBeNull()
+        expect(screen.queryByRole('menuitem', { name: /outline/i })).toBeNull()
+        expect(screen.queryByRole('menuitem', { name: /export/i })).toBeNull()
+        expect(onRefresh).not.toHaveBeenCalled()
     })
 
     it('uses the selected locale for session detail labels', () => {

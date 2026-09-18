@@ -15,6 +15,8 @@ const harness = vi.hoisted(() => ({
     startThreadIds: [] as string[],
     resumeThreadIds: [] as string[],
     forkThreadIds: [] as string[],
+    forkThreadParams: [] as Array<{ threadId?: string; lastTurnId?: string }>,
+    readThreadResponse: null as unknown,
     startTurnThreadIds: [] as string[],
     startTurnParams: [] as Array<Record<string, unknown>>,
     startTurnErrors: [] as Error[],
@@ -35,6 +37,7 @@ const harness = vi.hoisted(() => ({
     failNextCompact: false,
     deferThreadStatusNotifications: false,
     emitChildThreadEvents: false,
+    emitChildThreadConfiguration: false,
     emitChildUsageEvents: false,
     emitChildSessionEvent: false,
     emitChildGoalEvent: false,
@@ -43,9 +46,13 @@ const harness = vi.hoisted(() => ({
     emitChildWaitStructuredOutput: false,
     emitChildTaskCompleteBeforeMessage: false,
     suppressChildTaskCompleteEvent: false,
+    suppressChildCommandEnd: false,
     emitSecondChildMessage: false,
+    emitChildFailureSequence: false,
     emitLateChildCommandAfterParentTool: false,
     emitParentUsageEvents: false,
+    emitParentUsageModelSwitch: false,
+    parentUsageEmissionCount: 0,
     emitParentMessageSnapshots: false,
     emitParentSessionEvents: false,
     emitParentGoalDuplicateEvents: false,
@@ -61,6 +68,7 @@ const harness = vi.hoisted(() => ({
     emitRunningChildTurnBeforeSuppressedParent: false,
     emitCompletedChildTurnBeforeSuppressedParent: false,
     emitTurnAbortedOnInterrupt: false,
+    disconnectCalls: 0,
     bridgeOptions: [] as unknown[]
 }));
 
@@ -120,9 +128,19 @@ vi.mock('./codexAppServerClient', () => {
             return { thread: { id }, model: 'gpt-5.4' };
         }
 
-        async forkThread(params?: { threadId?: string }): Promise<{ thread: { id: string }; model: string; reasoningEffort: string; serviceTier: string }> {
+        async readThread(params?: { threadId?: string }): Promise<unknown> {
+            return harness.readThreadResponse ?? {
+                thread: {
+                    id: params?.threadId ?? 'thread-unknown',
+                    turns: [{ id: 'turn-completed', status: 'completed' }]
+                }
+            };
+        }
+
+        async forkThread(params?: { threadId?: string; lastTurnId?: string }): Promise<{ thread: { id: string }; model: string; reasoningEffort: string; serviceTier: string }> {
             const sourceId = params?.threadId ?? 'thread-source';
             harness.forkThreadIds.push(sourceId);
+            harness.forkThreadParams.push(params ?? {});
             return {
                 thread: { id: `fork-${sourceId}` },
                 model: 'gpt-5.4',
@@ -394,14 +412,21 @@ vi.mock('./codexAppServerClient', () => {
                 }
 
                 if (harness.emitParentUsageEvents) {
+                    const isModelSwitchUpdate = harness.emitParentUsageModelSwitch && harness.parentUsageEmissionCount++ > 0;
+                    const usageSnapshot = isModelSwitchUpdate
+                        ? { input_tokens: 150, output_tokens: 20 }
+                        : { input_tokens: 100, output_tokens: 10 };
                     const parentUsage = {
                         tokenUsage: {
                             thread_id: threadId,
                             turn_id: turnId,
-                            last_token_usage: {
-                                input_tokens: 100,
-                                output_tokens: 10
-                            },
+                            ...(harness.emitParentUsageModelSwitch
+                                ? {
+                                    total_token_usage: usageSnapshot,
+                                    model: isModelSwitchUpdate ? 'gpt-B' : 'gpt-A',
+                                    reasoning_effort: isModelSwitchUpdate ? 'low' : 'high'
+                                }
+                                : { last_token_usage: usageSnapshot }),
                             model_context_window: 200_000
                         }
                     };
@@ -493,6 +518,18 @@ vi.mock('./codexAppServerClient', () => {
                 const childMessage = 'child output should stay hidden';
                 const secondChildMessage = 'final child output should win';
 
+                if (harness.emitChildThreadConfiguration) {
+                    const childThreadStarted = {
+                        thread: {
+                            id: childThreadId,
+                            model: 'gpt-5.6',
+                            config: { model_reasoning_effort: 'high' }
+                        }
+                    };
+                    harness.notifications.push({ method: 'thread/started', params: childThreadStarted });
+                    this.notificationHandler?.('thread/started', childThreadStarted);
+                }
+
                 const emitChildDone = () => {
                     const childDone = {
                         msg: {
@@ -549,6 +586,25 @@ vi.mock('./codexAppServerClient', () => {
                     };
                     harness.notifications.push({ method: 'item/completed', params: secondChildMessageCompleted });
                     this.notificationHandler?.('item/completed', secondChildMessageCompleted);
+                }
+
+                if (harness.emitChildFailureSequence) {
+                    for (const error of [
+                        'Codex thread entered systemError',
+                        'Selected model is at capacity. Please try a different model.',
+                        'Task failed',
+                    ]) {
+                        const failed = {
+                            msg: {
+                                type: 'task_failed',
+                                thread_id: childThreadId,
+                                turn_id: childTurnId,
+                                error,
+                            }
+                        };
+                        harness.notifications.push({ method: 'codex/event/task_failed', params: failed });
+                        this.notificationHandler?.('codex/event/task_failed', failed);
+                    }
                 }
 
                 if (
@@ -637,17 +693,19 @@ vi.mock('./codexAppServerClient', () => {
                     threadId: childThreadId,
                     turnId: childTurnId
                 });
-                const childCommandEnd = {
-                    item: {
-                        id: 'child-cmd-1',
-                        type: 'commandExecution',
-                        exitCode: 0
-                    },
-                    threadId: childThreadId,
-                    turnId: childTurnId
-                };
-                harness.notifications.push({ method: 'item/completed', params: childCommandEnd });
-                this.notificationHandler?.('item/completed', childCommandEnd);
+                if (!harness.suppressChildCommandEnd) {
+                    const childCommandEnd = {
+                        item: {
+                            id: 'child-cmd-1',
+                            type: 'commandExecution',
+                            exitCode: 0
+                        },
+                        threadId: childThreadId,
+                        turnId: childTurnId
+                    };
+                    harness.notifications.push({ method: 'item/completed', params: childCommandEnd });
+                    this.notificationHandler?.('item/completed', childCommandEnd);
+                }
 
                 const childTitleStart = {
                     item: {
@@ -862,7 +920,9 @@ vi.mock('./codexAppServerClient', () => {
             return {};
         }
 
-        async disconnect(): Promise<void> {}
+        async disconnect(): Promise<void> {
+            harness.disconnectCalls += 1;
+        }
     }
 
     return { CodexAppServerClient: MockCodexAppServerClient };
@@ -880,11 +940,25 @@ vi.mock('./utils/buildHapiMcpBridge', () => ({
     }
 }));
 
-import { codexRemoteLauncher } from './codexRemoteLauncher';
+import {
+    codexRemoteLauncher,
+    isCodexAppServerTransportError,
+    isExactIdleRecoveryThreadRead,
+    readRecoveredCodexThreadState,
+    readSideSessionForkBoundary
+} from './codexRemoteLauncher';
 
 type FakeAgentState = {
     requests: Record<string, unknown>;
     completedRequests: Record<string, unknown>;
+    codex?: {
+        activeSubagentId?: string | null;
+        subagents?: Record<string, {
+            model?: string;
+            modelReasoningEffort?: string;
+        }>;
+        updatedAt?: number;
+    };
 };
 
 function createMode(): EnhancedMode {
@@ -895,13 +969,14 @@ function createMode(): EnhancedMode {
     };
 }
 
-function createSessionStub(messages = ['hello from launcher test'], mode = createMode()) {
+function createSessionStub(messages = ['hello from launcher test'], mode = createMode(), messageModes?: EnhancedMode[]) {
     const queue = new MessageQueue2<EnhancedMode>((mode) => JSON.stringify(mode));
     messages.forEach((message, index) => {
+        const messageMode = messageModes?.[index] ?? mode;
         if (index === 0 && messages.length > 1) {
-            queue.pushIsolateAndClear(message, mode);
+            queue.pushIsolateAndClear(message, messageMode);
         } else {
-            queue.push(message, mode);
+            queue.push(message, messageMode);
         }
     });
     queue.close();
@@ -922,9 +997,12 @@ function createSessionStub(messages = ['hello from launcher test'], mode = creat
         requests: {},
         completedRequests: {}
     };
+    let activeTransportCleanup: (() => Promise<void>) | null = null;
 
     const rpcHandlers = new Map<string, (params: unknown) => unknown>();
+    let usageMetadata: import('@hapi/protocol/types').Metadata = { path: '/tmp/hapi-update', host: 'test' };
     const client = {
+        updateMetadata: vi.fn((handler: (metadata: import('@hapi/protocol/types').Metadata) => import('@hapi/protocol/types').Metadata) => { usageMetadata = handler(usageMetadata); }),
         rpcHandlerManager: {
             registerHandler(method: string, handler: (params: unknown) => unknown) {
                 rpcHandlers.set(method, handler);
@@ -1003,11 +1081,24 @@ function createSessionStub(messages = ['hello from launcher test'], mode = creat
         },
         sendUserMessage(text: string) {
             client.sendUserMessage(text);
+        },
+        updateAgentState(handler: (state: FakeAgentState) => FakeAgentState) {
+            agentState = handler(agentState);
+        },
+        setActiveTransportCleanup(cleanup: () => Promise<void>) {
+            activeTransportCleanup = cleanup;
+        },
+        clearActiveTransportCleanup(cleanup: () => Promise<void>) {
+            if (activeTransportCleanup === cleanup) activeTransportCleanup = null;
+        },
+        async cleanupActiveTransport() {
+            await activeTransportCleanup?.();
         }
     };
 
     return {
         session,
+        getUsageMetadata: () => usageMetadata,
         sessionEvents,
         codexMessages,
         summaryMessages,
@@ -1028,6 +1119,45 @@ function createSessionStub(messages = ['hello from launcher test'], mode = creat
 }
 
 describe('codexRemoteLauncher', () => {
+    it('fails closed for inProgress, missing, and malformed recovery turn state', () => {
+        expect(isExactIdleRecoveryThreadRead({ thread: { id: 'thread-1', turns: [] } }, 'thread-1')).toBe(true);
+        expect(isExactIdleRecoveryThreadRead({ thread: { id: 'thread-1', turns: [{ status: 'interrupted' }] } }, 'thread-1')).toBe(true);
+        expect(isExactIdleRecoveryThreadRead({ thread: { id: 'thread-1', turns: [{ status: 'inProgress' }] } }, 'thread-1')).toBe(false);
+        expect(isExactIdleRecoveryThreadRead({ thread: { id: 'thread-1', turns: [{ status: 'mystery' }] } }, 'thread-1')).toBe(false);
+        expect(isExactIdleRecoveryThreadRead({ thread: { id: 'thread-1' } }, 'thread-1')).toBe(false);
+        expect(isExactIdleRecoveryThreadRead({ thread: { id: 'other', turns: [] } }, 'thread-1')).toBe(false);
+    });
+    it('classifies app-server transport failures and recovered thread state', () => {
+        expect(isCodexAppServerTransportError(new Error('Codex app-server exited (code=null, signal=SIGTERM)'))).toBe(true);
+        expect(isCodexAppServerTransportError(new Error('collaborationMode value failed policy validation'))).toBe(false);
+        expect(readRecoveredCodexThreadState({ thread: { id: 'thread-1', turns: [{ status: 'inProgress' }] } }, 'thread-1')).toBe('active');
+        expect(readRecoveredCodexThreadState({ thread: { id: 'thread-1', turns: [{ status: 'completed' }] } }, 'thread-1')).toBe('idle');
+        expect(readRecoveredCodexThreadState({ thread: { id: 'thread-1', turns: [{ status: 'mystery' }] } }, 'thread-1')).toBe('unknown');
+    });
+    it('selects the last completed side-session boundary before a running turn', () => {
+        expect(readSideSessionForkBoundary({
+            thread: {
+                id: 'thread-1',
+                turns: [
+                    { id: 'turn-1', status: 'completed' },
+                    { id: 'turn-2', status: 'failed' },
+                    { id: 'turn-3', status: 'inProgress' }
+                ]
+            }
+        }, 'thread-1')).toEqual({
+            lastTurnId: 'turn-2',
+            hasInProgressTurn: true
+        });
+        expect(readSideSessionForkBoundary({
+            thread: { id: 'thread-1', turns: [{ id: 'turn-1', status: 'inProgress' }] }
+        }, 'thread-1')).toEqual({
+            lastTurnId: null,
+            hasInProgressTurn: true
+        });
+        expect(readSideSessionForkBoundary({
+            thread: { id: 'thread-1', turns: [{ status: 'completed' }] }
+        }, 'thread-1')).toBeNull();
+    });
     afterEach(() => {
         harness.notifications = [];
         harness.registerRequestCalls = [];
@@ -1041,6 +1171,8 @@ describe('codexRemoteLauncher', () => {
         harness.startThreadIds = [];
         harness.resumeThreadIds = [];
         harness.forkThreadIds = [];
+        harness.forkThreadParams = [];
+        harness.readThreadResponse = null;
         harness.startTurnThreadIds = [];
         harness.startTurnParams = [];
         harness.startTurnErrors = [];
@@ -1061,6 +1193,7 @@ describe('codexRemoteLauncher', () => {
         harness.failNextCompact = false;
         harness.deferThreadStatusNotifications = false;
         harness.emitChildThreadEvents = false;
+        harness.emitChildThreadConfiguration = false;
         harness.emitChildUsageEvents = false;
         harness.emitChildSessionEvent = false;
         harness.emitChildGoalEvent = false;
@@ -1069,9 +1202,13 @@ describe('codexRemoteLauncher', () => {
         harness.emitChildWaitStructuredOutput = false;
         harness.emitChildTaskCompleteBeforeMessage = false;
         harness.suppressChildTaskCompleteEvent = false;
+        harness.suppressChildCommandEnd = false;
         harness.emitSecondChildMessage = false;
+        harness.emitChildFailureSequence = false;
         harness.emitLateChildCommandAfterParentTool = false;
         harness.emitParentUsageEvents = false;
+        harness.emitParentUsageModelSwitch = false;
+        harness.parentUsageEmissionCount = 0;
         harness.emitParentMessageSnapshots = false;
         harness.emitParentSessionEvents = false;
         harness.emitParentGoalDuplicateEvents = false;
@@ -1087,6 +1224,7 @@ describe('codexRemoteLauncher', () => {
         harness.emitRunningChildTurnBeforeSuppressedParent = false;
         harness.emitCompletedChildTurnBeforeSuppressedParent = false;
         harness.emitTurnAbortedOnInterrupt = false;
+        harness.disconnectCalls = 0;
         harness.bridgeOptions = [];
     });
 
@@ -1125,6 +1263,18 @@ describe('codexRemoteLauncher', () => {
         expect(session.thinking).toBe(false);
     });
 
+    it('stops the app-server transport when the owning session closes', async () => {
+        harness.suppressTurnCompletion = true;
+        const { session } = createSessionStub(['keep running']);
+
+        const running = codexRemoteLauncher(session as never);
+        await vi.waitFor(() => expect(harness.startTurnThreadIds).toEqual(['thread-1']));
+        await session.cleanupActiveTransport();
+
+        await expect(running).resolves.toBe('exit');
+        expect(harness.disconnectCalls).toBe(1);
+    });
+
     it('forks the native Codex thread without applying SHAPI model or reasoning overrides', async () => {
         const { session, foundSessionIds, getModel, getModelReasoningEffort, getServiceTier } = createSessionStub(['branch this']);
         session.forkSessionId = 'source-thread';
@@ -1138,6 +1288,70 @@ describe('codexRemoteLauncher', () => {
         expect(getModel()).toBe('gpt-5.4');
         expect(getModelReasoningEffort()).toBe('xhigh');
         expect(getServiceTier()).toBe('fast');
+    });
+
+    it('creates a side session from the last completed turn while the parent turn is running', async () => {
+        harness.suppressTurnCompletion = true;
+        harness.emitTurnAbortedOnInterrupt = true;
+        harness.readThreadResponse = {
+            thread: {
+                id: 'thread-1',
+                turns: [
+                    { id: 'turn-before-running', status: 'completed' },
+                    { id: 'turn-1', status: 'inProgress' }
+                ]
+            }
+        };
+        const { session, rpcHandlers } = createSessionStub(['keep running']);
+
+        const running = codexRemoteLauncher(session as never);
+        await vi.waitFor(() => {
+            expect(harness.startTurnThreadIds).toEqual(['thread-1']);
+            expect(rpcHandlers.has('forkCodexSideSession')).toBe(true);
+        });
+
+        await expect(rpcHandlers.get('forkCodexSideSession')?.({})).resolves.toEqual({
+            type: 'success',
+            childCodexThreadId: 'fork-thread-1',
+            parentCodexThreadId: 'thread-1'
+        });
+        expect(harness.forkThreadParams).toContainEqual({
+            threadId: 'thread-1',
+            lastTurnId: 'turn-before-running'
+        });
+        expect(harness.startTurnMessages).toEqual(['keep running']);
+
+        await rpcHandlers.get('abort')?.({});
+        await expect(running).resolves.toBe('exit');
+    });
+
+    it('starts an empty side thread when the first parent turn is still running', async () => {
+        harness.suppressTurnCompletion = true;
+        harness.emitTurnAbortedOnInterrupt = true;
+        harness.readThreadResponse = {
+            thread: {
+                id: 'thread-1',
+                turns: [{ id: 'turn-1', status: 'inProgress' }]
+            }
+        };
+        const { session, rpcHandlers } = createSessionStub(['first turn']);
+
+        const running = codexRemoteLauncher(session as never);
+        await vi.waitFor(() => {
+            expect(harness.startTurnThreadIds).toEqual(['thread-1']);
+            expect(rpcHandlers.has('forkCodexSideSession')).toBe(true);
+        });
+
+        await expect(rpcHandlers.get('forkCodexSideSession')?.({})).resolves.toEqual({
+            type: 'success',
+            childCodexThreadId: 'thread-2',
+            parentCodexThreadId: 'thread-1'
+        });
+        expect(harness.forkThreadParams).toEqual([]);
+        expect(harness.startThreadIds).toEqual(['thread-1', 'thread-2']);
+
+        await rpcHandlers.get('abort')?.({});
+        await expect(running).resolves.toBe('exit');
     });
 
     it('forwards parent agent message snapshots and final messages with the same stream id', async () => {
@@ -1175,6 +1389,7 @@ describe('codexRemoteLauncher', () => {
             itemId: 'parent-msg-1',
             final: true
         });
+        expect(codexMessages).toContainEqual(expect.objectContaining({ type: 'turn-outcome', outcome: 'completed', turnId: 'turn-1' }));
     });
 
     it('forwards rate updates as normal messages and session events as structured data', async () => {
@@ -1353,8 +1568,45 @@ describe('codexRemoteLauncher', () => {
             message: 'Plan mode is not supported by this Codex runtime. Sent as a normal turn instead.'
         });
         expect(sessionEvents).toContainEqual({
+            type: 'task-status',
+            status: 'failed',
+            source: 'codex',
+            code: 'unknown',
+            message: 'collaborationMode value failed policy validation',
+            recoverable: false
+        });
+        expect(sessionEvents).not.toContainEqual(expect.objectContaining({
+            message: expect.stringContaining('Process exited unexpectedly')
+        }));
+    });
+
+    it('silently restores the same thread after an app-server transport exit', async () => {
+        harness.startTurnErrors.push(new Error('Codex app-server exited (code=null, signal=SIGTERM)'));
+        const { session, sessionEvents } = createSessionStub(['first message']);
+
+        const exitReason = await codexRemoteLauncher(session as never);
+
+        expect(exitReason).toBe('exit');
+        expect(harness.startThreadIds).toEqual(['thread-1']);
+        expect(harness.resumeThreadIds).toEqual(['thread-1']);
+        expect(harness.initializeCalls).toHaveLength(2);
+        expect(session.sessionId).toBe('thread-1');
+        expect(sessionEvents).not.toContainEqual(expect.objectContaining({
+            message: expect.stringContaining('Process exited unexpectedly')
+        }));
+    });
+
+    it('shows the process-exit error only after exact-thread recovery fails', async () => {
+        harness.startTurnErrors.push(new Error('Codex app-server exited (code=1, signal=null)'));
+        harness.failResumeThreadIds = ['thread-1'];
+        const { session, sessionEvents } = createSessionStub(['first message']);
+
+        await codexRemoteLauncher(session as never);
+
+        expect(harness.resumeThreadIds).toEqual(['thread-1']);
+        expect(sessionEvents).toContainEqual({
             type: 'message',
-            message: 'Process exited unexpectedly'
+            message: 'Process exited unexpectedly: Codex app-server exited (code=1, signal=null); recovery failed: resume failed'
         });
     });
 
@@ -1716,6 +1968,48 @@ describe('codexRemoteLauncher', () => {
         expect(session.thinking).toBe(false);
     });
 
+    it('classifies Codex network failures for structured UI display', async () => {
+        harness.nextTurnFailureMessage = 'stream disconnected before completion: error sending request for url (https://chatgpt.com/backend-api/codex/responses)';
+        const { session, sessionEvents } = createSessionStub(['first message']);
+
+        const exitReason = await codexRemoteLauncher(session as never);
+
+        expect(exitReason).toBe('exit');
+        expect(sessionEvents).toContainEqual({
+            type: 'task-status',
+            status: 'failed',
+            source: 'codex',
+            code: 'network_error',
+            message: 'stream disconnected before completion: error sending request for url (https://chatgpt.com/backend-api/codex/responses)',
+            recoverable: false
+        });
+        expect(session.thinking).toBe(false);
+    });
+
+    it('classifies a signed-out Codex account for structured UI display', async () => {
+        harness.nextTurnFailureMessage = 'Authentication required; please run codex login';
+        const { session, sessionEvents } = createSessionStub(['first message']);
+
+        await codexRemoteLauncher(session as never);
+
+        expect(sessionEvents).toContainEqual(expect.objectContaining({
+            type: 'task-status', status: 'failed', code: 'authentication', recoverable: false
+        }));
+        expect(session.thinking).toBe(false);
+    });
+
+    it('classifies HTTP 403 failures instead of falling back to unknown', async () => {
+        harness.nextTurnFailureMessage = 'unexpected status 403 Forbidden: <html>server response</html>';
+        const { session, sessionEvents } = createSessionStub(['first message']);
+
+        await codexRemoteLauncher(session as never);
+
+        expect(sessionEvents).toContainEqual(expect.objectContaining({
+            type: 'task-status', status: 'failed', code: 'http_forbidden', recoverable: false
+        }));
+        expect(session.thinking).toBe(false);
+    });
+
     it('does not start a fresh thread for the next queued message after thread-level systemError', async () => {
         harness.remainingThreadSystemErrors = 1;
         const { session } = createSessionStub(['first message', 'second message']);
@@ -1781,6 +2075,45 @@ describe('codexRemoteLauncher', () => {
                 output: 'ok\n'
             })
         }));
+    });
+
+    it('supplements spawn-agent cards with parent and child effective configuration', async () => {
+        harness.emitParentSpawnStartWithoutEnd = true;
+        harness.emitChildTaskStartedAfterParentSpawnStart = true;
+        harness.emitChildThreadEvents = true;
+        harness.emitChildThreadConfiguration = true;
+        const mode: EnhancedMode = {
+            ...createMode(),
+            model: 'gpt-5.6-parent',
+            modelReasoningEffort: 'xhigh'
+        };
+        const { session, codexMessages, getAgentState } = createSessionStub(['hello from launcher test'], mode);
+
+        await codexRemoteLauncher(session as never);
+
+        expect(codexMessages).toContainEqual(expect.objectContaining({
+            type: 'agent-run-start',
+            cardId: 'failed-spawn',
+            input: expect.objectContaining({
+                reasoning_effort: 'medium',
+                hapiSubagentConfig: {
+                    parentModel: 'gpt-5.4',
+                    parentReasoningEffort: 'xhigh'
+                }
+            })
+        }));
+        expect(codexMessages).toContainEqual(expect.objectContaining({
+            type: 'agent-run-update',
+            agentId: 'child-thread',
+            hapiSubagentConfig: {
+                childModel: 'gpt-5.6',
+                childReasoningEffort: 'high'
+            }
+        }));
+        expect(getAgentState().codex?.subagents?.['child-thread']).toMatchObject({
+            model: 'gpt-5.6',
+            modelReasoningEffort: 'medium'
+        });
     });
 
     it('routes child thread messages into agent-run trace while keeping them out of the parent timeline', async () => {
@@ -1865,6 +2198,50 @@ describe('codexRemoteLauncher', () => {
             result: expect.objectContaining({
                 status: 'done'
             })
+        }));
+    });
+
+    it('closes an unfinished child tool when the child becomes terminal', async () => {
+        harness.emitChildThreadEvents = true;
+        harness.suppressChildCommandEnd = true;
+        const { session, codexMessages, getAgentState } = createSessionStub();
+
+        await codexRemoteLauncher(session as never);
+
+        expect(codexMessages).toContainEqual(expect.objectContaining({
+            type: 'agent-run-trace',
+            agentId: 'child-thread',
+            message: expect.objectContaining({
+                type: 'tool-call-result',
+                callId: 'child-cmd-1',
+                is_error: true,
+                output: 'Subagent ended before the tool completed',
+                completedAt: expect.any(Number)
+            })
+        }));
+        expect(getAgentState().codex?.subagents?.['child-thread']).toMatchObject({
+            status: 'completed',
+            completedAt: expect.any(Number)
+        });
+    });
+
+    it('does not let a trailing generic child failure erase the provider error', async () => {
+        harness.emitChildThreadEvents = true;
+        harness.emitChildFailureSequence = true;
+        const { session, codexMessages } = createSessionStub();
+
+        await codexRemoteLauncher(session as never);
+
+        const failedUpdates = codexMessages.filter((message): message is Record<string, unknown> => {
+            return typeof message === 'object'
+                && message !== null
+                && (message as Record<string, unknown>).type === 'agent-run-update'
+                && (message as Record<string, unknown>).agentId === 'child-thread'
+                && (message as Record<string, unknown>).status === 'failed';
+        });
+        expect(failedUpdates.at(-1)).toEqual(expect.objectContaining({
+            error: 'Selected model is at capacity. Please try a different model.',
+            activity: 'Failed: Selected model is at capacity. Please try a different model.'
         }));
     });
 
@@ -2002,7 +2379,7 @@ describe('codexRemoteLauncher', () => {
         }));
     });
 
-    it('does not regress a terminal child after resume_agent when a late command starts', async () => {
+    it('drops a late child command after a terminal child only receives resume_agent bookkeeping', async () => {
         harness.emitChildThreadEvents = true;
         harness.emitParentResumeSuccess = true;
         harness.emitLateChildCommandAfterParentTool = true;
@@ -2010,7 +2387,7 @@ describe('codexRemoteLauncher', () => {
 
         await codexRemoteLauncher(session as never);
 
-        expect(codexMessages).toContainEqual(expect.objectContaining({
+        expect(codexMessages).not.toContainEqual(expect.objectContaining({
             type: 'agent-run-trace',
             agentId: 'child-thread',
             message: expect.objectContaining({
@@ -2024,6 +2401,12 @@ describe('codexRemoteLauncher', () => {
             activity: 'Running command: echo late',
             activityKind: 'running-command',
             status: 'running'
+        }));
+        expect(codexMessages).toContainEqual(expect.objectContaining({
+            type: 'agent-run-update',
+            agentId: 'child-thread',
+            status: 'canceled',
+            statusText: 'Parent turn completed'
         }));
     });
 
@@ -2089,6 +2472,78 @@ describe('codexRemoteLauncher', () => {
             type: 'context_compacted',
             thread_id: 'child-thread'
         }));
+    });
+
+    it('aggregates parent and child usage snapshots without forwarding child usage into chat', async () => {
+        harness.emitChildThreadEvents = true;
+        harness.emitChildThreadConfiguration = true;
+        harness.emitParentUsageEvents = true;
+        harness.emitChildUsageEvents = true;
+        const { session, codexMessages, getUsageMetadata } = createSessionStub();
+
+        await codexRemoteLauncher(session as never);
+
+        expect(getUsageMetadata().codexTokenUsage).toMatchObject({
+            input: 130,
+            output: 13,
+            total: 143,
+            breakdown: expect.arrayContaining([
+                expect.objectContaining({
+                    model: 'gpt-5.4',
+                    reasoningEffort: null,
+                    input: 100,
+                    output: 10,
+                    total: 110
+                }),
+                expect.objectContaining({
+                    model: 'gpt-5.6',
+                    reasoningEffort: 'high',
+                    input: 30,
+                    output: 3,
+                    total: 33
+                })
+            ])
+        });
+        expect(codexMessages).not.toContainEqual(expect.objectContaining({
+            type: 'token_count',
+            thread_id: 'child-thread'
+        }));
+    });
+
+    it('attributes only a parent cumulative usage increment to its later model and effort', async () => {
+        harness.emitParentUsageEvents = true;
+        harness.emitParentUsageModelSwitch = true;
+        const firstMode: EnhancedMode = { ...createMode(), model: 'gpt-A', modelReasoningEffort: 'high' };
+        const secondMode: EnhancedMode = { ...createMode(), model: 'gpt-B', modelReasoningEffort: 'low' };
+        const { session, getUsageMetadata } = createSessionStub(
+            ['first turn', 'second turn'],
+            firstMode,
+            [firstMode, secondMode]
+        );
+
+        await codexRemoteLauncher(session as never);
+
+        expect(getUsageMetadata().codexTokenUsage).toMatchObject({
+            input: 150,
+            output: 20,
+            total: 170,
+            breakdown: expect.arrayContaining([
+                expect.objectContaining({
+                    model: 'gpt-A',
+                    reasoningEffort: 'high',
+                    input: 100,
+                    output: 10,
+                    total: 110
+                }),
+                expect.objectContaining({
+                    model: 'gpt-B',
+                    reasoningEffort: 'low',
+                    input: 50,
+                    output: 10,
+                    total: 60
+                })
+            ])
+        });
     });
 
     it('keeps child goal events out of the parent goal stream', async () => {
@@ -2157,9 +2612,11 @@ describe('codexRemoteLauncher', () => {
 
     it('marks parent usage and compact events with parent scope', async () => {
         harness.emitParentUsageEvents = true;
-        const { session, codexMessages } = createSessionStub();
+        const { session, codexMessages, getUsageMetadata } = createSessionStub();
 
         await codexRemoteLauncher(session as never);
+
+        expect(getUsageMetadata().codexTokenUsage).toMatchObject({ input: 100, output: 10, total: 110, scope: 'lastTurn' });
 
         expect(codexMessages).toContainEqual(expect.objectContaining({
             type: 'token_count',
@@ -2446,7 +2903,7 @@ describe('codexRemoteLauncher', () => {
         harness.suppressTurnCompletion = true;
         harness.emitRunningChildTurnBeforeSuppressedParent = true;
         harness.emitTurnAbortedOnInterrupt = true;
-        const { session, rpcHandlers } = createSessionStub(['first message']);
+        const { session, rpcHandlers, codexMessages } = createSessionStub(['first message']);
 
         const running = codexRemoteLauncher(session as never);
         await vi.waitFor(() => {
@@ -2463,6 +2920,8 @@ describe('codexRemoteLauncher', () => {
             { threadId: 'child-thread', turnId: 'child-turn' }
         ]);
         expect(session.thinking).toBe(false);
+        expect(codexMessages).toContainEqual(expect.objectContaining({ type: 'turn-outcome', outcome: 'aborted', turnId: 'turn-1' }));
+        expect(codexMessages).not.toContainEqual(expect.objectContaining({ type: 'turn-outcome', turnId: 'child-turn' }));
     });
 
     it('does not interrupt completed child agent turns when clearing codex thread state', async () => {

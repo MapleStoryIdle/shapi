@@ -65,6 +65,11 @@ describe('getPendingRequestKinds', () => {
 })
 
 describe('toSessionSummary', () => {
+    it('exposes the current thinking start without carrying it into idle summaries', () => {
+        expect(toSessionSummary(makeSession({ thinking: true, thinkingAt: 1234 })).thinkingStartedAt).toBe(1234)
+        expect(toSessionSummary(makeSession({ thinking: false, thinkingAt: 1234 })).thinkingStartedAt).toBeUndefined()
+    })
+
     it('includes pending request kinds and background task count', () => {
         const summary = toSessionSummary(makeSession({
             backgroundTaskCount: 2,
@@ -81,16 +86,33 @@ describe('toSessionSummary', () => {
         expect(summary.futureScheduledMessageCount).toBe(0)
     })
 
-    it('includes lifecycleState in summary metadata', () => {
+    it('includes lifecycle and control ownership in summary metadata', () => {
         const summary = toSessionSummary(makeSession({
             metadata: {
                 path: '/proj',
                 host: 'local',
+                controlOwner: 'external',
                 lifecycleState: 'archived'
             }
         }))
 
+        expect(summary.metadata?.controlOwner).toBe('external')
         expect(summary.metadata?.lifecycleState).toBe('archived')
+    })
+
+    it('includes the Monitor origin marker for session-list badges', () => {
+        const monitorSession = {
+            monitorId: 'monitor-1',
+            incidentId: 'incident-1',
+            sourceSession: { type: 'managed' as const, sessionId: 'source-1' },
+            createdAt: 1,
+            mode: 'isolated-trigger' as const
+        }
+        const summary = toSessionSummary(makeSession({
+            metadata: { path: '/proj', host: 'local', monitorSession }
+        }))
+
+        expect(summary.metadata?.monitorSession).toEqual(monitorSession)
     })
 
     it('includes structured pendingRequests for hover-tooltip copy', () => {

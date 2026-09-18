@@ -1,9 +1,16 @@
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AgentEvent } from '@/chat/types'
+import zhCN from '@/lib/locales/zh-CN'
 
 const state = vi.hoisted(() => ({
-    event: null as unknown
+    event: null as unknown,
+    preview: null as null | ((value: unknown) => boolean)
+}))
+
+vi.mock('@/components/ChatPreviewContext', async (importOriginal) => ({
+    ...await importOriginal<typeof import('@/components/ChatPreviewContext')>(),
+    useChatPreview: () => state.preview
 }))
 
 vi.mock('@assistant-ui/react', async () => {
@@ -26,7 +33,7 @@ vi.mock('@assistant-ui/react', async () => {
 })
 
 vi.mock('@/lib/use-translation', () => ({
-    useTranslation: () => ({ t: (key: string) => key })
+    useTranslation: () => ({ t: (key: string) => key.startsWith('taskStatus.forbidden.') ? zhCN[key as keyof typeof zhCN] : key })
 }))
 
 import { HappySystemMessage } from './SystemMessage'
@@ -36,9 +43,25 @@ function renderEvent(event: AgentEvent) {
     return render(<HappySystemMessage />)
 }
 
-afterEach(() => cleanup())
+afterEach(() => {
+    cleanup()
+    state.preview = null
+})
 
 describe('HappySystemMessage — quota events', () => {
+    it.each(['http_forbidden', 'unknown', 'network_error'] as const)('shows the approved HTTP 403 copy for %s', (code) => {
+        const { container } = renderEvent({
+            type: 'task-status', status: 'failed', source: 'codex', code,
+            message: 'unexpected status 403 Forbidden: <html><script>secret</script></html>',
+            recoverable: false
+        })
+        expect(screen.getByText('请求被拒绝（HTTP 403）')).toBeInTheDocument()
+        expect(screen.getByText('模型服务拒绝了本次请求，任务已停止。请检查登录状态或网络后重试。')).toBeInTheDocument()
+        expect(screen.queryByText('taskStatus.failed.title')).not.toBeInTheDocument()
+        expect(container).not.toHaveTextContent('secret')
+        expect(container.querySelector('script')).toBeNull()
+    })
+
     it('shows the quota reason and its settings action', () => {
         renderEvent({
             type: 'task-status',
@@ -52,11 +75,24 @@ describe('HappySystemMessage — quota events', () => {
         })
 
         expect(screen.getByText('taskStatus.usage.title')).toBeInTheDocument()
-        expect(screen.getByText('taskStatus.usage.bodyWithReset')).toBeInTheDocument()
+        expect(screen.getByText("You've hit your usage limit.")).toBeInTheDocument()
         expect(screen.getByRole('link', { name: 'taskStatus.usage.action' })).toHaveAttribute(
             'href',
             'https://chatgpt.com/codex/settings/usage'
         )
+        expect(screen.getByRole('link', { name: 'taskStatus.usage.action' })).toHaveClass('message-content-link', 'no-underline')
+    })
+
+    it('opens a task action as content in the shared mobile preview', () => {
+        const preview = vi.fn(() => true)
+        state.preview = preview
+        renderEvent({
+            type: 'task-status', status: 'failed', source: 'codex', code: 'usage_limit',
+            message: 'Limit', recoverable: false, actionUrl: 'https://chatgpt.com/codex/settings/usage'
+        })
+
+        expect(fireEvent.click(screen.getByRole('link', { name: 'taskStatus.usage.action' }))).toBe(false)
+        expect(preview).toHaveBeenCalledWith({ type: 'url', url: 'https://chatgpt.com/codex/settings/usage' })
     })
 
     it('uses the compact context-divider treatment for Codex usage updates', () => {
@@ -92,5 +128,33 @@ describe('HappySystemMessage — quota events', () => {
 
         expect(screen.queryByTestId('usage-limit-event')).not.toBeInTheDocument()
         expect(screen.getByText('taskStatus.modelCapacity.title')).toBeInTheDocument()
+        expect(screen.getByText('Selected model is at capacity.')).toBeInTheDocument()
+    })
+
+    it('shows a network-specific task failure card', () => {
+        renderEvent({
+            type: 'task-status',
+            status: 'failed',
+            source: 'codex',
+            code: 'unknown',
+            message: 'Network error: request timed out',
+            recoverable: false
+        })
+
+        expect(screen.getByText('taskStatus.network.title')).toBeInTheDocument()
+        expect(screen.getByText('Network error: request timed out')).toBeInTheDocument()
+    })
+
+    it('uses localized fallback copy only when Codex supplied no useful detail', () => {
+        renderEvent({
+            type: 'task-status',
+            status: 'failed',
+            source: 'codex',
+            code: 'unknown',
+            message: 'Task failed',
+            recoverable: false,
+        })
+
+        expect(screen.getByText('taskStatus.failed.body')).toBeInTheDocument()
     })
 })

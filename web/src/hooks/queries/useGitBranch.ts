@@ -1,10 +1,16 @@
 import { useQuery } from '@tanstack/react-query'
 import type { ApiClient } from '@/api/client'
+import type { GitBranchResponse } from '@hapi/protocol/apiTypes'
 import { parseStatusSummaryV2 } from '@/lib/gitParsers'
 import { queryKeys } from '@/lib/query-keys'
 
 const GIT_BRANCH_STALE_TIME_MS = 60_000
 const GIT_BRANCH_REFRESH_INTERVAL_MS = 60_000
+
+type MachineGitBranchQueryOptions = {
+    /** Detail headers only need an initial probe; project lists stay live. */
+    refetchInterval?: number | false
+}
 
 /**
  * Read only the branch line from `git status`. The session-list project header
@@ -55,11 +61,17 @@ export function useMachineGitBranch(
     api: ApiClient | null,
     machineId: string | null,
     cwd: string | null,
-    enabled = true
+    enabled = true,
+    options?: MachineGitBranchQueryOptions
 ): {
     branch: string | null
     isWorktree: boolean
     isDirty: boolean
+    isGitRepository: boolean
+    repositoryState: 'git' | 'non-git' | 'loading' | 'error'
+    childRepositories: NonNullable<GitBranchResponse['childRepositories']>
+    childRepositoriesTruncated: boolean
+    childRepositoriesError: boolean
 } {
     const resolvedMachineId = machineId ?? 'unknown'
     const resolvedCwd = cwd?.trim() ?? ''
@@ -72,17 +84,23 @@ export function useMachineGitBranch(
 
             const result = await api.getMachineGitBranch(machineId, resolvedCwd)
             if (!result.success) {
-                return null
+                throw new Error('Git detection unavailable')
             }
             return {
                 branch: getGitBranchFromStatusOutput(result.stdout ?? ''),
                 isWorktree: result.isWorktree === true,
-                isDirty: result.isDirty === true
+                isDirty: result.isDirty === true,
+                repositoryState: result.repositoryState ?? 'git',
+                childRepositories: result.childRepositories ?? [],
+                childRepositoriesTruncated: result.childRepositoriesTruncated === true,
+                childRepositoriesError: Boolean(result.childRepositoriesError)
             }
         },
         enabled: Boolean(enabled && api && machineId && resolvedCwd),
         staleTime: GIT_BRANCH_STALE_TIME_MS,
-        refetchInterval: GIT_BRANCH_REFRESH_INTERVAL_MS,
+        refetchInterval: options?.refetchInterval === undefined
+            ? GIT_BRANCH_REFRESH_INTERVAL_MS
+            : options.refetchInterval,
         refetchIntervalInBackground: false,
         refetchOnWindowFocus: true,
         retry: false
@@ -91,6 +109,11 @@ export function useMachineGitBranch(
     return {
         branch: query.data?.branch ?? null,
         isWorktree: query.data?.isWorktree === true,
-        isDirty: query.data?.isDirty === true
+        isDirty: query.data?.isDirty === true,
+        isGitRepository: query.data?.repositoryState === 'git',
+        repositoryState: query.isError ? 'error' : query.data?.repositoryState ?? (query.isFetching ? 'loading' : 'error'),
+        childRepositories: query.data?.childRepositories ?? [],
+        childRepositoriesTruncated: query.data?.childRepositoriesTruncated === true,
+        childRepositoriesError: query.data?.childRepositoriesError === true
     }
 }

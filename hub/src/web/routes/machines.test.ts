@@ -84,6 +84,7 @@ describe('machines routes', () => {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({
+                requestId: '5f753e18-5f5e-47c8-bfcf-94b8d6bd3f34',
                 directory: '/work/project',
                 agent: 'codex',
                 model: 'gpt-5.5',
@@ -104,6 +105,52 @@ describe('machines routes', () => {
             sessionId: 'session-1',
             session,
         })
+    })
+
+    it('spawns once when concurrent requests share an idempotency key', async () => {
+        const machine = createMachine()
+        let resolveSpawn: (value: { type: 'success'; sessionId: string }) => void = () => {
+            throw new Error('Spawn did not start')
+        }
+        let spawnCalls = 0
+        const engine = {
+            getMachine: () => machine,
+            getMachineByNamespace: () => machine,
+            spawnSession: () => {
+                spawnCalls += 1
+                return new Promise<{ type: 'success'; sessionId: string }>((resolve) => {
+                    resolveSpawn = resolve
+                })
+            },
+            getSessionByNamespace: () => undefined,
+        } as Partial<SyncEngine>
+
+        const app = new Hono<WebAppEnv>()
+        app.use('*', async (c, next) => {
+            c.set('namespace', 'default')
+            await next()
+        })
+        app.route('/api', createMachinesRoutes(() => engine as SyncEngine))
+
+        const body = JSON.stringify({
+            requestId: 'cd8c9d80-5077-42cd-8743-eb653107a1dc',
+            directory: '/work/project',
+            agent: 'codex',
+        })
+        const responses = Array.from({ length: 20 }, () => app.request('/api/machines/machine-1/spawn', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body,
+        }))
+
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        expect(spawnCalls).toBe(1)
+        resolveSpawn({ type: 'success', sessionId: 'session-1' })
+
+        for (const response of await Promise.all(responses)) {
+            expect(response.status).toBe(200)
+            expect(await response.json()).toEqual({ type: 'success', sessionId: 'session-1' })
+        }
     })
 
     it('returns Codex models for an online machine', async () => {
@@ -309,6 +356,124 @@ describe('machines routes', () => {
             success: false,
             error: 'cwd query parameter is required'
         })
+    })
+
+    it('forwards machine-scoped Git branch actions', async () => {
+        const machine = createMachine()
+        const calls: Array<{ method: string; machineId: string; payload: unknown }> = []
+        const responsePayload = {
+            success: true,
+            currentBranch: 'feature/mobile',
+            isDirty: false,
+            changedFileCount: 0,
+            additions: 0,
+            deletions: 0,
+            upstream: 'origin/feature/mobile',
+            canUpdate: true,
+            localBranches: [{ ref: 'feature/mobile', name: 'feature/mobile' }],
+            remoteBranches: [{ ref: 'origin/main', name: 'main' }]
+        }
+        const engine = {
+            getMachine: () => machine,
+            getMachineByNamespace: () => machine,
+            getMachineGitBranches: async (machineId: string, cwd: string) => {
+                calls.push({ method: 'list', machineId, payload: cwd })
+                return responsePayload
+            },
+            switchMachineGitBranch: async (machineId: string, payload: unknown) => {
+                calls.push({ method: 'switch', machineId, payload })
+                return responsePayload
+            },
+            createMachineGitBranch: async (machineId: string, payload: unknown) => {
+                calls.push({ method: 'create', machineId, payload })
+                return responsePayload
+            },
+            commitMachineGitChanges: async (machineId: string, payload: unknown) => {
+                calls.push({ method: 'commit', machineId, payload })
+                return responsePayload
+            },
+            pushMachineGitBranch: async (machineId: string, payload: unknown) => {
+                calls.push({ method: 'push', machineId, payload })
+                return responsePayload
+            },
+            fetchMachineGitBranches: async (machineId: string, payload: unknown) => {
+                calls.push({ method: 'fetch', machineId, payload })
+                return responsePayload
+            },
+            updateMachineGitBranch: async (machineId: string, payload: unknown) => {
+                calls.push({ method: 'update', machineId, payload })
+                return responsePayload
+            }
+        } as Partial<SyncEngine>
+
+        const app = new Hono<WebAppEnv>()
+        app.use('*', async (c, next) => {
+            c.set('namespace', 'default')
+            await next()
+        })
+        app.route('/api', createMachinesRoutes(() => engine as SyncEngine))
+
+        const list = await app.request('/api/machines/machine-1/git-branches?cwd=' + encodeURIComponent('/home/user/proj'))
+        const switchResponse = await app.request('/api/machines/machine-1/git-branches/switch', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+                cwd: '/home/user/proj',
+                target: { kind: 'remote', ref: 'origin/feature/mobile' },
+                confirmDirty: true
+            })
+        })
+        const create = await app.request('/api/machines/machine-1/git-branches', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ cwd: '/home/user/proj', name: 'feature/new' })
+        })
+        const commit = await app.request('/api/machines/machine-1/git-branches/commit', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ cwd: '/home/user/proj', message: 'Add branch controls' })
+        })
+        const push = await app.request('/api/machines/machine-1/git-branches/push', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ cwd: '/home/user/proj' })
+        })
+        const fetch = await app.request('/api/machines/machine-1/git-branches/fetch', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ cwd: '/home/user/proj' })
+        })
+        const update = await app.request('/api/machines/machine-1/git-branches/update', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ cwd: '/home/user/proj' })
+        })
+
+        expect(list.status).toBe(200)
+        expect(switchResponse.status).toBe(200)
+        expect(create.status).toBe(200)
+        expect(commit.status).toBe(200)
+        expect(push.status).toBe(200)
+        expect(fetch.status).toBe(200)
+        expect(update.status).toBe(200)
+        expect(calls).toEqual([
+            { method: 'list', machineId: 'machine-1', payload: '/home/user/proj' },
+            {
+                method: 'switch',
+                machineId: 'machine-1',
+                payload: {
+                    cwd: '/home/user/proj',
+                    target: { kind: 'remote', ref: 'origin/feature/mobile' },
+                    confirmDirty: true
+                }
+            },
+            { method: 'create', machineId: 'machine-1', payload: { cwd: '/home/user/proj', name: 'feature/new' } },
+            { method: 'commit', machineId: 'machine-1', payload: { cwd: '/home/user/proj', message: 'Add branch controls' } },
+            { method: 'push', machineId: 'machine-1', payload: { cwd: '/home/user/proj' } },
+            { method: 'fetch', machineId: 'machine-1', payload: { cwd: '/home/user/proj' } },
+            { method: 'update', machineId: 'machine-1', payload: { cwd: '/home/user/proj' } }
+        ])
+        expect(await list.json()).toEqual(responsePayload)
     })
 
     it('returns 503 when cursor-models is requested without a sync engine', async () => {

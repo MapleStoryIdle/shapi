@@ -10,7 +10,7 @@ import type { ChatBlock, CliOutputBlock, CodexReview, UsageData } from '@/chat/t
 import type { AgentEvent, ToolCallBlock } from '@/chat/types'
 import type { ToolGroupBlock, VisibleChatBlock } from '@/chat/toolGroups'
 import type { AttachmentMetadata, MessageStatus as HappyMessageStatus, Session } from '@/types/api'
-import { formatQuestionAnswerText, type QuestionAnswerPresentation } from '@/chat/questionAnswers'
+import { formatQuestionAnswerText, parseUserMessageQuestionReply, type QuestionAnswerPresentation } from '@/chat/questionAnswers'
 
 /**
  * Aggregated metadata for a multi-turn response group, surfaced on the
@@ -40,12 +40,47 @@ export type HappyChatMessageMetadata = {
     model?: string | null
     review?: CodexReview
     questionAnswer?: QuestionAnswerPresentation
+    /** Stable source block retained when pagination reshapes derived assistant groups. */
+    scrollAnchorId?: string
     /**
      * Distinct turn count when this block carries an aggregated response
      * group footer. Single-turn blocks omit this field so the existing
      * per-message footer is rendered unchanged.
      */
     turnCount?: number
+}
+
+function getStableBlockScrollAnchorId(block: VisibleChatBlock): string {
+    if (block.kind !== 'tool-group') return `${block.kind}:${block.id}`
+    const lastDetail = block.detailBlocks?.at(-1)
+    return lastDetail ? `${lastDetail.kind}:${lastDetail.id}` : `tool-call:${block.lastToolId}`
+}
+
+/** assistant-ui joins adjacent assistant blocks; anchor the joined row to its stable trailing source block. */
+export function getResponseGroupScrollAnchors(blocks: readonly VisibleChatBlock[]): Map<string, string> {
+    const anchors = new Map<string, string>()
+    let groupFirstBlockId: string | null = null
+    let groupLastAnchorId: string | null = null
+
+    const flush = () => {
+        if (groupFirstBlockId && groupLastAnchorId) {
+            anchors.set(groupFirstBlockId, groupLastAnchorId)
+        }
+        groupFirstBlockId = null
+        groupLastAnchorId = null
+    }
+
+    for (const block of blocks) {
+        if (visibleBlockRole(block) !== 'assistant') {
+            flush()
+            anchors.set(block.id, getStableBlockScrollAnchorId(block))
+            continue
+        }
+        groupFirstBlockId ??= block.id
+        groupLastAnchorId = getStableBlockScrollAnchorId(block)
+    }
+    flush()
+    return anchors
 }
 
 function formatCodexReviewText(review: CodexReview): string {
@@ -60,10 +95,13 @@ function formatCodexReviewText(review: CodexReview): string {
         lines.push('', 'Findings:')
         for (const finding of review.findings) {
             const priority = finding.priority === null ? '' : `[P${finding.priority}] `
+            const title = finding.priority === null
+                ? finding.title
+                : finding.title.replace(new RegExp(`^\\[P${finding.priority}\\]\\s*`, 'i'), '')
             const location = finding.filePath
                 ? ` (${finding.filePath}${finding.lineStart === null ? '' : `:${finding.lineStart}${finding.lineEnd !== null && finding.lineEnd !== finding.lineStart ? `-${finding.lineEnd}` : ''}`})`
                 : ''
-            lines.push(`- ${priority}${finding.title}${location}`)
+            lines.push(`- ${priority}${title}${location}`)
             lines.push(`  ${finding.body}`)
         }
     }
@@ -329,19 +367,21 @@ export function assignThreadMessageIds(
 
 export function toThreadMessageLike(block: VisibleChatBlock, threadMessageId: string): ThreadMessageLike {
     if (block.kind === 'user-text') {
+        const questionAnswer = parseUserMessageQuestionReply(block.text)
         return {
             role: 'user',
             id: threadMessageId,
             createdAt: new Date(block.createdAt),
-            content: [{ type: 'text', text: block.text }],
+            content: [{ type: 'text', text: questionAnswer ? formatQuestionAnswerText(questionAnswer) : block.text }],
             metadata: {
                 custom: {
                     kind: 'user',
                     status: block.status,
                     localId: block.localId,
-                    originalText: block.originalText,
+                    originalText: block.originalText ?? (questionAnswer ? block.text : undefined),
                     attachments: block.attachments,
-                    invokedAt: block.invokedAt
+                    invokedAt: block.invokedAt,
+                    questionAnswer: questionAnswer ?? undefined
                 } satisfies HappyChatMessageMetadata
             }
         }
@@ -616,12 +656,15 @@ export function useHappyRuntime(props: {
         () => aggregateResponseGroups(props.blocks),
         [props.blocks]
     )
+    const scrollAnchors = useMemo(
+        () => getResponseGroupScrollAnchors(props.blocks),
+        [props.blocks]
+    )
 
     const convertBlock = useCallback(
         ({ block, threadMessageId }: BlockWithThreadMessageId): ThreadMessageLike => {
             const message = toThreadMessageLike(block, threadMessageId)
             const aggregate = aggregates.get(block.id)
-            if (!aggregate) return message
             const existing = message.metadata?.custom as HappyChatMessageMetadata | undefined
             return {
                 ...message,
@@ -629,16 +672,19 @@ export function useHappyRuntime(props: {
                     ...message.metadata,
                     custom: {
                         ...(existing ?? { kind: 'assistant' }),
-                        usage: aggregate.usage,
-                        model: aggregate.model,
-                        invokedAt: aggregate.invokedAt,
-                        durationMs: aggregate.durationMs,
-                        turnCount: aggregate.turnCount
+                        scrollAnchorId: scrollAnchors.get(block.id) ?? `${block.kind}:${block.id}`,
+                        ...(aggregate ? {
+                            usage: aggregate.usage,
+                            model: aggregate.model,
+                            invokedAt: aggregate.invokedAt,
+                            durationMs: aggregate.durationMs,
+                            turnCount: aggregate.turnCount
+                        } : {})
                     } satisfies HappyChatMessageMetadata
                 }
             }
         },
-        [aggregates]
+        [aggregates, scrollAnchors]
     )
 
     // Use cached message converter for performance optimization

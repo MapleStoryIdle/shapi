@@ -1,4 +1,4 @@
-import { closeSync, openSync, readFileSync, readSync, statSync } from 'node:fs'
+import { closeSync, openSync, readSync, statSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import {
     appendCodexTranscriptImportLines,
@@ -9,11 +9,15 @@ import {
     getCodexTranscriptLifecycleEvents,
     getCodexTranscriptUserInputEvents,
     getCodexTranscriptTailSummary,
+    listLocalCodexSessionSubagents,
+    listLocalCodexSessionTranscriptFiles,
+    readLocalCodexSessionSummary,
     type CodexImportedMessageContent,
     type CodexLocalSessionData,
     type CodexLocalSessionPlan,
     type CodexLocalSessionReadOptions,
     type CodexLocalSessionReadTiming,
+    type CodexLocalSessionSubagent,
     type CodexLocalSessionSummary,
     type CodexLocalSessionSnapshotVersion,
     type CodexTranscriptImportAccumulator,
@@ -30,6 +34,8 @@ type FileFingerprint = {
 
 type CacheEntry = {
     session: CodexLocalSessionSummary
+    /** Chronological JSONL segments for one logical native Codex thread. */
+    transcriptFiles: readonly string[]
     importedMessages: CodexImportedMessageContent[] | null
     accumulator: CodexTranscriptImportAccumulator | null
     trailingBytes: Buffer
@@ -37,6 +43,12 @@ type CacheEntry = {
     fingerprint: FileFingerprint | null
     lifecycleEvents: CodexTranscriptLifecycleEvent[]
     userInputEvents: CodexTranscriptUserInputEvent[]
+    /** Direct native child snapshots are separate from parent pagination. */
+    subagents: CodexLocalSessionSubagent[]
+    /** Monotonic runner clock of the last cross-transcript child discovery. */
+    subagentScanAt: number
+    /** A parent agent-control call can create/update a child immediately. */
+    subagentDiscoveryPending: boolean
 }
 
 type ResolvedEntry = {
@@ -90,6 +102,12 @@ const MAX_LIFECYCLE_EVENTS_PER_TRANSCRIPT = 128
 // A cold session only needs the latest turn terminal/start records. Full
 // message history is loaded later, when the user actually opens the detail.
 const LIFECYCLE_TAIL_READ_BYTES = 16 * 1024
+const TRANSCRIPT_READ_CHUNK_BYTES = 256 * 1024
+// Child transcript changes do not always append to the parent file. Keep the
+// recursive CODEX_HOME discovery bounded; the browser can poll cheaply while
+// an active card exists, but should not make every one-second read scan every
+// historical rollout header.
+const SUBAGENT_DISCOVERY_INTERVAL_MS = 5_000
 
 function getFileFingerprint(file: string): FileFingerprint | null {
     try {
@@ -167,6 +185,52 @@ function applyTailSummary(session: CodexLocalSessionSummary, lines: readonly str
     }
 }
 
+function areSameNativeCodexSubagents(
+    left: readonly CodexLocalSessionSubagent[],
+    right: readonly CodexLocalSessionSubagent[]
+): boolean {
+    if (left.length !== right.length) return false
+    return left.every((subagent, index) => {
+        const candidate = right[index]
+        return candidate?.id === subagent.id
+            && candidate.parentSessionId === subagent.parentSessionId
+            && candidate.name === subagent.name
+            && candidate.role === subagent.role
+            && candidate.agentPath === subagent.agentPath
+            && candidate.model === subagent.model
+            && candidate.modelReasoningEffort === subagent.modelReasoningEffort
+            && candidate.status === subagent.status
+            && candidate.statusText === subagent.statusText
+            && candidate.startedAt === subagent.startedAt
+            && candidate.updatedAt === subagent.updatedAt
+            && candidate.completedAt === subagent.completedAt
+            && candidate.traceMessages.length === subagent.traceMessages.length
+    })
+}
+
+function hasNativeCodexSubagentControlRecord(lines: readonly string[]): boolean {
+    for (const line of lines) {
+        try {
+            const record = JSON.parse(line) as { type?: unknown; payload?: unknown }
+            if (record.type !== 'response_item' || !record.payload || typeof record.payload !== 'object') continue
+            const payload = record.payload as { type?: unknown; name?: unknown }
+            if (payload.type !== 'function_call' && payload.type !== 'custom_tool_call') continue
+            if (
+                payload.name === 'spawn_agent'
+                || payload.name === 'send_input'
+                || payload.name === 'resume_agent'
+                || payload.name === 'wait_agent'
+                || payload.name === 'close_agent'
+            ) {
+                return true
+            }
+        } catch {
+            // A live transcript may expose a partial final JSONL line.
+        }
+    }
+    return false
+}
+
 /**
  * Keeps recently viewed native transcripts in runner memory. After the first
  * read, normal status/context requests only stat the JSONL. When Codex appends
@@ -220,12 +284,23 @@ export class NativeCodexTranscriptCache {
         return this.readSummaryInternal(sessionId, true, false)
     }
 
+    /**
+     * Advance a watcher-observed summary from its exact JSONL path. Codex can
+     * rotate one thread into a new file while the previous file remains valid
+     * and unchanged, so a session-id-only refresh would otherwise stay stale.
+     */
+    refreshSummaryFromFile(sessionId: string, filePath: string): NativeCodexTranscriptSummaryRead | null {
+        if (!this.entries.has(sessionId)) return null
+        return this.readSummaryInternal(sessionId, true, false, filePath)
+    }
+
     private readSummaryInternal(
         sessionId: string,
         forceRefresh: boolean,
-        allowColdLoad: boolean
+        allowColdLoad: boolean,
+        observedFilePath?: string
     ): NativeCodexTranscriptSummaryRead | null {
-        const entry = this.resolveEntry(sessionId, { forceRefresh, allowColdLoad })?.entry
+        const entry = this.resolveEntry(sessionId, { forceRefresh, allowColdLoad, observedFilePath })?.entry
         if (!entry) return null
         const revision = this.getRevision(sessionId)
         return {
@@ -261,16 +336,35 @@ export class NativeCodexTranscriptCache {
         return this.readInternal(sessionId, options, true, false)
     }
 
+    /**
+     * Refresh a hot transcript from a watcher-reported file. A segment switch
+     * rebuilds the message accumulator across the thread's ordered JSONL
+     * files, keeping older conversation history intact.
+     */
+    refreshCachedFromFile(
+        sessionId: string,
+        filePath: string,
+        options: CodexLocalSessionReadOptions = {}
+    ): NativeCodexTranscriptRead | null {
+        const entry = this.entries.get(sessionId)
+        if (!entry || entry.importedMessages === null) {
+            return null
+        }
+        return this.readInternal(sessionId, options, true, false, filePath)
+    }
+
     private readInternal(
         sessionId: string,
         options: CodexLocalSessionReadOptions,
         forceRefresh: boolean,
-        allowColdLoad: boolean
+        allowColdLoad: boolean,
+        observedFilePath?: string
     ): NativeCodexTranscriptRead | null {
         const startedAt = this.now()
         const resolved = this.resolveEntry(sessionId, {
             forceRefresh,
-            allowColdLoad
+            allowColdLoad,
+            observedFilePath
         })
         if (!resolved) {
             return null
@@ -283,11 +377,29 @@ export class NativeCodexTranscriptCache {
             cacheMiss = true
         }
 
-        const data = createLocalCodexSessionData(entry.session, entry.importedMessages ?? [], options)
+        const entryBeforeSubagentRefresh = entry
+        const refreshedSubagents = this.refreshSubagents(entry)
+        entry = refreshedSubagents.entry
+        if (entry !== entryBeforeSubagentRefresh) {
+            this.setEntry(sessionId, entry)
+        }
+        if (refreshedSubagents.changed) {
+            this.bumpRevision(sessionId)
+            cacheMiss = true
+        }
+
+        const data = createLocalCodexSessionData(
+            entry.session,
+            entry.importedMessages ?? [],
+            options,
+            entry.subagents
+        )
         const revision = this.getRevision(sessionId)
         return {
             data: {
                 ...data,
+                tokenUsage: entry.accumulator?.tokenUsage ?? null,
+                modelProvider: entry.accumulator?.modelProvider ?? null,
                 session: this.applyLifecycleToSummary(data.session)
             },
             plan: entry.accumulator ? getCodexTranscriptImportPlan(entry.accumulator) : null,
@@ -302,8 +414,24 @@ export class NativeCodexTranscriptCache {
         }
     }
 
-    private resolveEntry(sessionId: string, options: { forceRefresh?: boolean; allowColdLoad?: boolean } = {}): ResolvedEntry | null {
+    private resolveEntry(
+        sessionId: string,
+        options: { forceRefresh?: boolean; allowColdLoad?: boolean; observedFilePath?: string } = {}
+    ): ResolvedEntry | null {
         const current = this.entries.get(sessionId)
+        const observedFilePath = options.observedFilePath?.trim()
+        if (current && observedFilePath && observedFilePath !== current.session.file) {
+            const observedSession = readLocalCodexSessionSummary(observedFilePath)
+            // A late watcher callback for an older segment must not move a
+            // thread backwards after Codex has already rotated it again.
+            if (observedSession?.id === sessionId && observedSession.modifiedAt >= current.session.modifiedAt) {
+                const entry = this.createEntry(observedSession)
+                this.setEntry(sessionId, entry)
+                this.bumpRevision(sessionId)
+                return { entry, cacheMiss: true }
+            }
+        }
+
         const fingerprint = current ? getFileFingerprint(current.session.file) : null
         const changed =
             current &&
@@ -345,23 +473,58 @@ export class NativeCodexTranscriptCache {
             this.entries.delete(sessionId)
             return null
         }
-        const nextFingerprint = getFileFingerprint(session.file)
-        const lifecycleTail = nextFingerprint
-            ? readRecentLifecycleTail(session.file, nextFingerprint.size)
-            : { lifecycleEvents: [], userInputEvents: [], trailingBytes: Buffer.alloc(0) }
-        const entry: CacheEntry = {
-            session: nextFingerprint ? { ...session, modifiedAt: nextFingerprint.modifiedAt } : session,
-            importedMessages: null,
-            accumulator: null,
-            trailingBytes: lifecycleTail.trailingBytes,
-            fileSize: nextFingerprint?.size ?? 0,
-            fingerprint: nextFingerprint,
-            lifecycleEvents: lifecycleTail.lifecycleEvents,
-            userInputEvents: lifecycleTail.userInputEvents
-        }
+        const entry = this.createEntry(session)
         this.setEntry(sessionId, entry)
         this.bumpRevision(sessionId)
         return { entry, cacheMiss: true }
+    }
+
+    private createEntry(session: CodexLocalSessionSummary): CacheEntry {
+        const fingerprint = getFileFingerprint(session.file)
+        const lifecycleTail = fingerprint
+            ? readRecentLifecycleTail(session.file, fingerprint.size)
+            : { lifecycleEvents: [], userInputEvents: [], trailingBytes: Buffer.alloc(0) }
+        const transcriptFiles = listLocalCodexSessionTranscriptFiles(session.id).map((candidate) => candidate.file)
+        if (!transcriptFiles.includes(session.file)) {
+            transcriptFiles.push(session.file)
+        }
+        return {
+            session: fingerprint ? { ...session, modifiedAt: fingerprint.modifiedAt } : session,
+            transcriptFiles,
+            importedMessages: null,
+            accumulator: null,
+            trailingBytes: lifecycleTail.trailingBytes,
+            fileSize: fingerprint?.size ?? 0,
+            fingerprint,
+            lifecycleEvents: lifecycleTail.lifecycleEvents,
+            userInputEvents: lifecycleTail.userInputEvents,
+            subagents: [],
+            subagentScanAt: 0,
+            subagentDiscoveryPending: true
+        }
+    }
+
+    private refreshSubagents(entry: CacheEntry): { entry: CacheEntry; changed: boolean } {
+        const now = this.now()
+        if (
+            !entry.subagentDiscoveryPending
+            && entry.subagentScanAt > 0
+            && now - entry.subagentScanAt < SUBAGENT_DISCOVERY_INTERVAL_MS
+        ) {
+            return { entry, changed: false }
+        }
+
+        const subagents = listLocalCodexSessionSubagents(entry.session.id)
+        const next: CacheEntry = {
+            ...entry,
+            subagents,
+            subagentScanAt: now,
+            subagentDiscoveryPending: false
+        }
+        return {
+            entry: next,
+            changed: !areSameNativeCodexSubagents(entry.subagents, subagents)
+        }
     }
 
     private advanceAppendedEntry(entry: CacheEntry, fingerprint: FileFingerprint): CacheEntry | null {
@@ -388,19 +551,62 @@ export class NativeCodexTranscriptCache {
             fileSize: entry.fileSize + appendedBytes.length,
             fingerprint,
             lifecycleEvents,
-            userInputEvents
+            userInputEvents,
+            subagentDiscoveryPending: entry.subagentDiscoveryPending
+                || hasNativeCodexSubagentControlRecord(parsed.lines)
         }
     }
 
     private loadImportedMessages(sessionId: string, entry: CacheEntry): CacheEntry {
-        let contents: Buffer
-        try {
-            contents = readFileSync(entry.session.file)
-        } catch {
+        const accumulator = createCodexTranscriptImportAccumulator()
+        let latestParsed: CompleteLines | null = null
+        let latestFingerprint: FileFingerprint | null = null
+        let lifecycleEvents: CodexTranscriptLifecycleEvent[] = []
+        let runState = entry.session.runState
+        for (const filePath of entry.transcriptFiles) {
+            const fingerprint = getFileFingerprint(filePath)
+            if (!fingerprint) continue
+            let offset = 0
+            let pendingChunks: Buffer[] = []
+            while (offset < fingerprint.size) {
+                const bytes = readFileRange(filePath, offset, Math.min(TRANSCRIPT_READ_CHUNK_BYTES, fingerprint.size - offset))
+                if (!bytes?.length) break
+                offset += bytes.length
+                // Only accept a non-newline-terminated record at the actual
+                // EOF; a chunk boundary is not a transcript record boundary.
+                const boundary = offset === fingerprint.size ? bytes.length : bytes.lastIndexOf(0x0a) + 1
+                if (boundary === 0) {
+                    pendingChunks.push(bytes)
+                    continue
+                }
+                const parsed = splitCompleteJsonlLines(Buffer.concat([...pendingChunks, bytes.subarray(0, boundary)]))
+                pendingChunks = [parsed.trailingBytes, bytes.subarray(boundary)].filter((chunk) => chunk.length > 0)
+                appendCodexTranscriptImportLines(accumulator, parsed.lines)
+                if (filePath === entry.session.file) {
+                    // Keep lifecycle authority across a long turn whose start
+                    // lies outside the tiny summary tail, without parsing
+                    // large tool/image payloads several additional times.
+                    const lifecycleLines = parsed.lines.filter((line) => (
+                        line.includes('task_started') || line.includes('task_complete')
+                        || line.includes('task_failed') || line.includes('turn_aborted')
+                    ))
+                    lifecycleEvents = appendLifecycleEvents(lifecycleEvents, lifecycleLines)
+                    runState = getCodexTranscriptTailSummary(lifecycleLines).runState ?? runState
+                }
+            }
+            if (filePath === entry.session.file) {
+                latestParsed = { lines: [], trailingBytes: Buffer.concat(pendingChunks) }
+                // Retain the exact read boundary so writes arriving during a
+                // cold load are consumed by the next incremental refresh.
+                latestFingerprint = { ...fingerprint, size: offset }
+            }
+        }
+
+        if (!latestParsed) {
             const empty: CacheEntry = {
                 ...entry,
                 importedMessages: [],
-                accumulator: createCodexTranscriptImportAccumulator(),
+                accumulator,
                 trailingBytes: Buffer.alloc(0),
                 lifecycleEvents: [],
                 userInputEvents: []
@@ -409,20 +615,21 @@ export class NativeCodexTranscriptCache {
             return empty
         }
 
-        const parsed = splitCompleteJsonlLines(contents)
-        const accumulator = createCodexTranscriptImportAccumulator()
-        appendCodexTranscriptImportLines(accumulator, parsed.lines)
-        const fingerprint = getFileFingerprint(entry.session.file)
+        const fingerprint = latestFingerprint
+        const lifecycleTail = readRecentLifecycleTail(entry.session.file, fingerprint?.size ?? entry.fileSize)
         const next: CacheEntry = {
             ...entry,
-            session: fingerprint ? applyTailSummary(entry.session, parsed.lines, fingerprint) : entry.session,
+            session: {
+                ...(readLocalCodexSessionSummary(entry.session.file, fingerprint?.modifiedAt, fingerprint?.size) ?? entry.session),
+                ...(runState === undefined ? {} : { runState })
+            },
             importedMessages: accumulator.messages,
             accumulator,
-            trailingBytes: parsed.trailingBytes,
-            fileSize: contents.length,
+            trailingBytes: latestParsed.trailingBytes,
+            fileSize: fingerprint?.size ?? entry.fileSize,
             fingerprint,
-            lifecycleEvents: takeRecentLifecycleEvents(parsed.lines),
-            userInputEvents: takeRecentUserInputEvents(parsed.lines)
+            lifecycleEvents,
+            userInputEvents: lifecycleTail.userInputEvents
         }
         this.setEntry(sessionId, next)
         return next
@@ -520,7 +727,7 @@ function getIncrementalUserInputWaitingState(
     return active !== null
 }
 
-function readRecentLifecycleTail(file: string, fileSize: number): RecentLifecycleTail {
+export function readRecentLifecycleTail(file: string, fileSize: number): RecentLifecycleTail {
     const empty: RecentLifecycleTail = {
         lifecycleEvents: [],
         userInputEvents: [],

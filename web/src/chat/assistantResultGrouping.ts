@@ -2,6 +2,7 @@ import type { ChatBlock, ToolCallBlock } from '@/chat/types'
 import { isToolGroupBlock, summarizeToolGroup, type ToolGroupBlock, type VisibleChatBlock } from '@/chat/toolGroups'
 
 function isAssistantVisibleBlock(block: VisibleChatBlock): boolean {
+    if (block.kind === 'tool-call' && ['request_user_input', 'request_user_input_async'].includes(block.tool.name.split('.').pop() ?? '')) return false
     if (block.kind === 'user-text') return false
     if (block.kind === 'question-answer') return false
     if (block.kind === 'agent-event') return false
@@ -62,7 +63,11 @@ function collectExpansionStateKeys(blocks: readonly VisibleChatBlock[]): string[
 function createResultDetailsGroup(
     sourceBlocks: VisibleChatBlock[],
     tools: ToolCallBlock[],
-    detailBlocks: ChatBlock[]
+    detailBlocks: ChatBlock[],
+    options: {
+        id?: string
+        turnActive?: boolean
+    } = {}
 ): ToolGroupBlock {
     const firstBlock = sourceBlocks[0]
     const firstToolId = tools[0]?.id ?? firstBlock.id
@@ -70,7 +75,7 @@ function createResultDetailsGroup(
 
     return {
         kind: 'tool-group',
-        id: `tool-group:result-details:${firstBlock.id}`,
+        id: options.id ?? `tool-group:result-details:${firstBlock.id}`,
         createdAt: firstBlock.createdAt,
         invokedAt: firstInvokedAt(sourceBlocks),
         firstToolId,
@@ -84,8 +89,33 @@ function createResultDetailsGroup(
         detailBlocks,
         showAgentIcon: tools.length > 0,
         forceGenericCompactTitle: true,
-        forceCompact: true
+        forceCompact: true,
+        ...(options.turnActive ? { turnActive: true } : {})
     }
+}
+
+function transformActiveProcessGroup(group: VisibleChatBlock[]): VisibleChatBlock[] {
+    const tools: ToolCallBlock[] = []
+    const detailBlocks: ChatBlock[] = []
+
+    for (const block of group) {
+        flattenSourceBlock(block, tools, detailBlocks)
+    }
+
+    // A compact activity group needs at least one real tool artifact. Keep a
+    // reasoning-only turn in its native renderer, and never hide a permission
+    // request that still needs a tap from the user.
+    if (
+        tools.length === 0
+        || tools.some((tool) => tool.tool.permission?.status === 'pending')
+    ) {
+        return group
+    }
+
+    return [createResultDetailsGroup(group, tools, detailBlocks, {
+        id: `tool-group:active-process:${tools[0]!.id}`,
+        turnActive: true
+    })]
 }
 
 function transformAssistantGroup(group: VisibleChatBlock[]): VisibleChatBlock[] {
@@ -124,9 +154,56 @@ function transformAssistantGroup(group: VisibleChatBlock[]): VisibleChatBlock[] 
     ]
 }
 
+/**
+ * A live turn can contain several process groups. Only its newest process
+ * opens itself; older activity remains quiet until the operator asks for it.
+ */
+function markLatestActiveProcessDefaultOpen(blocks: VisibleChatBlock[]): VisibleChatBlock[] {
+    const latestActiveIndex = blocks.findLastIndex((block) => (
+        isToolGroupBlock(block)
+        && (block.turnActive === true || block.tools.some((tool) => (
+            tool.tool.state === 'running' || tool.tool.state === 'pending'
+        )))
+    ))
+    if (latestActiveIndex === -1) return blocks
+
+    return blocks.map((block, index) => {
+        if (!isToolGroupBlock(block)) return block
+        const active = block.turnActive === true || block.tools.some((tool) => (
+            tool.tool.state === 'running' || tool.tool.state === 'pending'
+        ))
+        if (!active) return block
+        return { ...block, defaultOpen: index === latestActiveIndex }
+    })
+}
+
+/**
+ * A Runner can finish its latest tool before the assistant turn itself ends.
+ * Keep that newest process row live until the session reports idle; otherwise
+ * the compact title jumps to "Processed" while the agent is still working.
+ */
+function markLatestCurrentTurnProcessActive(blocks: VisibleChatBlock[]): VisibleChatBlock[] {
+    const latestUserIndex = blocks.findLastIndex((block) => (
+        block.kind === 'user-text' || block.kind === 'question-answer'
+    ))
+    const latestProcessIndex = blocks.findLastIndex((block, index) => (
+        index > latestUserIndex && isToolGroupBlock(block)
+    ))
+    if (latestProcessIndex === -1) return blocks
+    return blocks.map((block, index) => (
+        index === latestProcessIndex && isToolGroupBlock(block)
+            ? { ...block, turnActive: true }
+            : block
+    ))
+}
+
 export function groupAssistantResultDetails(
     blocks: VisibleChatBlock[],
-    options: { runActive?: boolean } = {}
+    options: {
+        runActive?: boolean
+        aggregateActiveProcess?: boolean
+        activeTurnStartsAtBeginning?: boolean
+    } = {}
 ): VisibleChatBlock[] {
     const transformed: VisibleChatBlock[] = []
     let group: VisibleChatBlock[] = []
@@ -134,7 +211,7 @@ export function groupAssistantResultDetails(
     const latestUserIndex = blocks.findLastIndex((block) => (
         block.kind === 'user-text' || block.kind === 'question-answer'
     ))
-    if (options.runActive && latestUserIndex === -1) {
+    if (options.runActive && latestUserIndex === -1 && !options.activeTurnStartsAtBeginning) {
         return blocks
     }
 
@@ -143,7 +220,9 @@ export function groupAssistantResultDetails(
         const isCurrentTurnGroup = groupStartIndex > latestUserIndex
         transformed.push(...(
             options.runActive && isCurrentTurnGroup
-                ? group
+                ? options.aggregateActiveProcess
+                    ? transformActiveProcessGroup(group)
+                    : group
                 : transformAssistantGroup(group)
         ))
         group = []
@@ -164,5 +243,7 @@ export function groupAssistantResultDetails(
     }
 
     flushGroup()
-    return transformed
+    return options.runActive
+        ? markLatestActiveProcessDefaultOpen(markLatestCurrentTurnProcessActive(transformed))
+        : transformed
 }

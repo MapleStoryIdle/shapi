@@ -21,6 +21,11 @@ type ClosingTagBoundary = {
     tail: string
 }
 
+export type ShapiManagedSkillInvocation = {
+    id: string
+    request: string
+}
+
 const UNRECOGNIZED: KnownNormalizationResult = { recognized: false }
 
 const INTERNAL_XML_TAGS = [
@@ -466,8 +471,43 @@ function normalizeAppshotScaffold(value: string): KnownNormalizationResult {
     return nested.recognized ? nested : { recognized: true, text: remainder }
 }
 
+/**
+ * Recover the user-authored portion of a complete managed-skill wrapper for
+ * a local display surface. The wrapper body is deliberately never returned.
+ */
+export function parseShapiManagedSkillInvocation(value: string): ShapiManagedSkillInvocation | null {
+    const normalized = value.trim()
+    const opening = /^<shapi-managed-skill(-ref)? id="([a-z][a-z0-9-]{0,63})" version="[^"<>\r\n]+">/.exec(normalized)
+    if (!opening) return null
+
+    const closingTag = opening[1] ? '</shapi-managed-skill-ref>' : '</shapi-managed-skill>'
+    const boundary = findLastClosingTagBoundary(
+        normalized,
+        closingTag,
+        opening[0].length,
+        tail => /^User request:[ \t]*(?:\r?\n|$)/.test(tail)
+    )
+    if (!boundary) return null
+    const heading = /^User request:[ \t]*(?:\r?\n|$)/.exec(boundary.tail)
+    if (!heading) return null
+    return {
+        id: opening[2],
+        request: boundary.tail.slice(heading[0].length).trim()
+    }
+}
+
+function normalizeShapiManagedSkillScaffold(value: string): KnownNormalizationResult {
+    if (!parseShapiManagedSkillInvocation(value)) return UNRECOGNIZED
+
+    // The Hub already persisted the original `$skill request`. This record is
+    // only Codex's expanded mirror; forwarding it would duplicate the user
+    // turn and expose internal managed instructions.
+    return { recognized: true, text: null }
+}
+
 function normalizeKnownScaffold(value: string): KnownNormalizationResult {
     return [
+        normalizeShapiManagedSkillScaffold,
         normalizeBrowserCommentsScaffold,
         normalizeResponseAnnotationsScaffold,
         normalizeDelegationScaffold,

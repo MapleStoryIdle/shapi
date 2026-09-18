@@ -1,9 +1,25 @@
 import { z } from 'zod'
+import { CodexTokenUsageSchema } from './codexUsage'
 import { CODEX_COLLABORATION_MODES, PERMISSION_MODES } from './modes'
+import { NativeCodexSessionControlsSchema } from './codexSessionControl'
 
 export const PermissionModeSchema = z.enum(PERMISSION_MODES)
 export const CodexCollaborationModeSchema = z.enum(CODEX_COLLABORATION_MODES)
+export const CodexManagedSessionTargetResponseSchema = z.object({
+    success: z.literal(true),
+    sessionId: z.string().nullable()
+})
+export type CodexManagedSessionTargetResponse = z.infer<typeof CodexManagedSessionTargetResponseSchema>
 export const SessionEndReasonSchema = z.enum(['completed', 'terminated', 'error', 'handoff'])
+/** Browser-only handoff after a queued message has been cancelled for editing. */
+export const QueuedMessageEditSchema = z.object({
+    id: z.string(),
+    text: z.string(),
+    pendingSchedule: z.union([
+        z.object({ type: z.literal('absolute'), ms: z.number().finite() }),
+        z.object({ type: z.literal('preset'), preset: z.enum(['+5m', '+30m', '+1h', '+4h']) })
+    ]).nullable()
+})
 export type SessionEndReason = z.infer<typeof SessionEndReasonSchema>
 
 const MetadataSummarySchema = z.object({
@@ -43,6 +59,19 @@ export const CodexForkMetadataSchema = z.object({
 
 export type CodexForkMetadata = z.infer<typeof CodexForkMetadataSchema>
 
+export const MonitorSessionMetadataSchema = z.object({
+    monitorId: z.string(),
+    incidentId: z.string(),
+    sourceSession: z.object({
+        type: z.enum(['managed', 'native-codex']),
+        sessionId: z.string()
+    }),
+    createdAt: z.number(),
+    mode: z.literal('isolated-trigger')
+})
+
+export type MonitorSessionMetadata = z.infer<typeof MonitorSessionMetadataSchema>
+
 export const MetadataSchema = z.object({
     path: z.string(),
     host: z.string(),
@@ -53,6 +82,8 @@ export const MetadataSchema = z.object({
     machineId: z.string().optional(),
     claudeSessionId: z.string().optional(),
     codexSessionId: z.string().optional(),
+    codexTokenUsage: CodexTokenUsageSchema.nullish(),
+    codexModelProvider: z.string().nullish(),
     geminiSessionId: z.string().optional(),
     opencodeSessionId: z.string().optional(),
     cursorSessionId: z.string().optional(),
@@ -73,9 +104,17 @@ export const MetadataSchema = z.object({
     happyLibDir: z.string().optional(),
     happyToolsDir: z.string().optional(),
     startedFromRunner: z.boolean().optional(),
+    /** Random ownership marker assigned by the Runner that launched this process. */
+    runnerLaunchId: z.string().uuid().optional(),
     hostPid: z.number().optional(),
     hapiMcpUrl: z.string().url().optional(),
     startedBy: z.enum(['runner', 'terminal']).optional(),
+    /**
+     * Durable ownership of a managed agent session.  `desktop` means SHAPI
+     * intentionally released the runner and must remain read-only until an
+     * explicit future reclaim flow changes it.
+     */
+    controlOwner: z.enum(['shapi', 'external']).optional(),
     lifecycleState: z.string().optional(),
     lifecycleStateSince: z.number().optional(),
     archivedBy: z.string().optional(),
@@ -86,6 +125,7 @@ export const MetadataSchema = z.object({
     worktree: WorktreeMetadataSchema.optional(),
     sideSession: SideSessionMetadataSchema.optional(),
     codexFork: CodexForkMetadataSchema.optional(),
+    monitorSession: MonitorSessionMetadataSchema.optional(),
     // Cached Pi model list — written by CLI, read by web (inactive session fallback).
     // Minimal shape: each entry must have modelId; other fields (provider, name, etc.) pass through.
     piAvailableModels: z.array(z.object({ modelId: z.string() }).passthrough()).optional(),
@@ -138,6 +178,8 @@ export const CodexSubagentStateSchema = z.object({
     statusText: z.string().optional(),
     activity: z.string().optional(),
     activityKind: z.string().optional(),
+    model: z.string().optional(),
+    modelReasoningEffort: z.string().optional(),
     startedAt: z.number(),
     updatedAt: z.number(),
     completedAt: z.number().optional()
@@ -282,6 +324,7 @@ export type Session = z.infer<typeof SessionSchema>
 export const SessionPatchSchema = z.object({
     active: z.boolean().optional(),
     thinking: z.boolean().optional(),
+    thinkingAt: z.number().optional(),
     activeAt: z.number().optional(),
     updatedAt: z.number().optional(),
     model: z.string().nullable().optional(),
@@ -299,6 +342,7 @@ export const MachineMetadataSchema = z.object({
     host: z.string(),
     platform: z.string(),
     happyCliVersion: z.string(),
+    runnerVersion: z.string().optional(),
     displayName: z.string().optional(),
     homeDir: z.string().optional(),
     /** Absolute CODEX_HOME advertised by a runner for native thread affinity. */
@@ -307,7 +351,12 @@ export const MachineMetadataSchema = z.object({
     nativeCodexRealtime: z.boolean().optional(),
     happyHomeDir: z.string().optional(),
     happyLibDir: z.string().optional(),
-    workspaceRoots: z.array(z.string()).optional()
+    workspaceRoots: z.array(z.string()).optional(),
+    managedSkills: z.record(z.string(), z.object({
+        version: z.string(),
+        sha256: z.string(),
+        state: z.enum(['ready', 'missing', 'outdated', 'conflict', 'error'])
+    }).strict()).optional()
 })
 
 export type MachineMetadata = z.infer<typeof MachineMetadataSchema>
@@ -350,6 +399,22 @@ export const MachineAgentCliStatusSchema = z.object({
     available: z.boolean()
 }).strict()
 
+export const MachineShapiProcessCountsSchema = z.object({
+    total: z.number().int().nonnegative(),
+    active: z.number().int().nonnegative(),
+    sleeping: z.number().int().nonnegative(),
+    other: z.number().int().nonnegative()
+}).strict()
+
+export const MachineShapiResourcesSchema = z.object({
+    cpuPercent: z.number().min(0).max(100),
+    memoryBytes: z.number().int().nonnegative(),
+    memoryPercent: z.number().min(0).max(100),
+    diskBytes: z.number().int().nonnegative().optional(),
+    diskPath: z.string().optional(),
+    processes: MachineShapiProcessCountsSchema
+}).strict()
+
 export const MachineHealthSchema = z.object({
     collectedAt: z.number(),
     cpuCount: z.number().int().positive().optional(),
@@ -358,6 +423,7 @@ export const MachineHealthSchema = z.object({
     memoryPercent: z.number().min(0).max(100).optional(),
     uptimeSeconds: z.number().nonnegative().optional(),
     disk: MachineHealthDiskSchema.optional(),
+    shapi: MachineShapiResourcesSchema.optional(),
     networkInterfaces: z.array(MachineHealthNetworkInterfaceSchema).optional(),
     agentCli: z.array(MachineAgentCliStatusSchema).optional()
 }).strict()
@@ -418,7 +484,9 @@ export const CodexLocalSessionListUpdateSchema = z.object({
     model: z.string().nullable().optional(),
     modelReasoningEffort: z.string().nullable().optional(),
     runState: z.enum(['idle', 'processing', 'unknown']).optional(),
-    waitingForUserInput: z.boolean().optional()
+    runStartedAt: z.number().finite().optional(),
+    waitingForUserInput: z.boolean().optional(),
+    controlledByCodexSsh: z.boolean().optional()
 }).strict()
 
 export type CodexLocalSessionListUpdate = z.infer<typeof CodexLocalSessionListUpdateSchema>
@@ -432,6 +500,10 @@ export const CodexLocalSessionDirectSendProgressSchema = z.object({
     phase: z.enum(['launching', 'matching', 'connected', 'retrying', 'reasoning']),
     startedAt: z.number().finite(),
     phaseStartedAt: z.number().finite(),
+    history: z.array(z.object({
+        phase: z.enum(['launching', 'matching', 'connected', 'retrying', 'reasoning']),
+        startedAt: z.number().finite()
+    }).strict()).max(32).optional(),
     transport: z.enum(['app-server', 'exec-resume']),
     attempt: z.number().int().positive().optional()
 }).strict()
@@ -442,35 +514,46 @@ export const CodexLocalSessionQueuedMessageSchema = z.object({
     id: z.string(),
     text: z.string(),
     queuedAt: z.number().finite(),
+    cancelBlocked: z.boolean().optional(),
     recoveryRequired: z.boolean().optional(),
     recoveryReason: z.enum([
         'codex_timeout',
         'session_status_unknown',
         'launch_failed',
         'runner_restarted',
+        'review_guard_failed',
         'external_writer_active'
     ]).optional()
 }).strict()
 
 const CodexLocalSessionRealtimeQueuedMessageSchema = z.object({
     id: z.string().min(1).max(160),
+    cancelBlocked: z.boolean().optional(),
     recoveryRequired: z.boolean().optional(),
     recoveryReason: z.enum([
         'codex_timeout',
         'session_status_unknown',
         'launch_failed',
         'runner_restarted',
+        'review_guard_failed',
         'external_writer_active'
     ]).optional()
 }).strict()
 
 export const CodexLocalSessionRealtimeStatusSchema = z.object({
     success: z.literal(true),
+    controls: NativeCodexSessionControlsSchema.optional(),
     status: z.enum(['idle', 'processing', 'unknown']),
     activeTurnId: CodexLocalSessionActiveTurnIdSchema.optional(),
     waitingForUserInput: z.boolean().optional(),
+    controlledByCodexSsh: z.boolean().optional(),
     stalledSince: z.number().finite().optional(),
     startedAt: z.number().finite().optional(),
+    activeClientMessageId: z.string().min(1).max(160).optional(),
+    deliveryReceipts: z.array(z.object({
+        id: z.string().min(1).max(160),
+        state: z.enum(['accepted', 'delivered'])
+    }).strict()).max(100).optional(),
     progress: CodexLocalSessionDirectSendProgressSchema.optional(),
     lastError: z.string().optional(),
     lastErrorAt: z.number().finite().optional(),
@@ -480,9 +563,11 @@ export const CodexLocalSessionRealtimeStatusSchema = z.object({
         'session_status_unknown',
         'launch_failed',
         'runner_restarted',
+        'review_guard_failed',
         'external_writer_active'
     ]).optional(),
-    queuedMessageRefs: z.array(CodexLocalSessionRealtimeQueuedMessageSchema).max(50).optional()
+    // Up to 50 local entries plus one acknowledged Desktop queue receipt.
+    queuedMessageRefs: z.array(CodexLocalSessionRealtimeQueuedMessageSchema).max(51).optional()
 }).strict()
 
 /** Global SSE invalidation only; transcript bodies must use snapshot RPC. */
@@ -497,6 +582,18 @@ export const CodexLocalSessionRealtimeSnapshotSchema = z.object({
 }).strict()
 
 export const SyncEventSchema = z.discriminatedUnion('type', [
+    SessionEventBaseSchema.extend({
+        type: z.literal('kanban-order-updated')
+    }),
+    SessionEventBaseSchema.extend({
+        type: z.literal('session-pins-updated')
+    }),
+    SessionEventBaseSchema.extend({
+        type: z.literal('session-groups-updated')
+    }),
+    SessionEventBaseSchema.extend({
+        type: z.literal('session-labels-updated')
+    }),
     SessionChangedSchema.extend({
         type: z.literal('session-added'),
         data: z.unknown().optional()

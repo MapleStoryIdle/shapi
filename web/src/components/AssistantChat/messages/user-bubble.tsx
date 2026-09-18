@@ -3,7 +3,10 @@ import { LazyRainbowText } from '@/components/LazyRainbowText'
 import { PuzzleIcon, SparklesIcon } from '@/components/ToolCard/icons'
 import { cn } from '@/lib/utils'
 
-const LEADING_DIRECTIVE_REGEX = /^([$\/][a-z0-9][\w-]*)(?=\s|$)/i
+const LEADING_DIRECTIVE_REGEX = /^([$\/][a-z0-9][\w:-]*)(?=\s|$)/i
+// Desktop skill mentions are Markdown links, unlike composer $skill tokens.
+// Restrict this to explicit skill labels and SKILL.md targets, not file links.
+const LEADING_SKILL_LINK_REGEX = /^\[(\$[a-z0-9][\w:-]*)\]\((?:<[^>\r\n]*\/SKILL\.md>|[^\s)]+\/SKILL\.md)\)(?=\s|$)/i
 
 export function getUserBubbleClassName(status?: MessageStatus) {
     return cn(
@@ -25,7 +28,7 @@ export function extractLeadingDirectives(text: string): { directives: string[]; 
     const directives: string[] = []
 
     while (rest.length > 0) {
-        const match = rest.match(LEADING_DIRECTIVE_REGEX)
+        const match = rest.match(LEADING_SKILL_LINK_REGEX) ?? rest.match(LEADING_DIRECTIVE_REGEX)
         if (!match) break
 
         directives.push(match[1])
@@ -52,8 +55,10 @@ export function DirectiveChip(props: { value: string }) {
     return (
         <span
             className={cn(
-                'inline-flex items-center justify-center gap-[0.2rem] whitespace-nowrap rounded-full border border-[var(--app-chat-user-border)] bg-[var(--app-chat-user-chip-bg)] px-2 py-px align-middle text-[length:var(--app-chat-font-size)] font-normal leading-[1.4] shadow-none',
-                isSkill ? 'text-[var(--app-link)]' : 'text-[var(--app-chat-user-chip-fg)]'
+                'inline-flex items-center justify-center gap-[0.2rem] whitespace-nowrap align-middle text-[length:var(--app-chat-font-size)] leading-[1.4] shadow-none',
+                isSkill
+                    ? 'happy-user-skill-directive'
+                    : 'rounded-full border border-[var(--app-chat-user-border)] bg-[var(--app-chat-user-chip-bg)] px-2 py-px font-normal text-[var(--app-chat-user-chip-fg)]'
             )}
             title={props.value}
             aria-label={props.value}

@@ -24,6 +24,8 @@ import type { SyncEngine, Session } from '../../sync/syncEngine'
 import { RpcTargetMissingError } from '../../sync/rpcGateway'
 import type { WebAppEnv } from '../middleware/auth'
 import { requireSessionFromParam, requireSyncEngine } from './guards'
+import { mergeEnabledManagedSkills } from '../../managedSkills'
+import type { Store } from '../../store'
 
 function commandsFromMetadataSlashCommands(names: readonly string[] | undefined): SlashCommand[] {
     if (!names?.length) {
@@ -100,7 +102,7 @@ function uploadRpcFailure(c: Context<WebAppEnv>, error: unknown, fallback: strin
     return c.json({ success: false, error: message }, 500)
 }
 
-export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Hono<WebAppEnv> {
+export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null, store?: Store): Hono<WebAppEnv> {
     const app = new Hono<WebAppEnv>()
 
     app.get('/sessions', (c) => {
@@ -472,6 +474,32 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
         }
 
         await engine.archiveSession(sessionResult.sessionId)
+        return c.json({ ok: true })
+    })
+
+    app.post('/sessions/:id/release-control', async (c) => {
+        const engine = requireSyncEngine(c, getSyncEngine)
+        if (engine instanceof Response) {
+            return engine
+        }
+
+        const sessionResult = requireSessionFromParam(c, engine)
+        if (sessionResult instanceof Response) {
+            return sessionResult
+        }
+
+        const result = await engine.releaseSessionControl(
+            sessionResult.sessionId,
+            c.get('namespace')
+        )
+        if (result.type === 'error') {
+            const status = result.code === 'access_denied' ? 403
+                : result.code === 'session_not_found' ? 404
+                    : result.code === 'release_unavailable' || result.code === 'release_in_progress' || result.code === 'session_busy' || result.code === 'queued_messages' || result.code === 'release_uncertain' ? 409
+                        : 500
+            return c.json({ error: result.message, code: result.code }, status)
+        }
+
         return c.json({ ok: true })
     })
 
@@ -875,6 +903,9 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
                 sessionResult.sessionId,
                 sessionResult.session.metadata?.flavor ?? 'claude'
             )
+            if (result.success) {
+                result.skills = mergeEnabledManagedSkills(result.skills ?? [], store, c.get('namespace'))
+            }
             return c.json(result)
         } catch (error) {
             return c.json({

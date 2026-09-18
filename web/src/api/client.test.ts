@@ -16,6 +16,56 @@ describe('ApiClient error mapping', () => {
         vi.useRealTimers()
     })
 
+    it('renames a native session using its selected runner and the native PATCH route', async () => {
+        fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ success: true, name: '原生任务' }), { status: 200 }))
+        const api = new ApiClient('test-token')
+        expect(await api.renameCodexSession('thread/1', 'runner-1', '原生任务')).toEqual({ success: true, name: '原生任务' })
+        expect(fetchMock).toHaveBeenCalledWith('/api/codex/sessions/thread%2F1', expect.objectContaining({
+            method: 'PATCH', body: JSON.stringify({ machineId: 'runner-1', name: '原生任务' })
+        }))
+    })
+
+    it('keeps one spawn idempotency key when authentication retries the request', async () => {
+        fetchMock
+            .mockResolvedValueOnce(new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 }))
+            .mockResolvedValueOnce(new Response(JSON.stringify({ type: 'success', sessionId: 'session-1' }), { status: 200 }))
+        const api = new ApiClient('test-token', {
+            onUnauthorized: async () => 'refreshed-token'
+        })
+
+        await api.spawnSession('machine-1', '/work/project', 'codex')
+
+        expect(fetchMock).toHaveBeenCalledTimes(2)
+        const firstBody = JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string)
+        const retryBody = JSON.parse((fetchMock.mock.calls[1]?.[1] as RequestInit).body as string)
+        expect(firstBody.requestId).toMatch(/^[0-9a-f-]{36}$/)
+        expect(retryBody).toEqual(firstBody)
+    })
+
+    it('resolves a native Codex thread to its managed SHAPI session on the selected runner', async () => {
+        fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+            success: true,
+            sessionId: 'managed-session'
+        }), { status: 200 }))
+        const api = new ApiClient('test-token')
+
+        expect(await api.getCodexManagedSessionTarget('thread/1', 'runner 1')).toEqual({
+            success: true,
+            sessionId: 'managed-session'
+        })
+        expect(fetchMock).toHaveBeenCalledWith(
+            '/api/codex/sessions/thread%2F1/managed-session?machineId=runner+1',
+            expect.objectContaining({ headers: expect.any(Object) })
+        )
+    })
+
+    it('rejects an invalid managed-session target payload', async () => {
+        fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ success: true }), { status: 200 }))
+        const api = new ApiClient('test-token')
+
+        await expect(api.getCodexManagedSessionTarget('thread-1', 'runner-1')).rejects.toThrow()
+    })
+
     it('prefers the stable `code` field over the human-readable `error` message in ApiError.code', async () => {
         // Match the shape /sessions/:id/reopen actually returns on a 503.
         fetchMock.mockResolvedValueOnce(
@@ -180,6 +230,96 @@ describe('ApiClient error mapping', () => {
         expect((fetchMock.mock.calls[3]?.[1] as RequestInit).method).toBe('DELETE')
     })
 
+    it('uses monitor endpoints without ever fetching a raw webhook token', async () => {
+        const config = {
+            name: 'API health',
+            kind: 'http' as const,
+            deliveryMode: 'current-session' as const,
+            machineId: 'machine / one',
+            directory: '/work/project',
+            agent: 'codex' as const,
+            model: '',
+            reasoningEffort: '' as const,
+            permissionMode: 'read-only' as const,
+            prompt: 'Investigate safely and propose a repair.',
+            webhookIgnoreKeywords: '',
+            expiresAt: null,
+            enabled: true,
+            request: {
+                url: 'https://example.test/health',
+                method: 'POST' as const,
+                headers: { accept: 'application/json' },
+                body: '{"probe":true}',
+                intervalSeconds: 60,
+                timeoutSeconds: 10,
+                expectedStatus: 200,
+                bodyIncludes: 'ok',
+                allowPrivateNetwork: false,
+                allowPost: true
+            }
+        }
+        fetchMock
+            .mockResolvedValueOnce(new Response(JSON.stringify({ monitors: [] })))
+            .mockResolvedValueOnce(new Response(JSON.stringify({ monitor: { id: 'm / 1' } })))
+            .mockResolvedValueOnce(new Response(JSON.stringify({ monitor: { id: 'm / 1' }, token: 'new-token' })))
+            .mockResolvedValueOnce(new Response(JSON.stringify({ monitor: { id: 'm / 1' } })))
+            .mockResolvedValueOnce(new Response(JSON.stringify({ token: 'rotated-token' })))
+            .mockResolvedValueOnce(new Response(JSON.stringify({ accepted: true })))
+            .mockResolvedValueOnce(new Response(JSON.stringify({ accepted: true })))
+            .mockResolvedValueOnce(new Response(JSON.stringify({ accepted: true })))
+            .mockResolvedValueOnce(new Response(JSON.stringify({ request: config.request })))
+
+        const api = new ApiClient('test-token')
+        await api.getMonitors()
+        await api.getMonitor('m / 1')
+        await api.createMonitor(config)
+        await api.updateMonitor('m / 1', config)
+        await api.rotateMonitorToken('m / 1')
+        await api.checkMonitor('m / 1')
+        await api.approveMonitorIncident('m / 1', 'incident / 1', 'immutable-plan-hash')
+        await api.closeMonitorIncident('m / 1', 'incident / 1')
+        await api.parseMonitorCurl('curl -X POST https://example.test/health')
+
+        expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+            '/api/monitors',
+            '/api/monitors/m%20%2F%201',
+            '/api/monitors',
+            '/api/monitors/m%20%2F%201',
+            '/api/monitors/m%20%2F%201/token',
+            '/api/monitors/m%20%2F%201/check',
+            '/api/monitors/m%20%2F%201/incidents/incident%20%2F%201/approve',
+            '/api/monitors/m%20%2F%201/incidents/incident%20%2F%201/close',
+            '/api/monitors/parse-curl'
+        ])
+        expect((fetchMock.mock.calls[2]?.[1] as RequestInit).body).toBe(JSON.stringify(config))
+        expect((fetchMock.mock.calls[4]?.[1] as RequestInit).method).toBe('POST')
+        expect((fetchMock.mock.calls[6]?.[1] as RequestInit).body).toBe(JSON.stringify({ planHash: 'immutable-plan-hash' }))
+        expect((fetchMock.mock.calls[7]?.[1] as RequestInit).body).toBe(JSON.stringify({}))
+        expect((fetchMock.mock.calls[8]?.[1] as RequestInit).body).toBe(JSON.stringify({ curl: 'curl -X POST https://example.test/health' }))
+    })
+
+    it('loads a server-resolved monitor target with encoded session identifiers', async () => {
+        fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+            config: { targetSession: { type: 'native-codex', sessionId: 'thread / one' } },
+            target: { type: 'native-codex', sessionId: 'thread / one', title: 'Native thread' }
+        })))
+
+        const api = new ApiClient('test-token')
+        await expect(api.getMonitorSessionTarget({
+            type: 'native-codex',
+            sessionId: 'thread / one',
+            machineId: 'machine / one'
+        })).resolves.toEqual({
+            config: { targetSession: { type: 'native-codex', sessionId: 'thread / one' } },
+            target: { type: 'native-codex', sessionId: 'thread / one', title: 'Native thread' }
+        })
+
+        expect(fetchMock.mock.calls[0]?.[0]).toBe(
+            '/api/monitors/session-target?type=native-codex&sessionId=thread+%2F+one&machineId=machine+%2F+one'
+        )
+        expect((fetchMock.mock.calls[0]?.[1] as RequestInit).method ?? 'GET').toBe('GET')
+    })
+
     it('requests a runner directory Git branch with encoded identifiers', async () => {
         fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
             success: true,
@@ -201,6 +341,83 @@ describe('ApiClient error mapping', () => {
         expect(fetchMock.mock.calls[0]?.[0]).toBe(
             '/api/machines/machine%20%2F%20one/git-branch?cwd=%2Fwork%2Fproject%20name'
         )
+    })
+
+    it('uses the machine Git branch picker endpoints', async () => {
+        const payload = {
+            success: true,
+            currentBranch: 'main',
+            isDirty: false,
+            changedFileCount: 0,
+            additions: 0,
+            deletions: 0,
+            upstream: 'origin/main',
+            canUpdate: true,
+            localBranches: [{ ref: 'main', name: 'main' }],
+            remoteBranches: [{ ref: 'origin/main', name: 'main' }]
+        }
+        fetchMock
+            .mockResolvedValueOnce(new Response(JSON.stringify(payload)))
+            .mockResolvedValueOnce(new Response(JSON.stringify(payload)))
+            .mockResolvedValueOnce(new Response(JSON.stringify(payload)))
+            .mockResolvedValueOnce(new Response(JSON.stringify(payload)))
+            .mockResolvedValueOnce(new Response(JSON.stringify(payload)))
+            .mockResolvedValueOnce(new Response(JSON.stringify(payload)))
+            .mockResolvedValueOnce(new Response(JSON.stringify(payload)))
+
+        const api = new ApiClient('test-token')
+        await expect(api.getMachineGitBranches('machine / one', '/work/project name')).resolves.toEqual(payload)
+        await expect(api.switchMachineGitBranch('machine / one', {
+            cwd: '/work/project name',
+            target: { kind: 'remote', ref: 'origin/main' },
+            confirmDirty: true
+        })).resolves.toEqual(payload)
+        await expect(api.createMachineGitBranch('machine / one', {
+            cwd: '/work/project name',
+            name: 'feature/new'
+        })).resolves.toEqual(payload)
+        await expect(api.commitMachineGitChanges('machine / one', {
+            cwd: '/work/project name',
+            message: 'Add branch controls'
+        })).resolves.toEqual(payload)
+        await expect(api.pushMachineGitBranch('machine / one', {
+            cwd: '/work/project name'
+        })).resolves.toEqual(payload)
+        await expect(api.fetchMachineGitBranches('machine / one', {
+            cwd: '/work/project name'
+        })).resolves.toEqual(payload)
+        await expect(api.updateMachineGitBranch('machine / one', {
+            cwd: '/work/project name'
+        })).resolves.toEqual(payload)
+
+        expect(fetchMock.mock.calls[0]?.[0]).toBe(
+            '/api/machines/machine%20%2F%20one/git-branches?cwd=%2Fwork%2Fproject%20name'
+        )
+        expect(fetchMock.mock.calls[1]?.[0]).toBe('/api/machines/machine%20%2F%20one/git-branches/switch')
+        expect((fetchMock.mock.calls[1]?.[1] as RequestInit).method).toBe('POST')
+        expect((fetchMock.mock.calls[1]?.[1] as RequestInit).body).toBe(JSON.stringify({
+            cwd: '/work/project name',
+            target: { kind: 'remote', ref: 'origin/main' },
+            confirmDirty: true
+        }))
+        expect(fetchMock.mock.calls[2]?.[0]).toBe('/api/machines/machine%20%2F%20one/git-branches')
+        expect(fetchMock.mock.calls[3]?.[0]).toBe('/api/machines/machine%20%2F%20one/git-branches/commit')
+        expect((fetchMock.mock.calls[3]?.[1] as RequestInit).body).toBe(JSON.stringify({
+            cwd: '/work/project name',
+            message: 'Add branch controls'
+        }))
+        expect(fetchMock.mock.calls[4]?.[0]).toBe('/api/machines/machine%20%2F%20one/git-branches/push')
+        expect((fetchMock.mock.calls[4]?.[1] as RequestInit).body).toBe(JSON.stringify({
+            cwd: '/work/project name'
+        }))
+        expect(fetchMock.mock.calls[5]?.[0]).toBe('/api/machines/machine%20%2F%20one/git-branches/fetch')
+        expect((fetchMock.mock.calls[5]?.[1] as RequestInit).body).toBe(JSON.stringify({
+            cwd: '/work/project name'
+        }))
+        expect(fetchMock.mock.calls[6]?.[0]).toBe('/api/machines/machine%20%2F%20one/git-branches/update')
+        expect((fetchMock.mock.calls[6]?.[1] as RequestInit).body).toBe(JSON.stringify({
+            cwd: '/work/project name'
+        }))
     })
 
     it('reads a native Codex file through its owning runner with encoded identifiers', async () => {

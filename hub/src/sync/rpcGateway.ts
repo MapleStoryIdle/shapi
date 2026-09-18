@@ -2,6 +2,9 @@ import type { AgentFlavor, CodexCollaborationMode, PermissionMode } from '@hapi/
 import { randomUUID } from 'node:crypto'
 import { MAX_UPLOAD_CHUNK_BYTES } from '@hapi/protocol'
 import { RPC_METHODS } from '@hapi/protocol/rpcMethods'
+import type { RenameNativeCodexSessionResponse } from '@hapi/protocol/apiTypes'
+import { LOCAL_SERVICE_RPC, type LocalServiceTunnelRequest } from '@hapi/protocol/localServices'
+import { openLocalServiceSocketTunnel, type LocalServiceTunnel } from '../localServices/socketTransport'
 import type {
     CodexLocalSessionComposerCapabilitiesRpcResponse,
     ArchiveCodexLocalSessionRpcResponse,
@@ -12,8 +15,13 @@ import type {
     CodexLocalSessionsRpcResponse,
     DiscardCodexLocalSessionMessageRpcResponse,
     NativeCodexDeliveryPolicy,
+    NativeCodexAttachment,
     NativeKanbanFeedbackReviewGuard,
-    SendCodexLocalSessionMessageRpcResponse
+    NativeCodexSessionControlAction,
+    NativeCodexSessionControlResponse,
+    SendCodexLocalSessionMessageRpcResponse,
+    RecoverCodexLocalSessionControlRequest,
+    CodexLocalSessionRecoveryResponse
 } from '@hapi/protocol/codexTranscript'
 import type {
     BinaryFileReadRequest,
@@ -21,7 +29,11 @@ import type {
     NativeKanbanFeedbackDeleteRequest,
     NativeKanbanFeedbackDeleteResponse,
     NativeKanbanFeedbackStageRequest,
-    NativeKanbanFeedbackStageResponse
+    NativeKanbanFeedbackStageResponse,
+    NativeCodexAttachmentDeleteRequest,
+    NativeCodexAttachmentDeleteResponse,
+    NativeCodexAttachmentStageRequest,
+    NativeCodexAttachmentStageResponse
 } from '@hapi/protocol'
 import type {
     CodexSubscriptionLimitsResponse,
@@ -36,6 +48,7 @@ import type {
     FileReadResponse,
     GeneratedImageResponse,
     GitBranchResponse,
+    GitBranchesResponse,
     LocalPreviewHttpRequest,
     LocalPreviewHttpResponse,
     LocalPreviewProbeRequest,
@@ -44,8 +57,18 @@ import type {
     OpenVikingContextListResponse,
     OpenVikingContextReadRequest,
     OpenVikingContextReadResponse,
+    OpenVikingMetricsResponse,
+    OpenVikingQualityResponse,
+    OpenVikingSearchRequest,
+    OpenVikingSearchResponse,
     OpenVikingStatusResponse,
     ListDirectoryResponse,
+    MachineGitBranchCreateRequest,
+    MachineGitBranchCommitRequest,
+    MachineGitBranchFetchRequest,
+    MachineGitBranchPushRequest,
+    MachineGitBranchSwitchRequest,
+    MachineGitBranchUpdateRequest,
     OpencodeModelsResponse,
     OpencodeModelSummary,
     OpencodeReasoningEffortResponse,
@@ -64,6 +87,8 @@ import type { RpcRegistry } from '../socket/rpcRegistry'
 const DEFAULT_RPC_TIMEOUT_MS = 30_000
 const MODEL_LIST_RPC_TIMEOUT_MS = 120_000
 const SIDE_SESSION_FORK_RPC_TIMEOUT_MS = 90_000
+const GIT_BRANCH_MUTATION_RPC_TIMEOUT_MS = 45_000
+const GIT_BRANCH_REMOTE_RPC_TIMEOUT_MS = 75_000
 const UPLOAD_CANCEL_TIMEOUT_MS = 5_000
 
 /**
@@ -87,8 +112,12 @@ export class RpcTargetMissingError extends Error {
     }
 }
 
+/** A runner answered the handoff RPC but declined before beginning teardown. */
+export class HandoffRejectedError extends Error {}
+
 export type RpcCommandResponse = CommandResponse
 export type RpcGitBranchResponse = GitBranchResponse
+export type RpcGitBranchesResponse = GitBranchesResponse
 export type RpcReadFileResponse = FileReadResponse
 export type RpcGeneratedImageResponse = GeneratedImageResponse
 export type RpcUploadFileResponse = UploadFileResponse
@@ -109,6 +138,9 @@ export type RpcLocalPreviewHttpResponse = LocalPreviewHttpResponse
 export type RpcOpenVikingStatusResponse = OpenVikingStatusResponse
 export type RpcOpenVikingContextListResponse = OpenVikingContextListResponse
 export type RpcOpenVikingContextReadResponse = OpenVikingContextReadResponse
+export type RpcOpenVikingMetricsResponse = OpenVikingMetricsResponse
+export type RpcOpenVikingSearchResponse = OpenVikingSearchResponse
+export type RpcOpenVikingQualityResponse = OpenVikingQualityResponse
 export type RpcCodexLocalSessionsResponse = CodexLocalSessionsRpcResponse
 export type RpcCodexLocalSessionDataResponse = CodexLocalSessionDataRpcResponse
 export type RpcCodexLocalSessionComposerCapabilitiesResponse = CodexLocalSessionComposerCapabilitiesRpcResponse
@@ -117,8 +149,11 @@ export type RpcCodexLocalSessionStatusResponse = CodexLocalSessionStatusRpcRespo
 export type RpcArchiveCodexLocalSessionResponse = ArchiveCodexLocalSessionRpcResponse
 export type RpcDiscardCodexLocalSessionMessageResponse = DiscardCodexLocalSessionMessageRpcResponse
 export type RpcSendCodexLocalSessionMessageResponse = SendCodexLocalSessionMessageRpcResponse
+export type RpcCodexLocalSessionRecoveryResponse = CodexLocalSessionRecoveryResponse
 export type RpcNativeKanbanFeedbackStageResponse = NativeKanbanFeedbackStageResponse
 export type RpcNativeKanbanFeedbackDeleteResponse = NativeKanbanFeedbackDeleteResponse
+export type RpcNativeCodexAttachmentStageResponse = NativeCodexAttachmentStageResponse
+export type RpcNativeCodexAttachmentDeleteResponse = NativeCodexAttachmentDeleteResponse
 export type RpcForkCodexSideSessionResponse =
     | { type: 'success'; childCodexThreadId: string; parentCodexThreadId: string }
     | { type: 'error'; message: string; code?: string }
@@ -234,8 +269,17 @@ export class RpcGateway {
         await this.sessionRpc(sessionId, RPC_METHODS.KillSession, {})
     }
 
-    async handoffSessionToLocal(sessionId: string): Promise<void> {
-        await this.sessionRpc(sessionId, RPC_METHODS.HandoffLocal, {})
+    async handoffSessionToLocal(sessionId: string, destination: 'local-terminal' | 'external' = 'local-terminal'): Promise<void> {
+        const response = await this.sessionRpc(sessionId, RPC_METHODS.HandoffLocal, { destination })
+        if (!response || typeof response !== 'object') {
+            throw new Error('Invalid handoff response from runner')
+        }
+        const result = response as { ok?: unknown; error?: unknown }
+        if (result.ok === true) return
+        if (typeof result.error === 'string' && result.error.length > 0) {
+            throw new HandoffRejectedError(result.error)
+        }
+        throw new Error('Runner did not confirm handoff')
     }
 
     async spawnSession(
@@ -251,13 +295,14 @@ export class RpcGateway {
         effort?: string,
         permissionMode?: PermissionMode,
         serviceTier?: string,
-        forkSessionId?: string
+        forkSessionId?: string,
+        approvedNewDirectoryCreation?: boolean
     ): Promise<{ type: 'success'; sessionId: string } | { type: 'error'; message: string }> {
         try {
             const result = await this.machineRpc(
                 machineId,
                 RPC_METHODS.SpawnHappySession,
-                { type: 'spawn-in-directory', directory, agent, model, modelReasoningEffort, yolo, sessionType, worktreeName, resumeSessionId, effort, permissionMode, serviceTier, forkSessionId }
+                { type: 'spawn-in-directory', directory, agent, model, modelReasoningEffort, yolo, sessionType, worktreeName, resumeSessionId, effort, permissionMode, serviceTier, forkSessionId, approvedNewDirectoryCreation }
             )
             if (result && typeof result === 'object') {
                 const obj = result as Record<string, unknown>
@@ -298,6 +343,10 @@ export class RpcGateway {
             return { success: false, error: 'Unexpected list-directory result' }
         }
         return result as RpcListDirectoryResponse
+    }
+
+    async browseSessionFiles(machineId: string, cwd: string, request: import('@hapi/protocol/apiTypes').SessionFileBrowserRequest): Promise<import('@hapi/protocol/apiTypes').SessionFileBrowserResponse> {
+        return await this.machineRpc(machineId, RPC_METHODS.BrowseSessionFiles, { cwd, request }) as import('@hapi/protocol/apiTypes').SessionFileBrowserResponse
     }
 
     async listCodexLocalSessions(
@@ -342,6 +391,25 @@ export class RpcGateway {
         }) as RpcCodexLocalSessionStatusResponse
     }
 
+    async recoverCodexLocalSessionControl(machineId: string, request: RecoverCodexLocalSessionControlRequest): Promise<RpcCodexLocalSessionRecoveryResponse> {
+        return await this.machineRpc(machineId, RPC_METHODS.RecoverCodexLocalSessionControl, request) as RpcCodexLocalSessionRecoveryResponse
+    }
+
+    async getCodexLocalSessionRecovery(machineId: string, sessionId: string): Promise<RpcCodexLocalSessionRecoveryResponse> {
+        return await this.machineRpc(machineId, RPC_METHODS.GetCodexLocalSessionRecovery, { sessionId }) as RpcCodexLocalSessionRecoveryResponse
+    }
+
+    async controlCodexLocalSession(
+        machineId: string,
+        sessionId: string,
+        action: NativeCodexSessionControlAction
+    ): Promise<NativeCodexSessionControlResponse> {
+        return await this.machineRpc(machineId, RPC_METHODS.ControlCodexLocalSession, {
+            sessionId,
+            ...action
+        }) as NativeCodexSessionControlResponse
+    }
+
     async getCodexLocalSessionComposerCapabilities(
         machineId: string,
         sessionId: string
@@ -359,7 +427,9 @@ export class RpcGateway {
         clientMessageId?: string,
         forceRecovery?: boolean,
         deliveryPolicy?: NativeCodexDeliveryPolicy,
-        reviewGuard?: NativeKanbanFeedbackReviewGuard
+        reviewGuard?: NativeKanbanFeedbackReviewGuard,
+        attachmentIds?: readonly string[],
+        allowHapiInitiated = false
     ): Promise<RpcSendCodexLocalSessionMessageResponse> {
         return await this.machineRpc(machineId, RPC_METHODS.SendCodexLocalSessionMessage, {
             sessionId,
@@ -368,7 +438,9 @@ export class RpcGateway {
             ...(clientMessageId === undefined ? {} : { clientMessageId }),
             ...(forceRecovery === true ? { forceRecovery: true } : {}),
             ...(deliveryPolicy === undefined || deliveryPolicy === 'default' ? {} : { deliveryPolicy }),
-            ...(deliveryPolicy === 'untrusted-review' && reviewGuard ? { reviewGuard } : {})
+            ...(deliveryPolicy === 'untrusted-review' && reviewGuard ? { reviewGuard } : {}),
+            ...(attachmentIds?.length ? { attachmentIds: [...attachmentIds] } : {}),
+            ...(allowHapiInitiated ? { allowHapiInitiated: true } : {})
         }) as RpcSendCodexLocalSessionMessageResponse
     }
 
@@ -390,6 +462,10 @@ export class RpcGateway {
         return await this.machineRpc(machineId, RPC_METHODS.ArchiveCodexLocalSession, {
             sessionId
         }) as RpcArchiveCodexLocalSessionResponse
+    }
+
+    async renameCodexLocalSession(machineId: string, sessionId: string, name: string): Promise<RenameNativeCodexSessionResponse> {
+        return await this.machineRpc(machineId, RPC_METHODS.RenameCodexLocalSession, { sessionId, name }, 60_000) as RenameNativeCodexSessionResponse
     }
 
     async stageNativeKanbanFeedback(
@@ -416,6 +492,42 @@ export class RpcGateway {
         return { success: false, error: typeof record.error === 'string' ? record.error : 'Could not delete native feedback stage' }
     }
 
+    async stageNativeCodexAttachment(
+        machineId: string,
+        request: NativeCodexAttachmentStageRequest
+    ): Promise<RpcNativeCodexAttachmentStageResponse> {
+        const socket = this.getSocketForMachine(machineId, 'native-codex-attachment:stage')
+        const response = await socket.timeout(DEFAULT_RPC_TIMEOUT_MS).emitWithAck('native-codex-attachment:stage', request) as NativeCodexAttachmentStageResponse | unknown
+        if (!response || typeof response !== 'object') return { success: false, error: 'Unexpected native attachment stage response' }
+        const record = response as Record<string, unknown>
+        const attachment = record.attachment
+        if (
+            record.success === true
+            && attachment
+            && typeof attachment === 'object'
+            && typeof (attachment as Record<string, unknown>).id === 'string'
+            && typeof (attachment as Record<string, unknown>).filename === 'string'
+            && typeof (attachment as Record<string, unknown>).mimeType === 'string'
+            && typeof (attachment as Record<string, unknown>).size === 'number'
+            && ((attachment as Record<string, unknown>).kind === 'image' || (attachment as Record<string, unknown>).kind === 'file')
+        ) {
+            return { success: true, attachment: attachment as NativeCodexAttachment }
+        }
+        return { success: false, error: typeof record.error === 'string' ? record.error : 'Could not stage native attachment' }
+    }
+
+    async deleteNativeCodexAttachment(
+        machineId: string,
+        request: NativeCodexAttachmentDeleteRequest
+    ): Promise<RpcNativeCodexAttachmentDeleteResponse> {
+        const socket = this.getSocketForMachine(machineId, 'native-codex-attachment:delete')
+        const response = await socket.timeout(DEFAULT_RPC_TIMEOUT_MS).emitWithAck('native-codex-attachment:delete', request) as NativeCodexAttachmentDeleteResponse | unknown
+        if (!response || typeof response !== 'object') return { success: false, error: 'Unexpected native attachment delete response' }
+        const record = response as Record<string, unknown>
+        if (record.success === true && typeof record.deleted === 'boolean') return { success: true, deleted: record.deleted }
+        return { success: false, error: typeof record.error === 'string' ? record.error : 'Could not delete native attachment' }
+    }
+
     async checkPathsExist(machineId: string, paths: string[]): Promise<Record<string, boolean>> {
         const result = await this.machineRpc(machineId, RPC_METHODS.PathExists, { paths }) as RpcPathExistsResponse | unknown
         if (!result || typeof result !== 'object') {
@@ -436,6 +548,77 @@ export class RpcGateway {
 
     async getMachineGitBranch(machineId: string, cwd: string): Promise<RpcGitBranchResponse> {
         return await this.machineRpc(machineId, RPC_METHODS.GetMachineGitBranch, { cwd }) as RpcGitBranchResponse
+    }
+
+    async getMachineGitBranches(machineId: string, cwd: string): Promise<RpcGitBranchesResponse> {
+        return await this.machineRpc(machineId, RPC_METHODS.GetMachineGitBranches, { cwd }) as RpcGitBranchesResponse
+    }
+
+    async switchMachineGitBranch(
+        machineId: string,
+        request: MachineGitBranchSwitchRequest
+    ): Promise<RpcGitBranchesResponse> {
+        return await this.machineRpc(
+            machineId,
+            RPC_METHODS.SwitchMachineGitBranch,
+            request,
+            GIT_BRANCH_MUTATION_RPC_TIMEOUT_MS
+        ) as RpcGitBranchesResponse
+    }
+
+    async createMachineGitBranch(
+        machineId: string,
+        request: MachineGitBranchCreateRequest
+    ): Promise<RpcGitBranchesResponse> {
+        return await this.machineRpc(machineId, RPC_METHODS.CreateMachineGitBranch, request) as RpcGitBranchesResponse
+    }
+
+    async commitMachineGitChanges(
+        machineId: string,
+        request: MachineGitBranchCommitRequest
+    ): Promise<RpcGitBranchesResponse> {
+        return await this.machineRpc(
+            machineId,
+            RPC_METHODS.CommitMachineGitChanges,
+            request,
+            GIT_BRANCH_REMOTE_RPC_TIMEOUT_MS
+        ) as RpcGitBranchesResponse
+    }
+
+    async pushMachineGitBranch(
+        machineId: string,
+        request: MachineGitBranchPushRequest
+    ): Promise<RpcGitBranchesResponse> {
+        return await this.machineRpc(
+            machineId,
+            RPC_METHODS.PushMachineGitBranch,
+            request,
+            GIT_BRANCH_REMOTE_RPC_TIMEOUT_MS
+        ) as RpcGitBranchesResponse
+    }
+
+    async fetchMachineGitBranches(
+        machineId: string,
+        request: MachineGitBranchFetchRequest
+    ): Promise<RpcGitBranchesResponse> {
+        return await this.machineRpc(
+            machineId,
+            RPC_METHODS.FetchMachineGitBranches,
+            request,
+            GIT_BRANCH_REMOTE_RPC_TIMEOUT_MS
+        ) as RpcGitBranchesResponse
+    }
+
+    async updateMachineGitBranch(
+        machineId: string,
+        request: MachineGitBranchUpdateRequest
+    ): Promise<RpcGitBranchesResponse> {
+        return await this.machineRpc(
+            machineId,
+            RPC_METHODS.UpdateMachineGitBranch,
+            request,
+            GIT_BRANCH_REMOTE_RPC_TIMEOUT_MS
+        ) as RpcGitBranchesResponse
     }
 
     async readMachineFile(machineId: string, cwd: string, path: string): Promise<RpcReadFileResponse> {
@@ -590,22 +773,30 @@ export class RpcGateway {
 
     async listSkills(sessionId: string, flavor?: string): Promise<{
         success: boolean
-        skills?: Array<{ name: string; description?: string; scope?: 'project' | 'user' | 'plugin' | 'system' | 'admin' }>
+        skills?: Array<{ name: string; description?: string; descriptions?: Partial<Record<'en' | 'zh-CN', string>>; scope?: 'hub' | 'project' | 'user' | 'plugin' | 'system' | 'admin' }>
         error?: string
     }> {
         return await this.sessionRpc(sessionId, RPC_METHODS.ListSkills, { flavor }) as {
             success: boolean
-            skills?: Array<{ name: string; description?: string; scope?: 'project' | 'user' | 'plugin' | 'system' | 'admin' }>
+            skills?: Array<{ name: string; description?: string; descriptions?: Partial<Record<'en' | 'zh-CN', string>>; scope?: 'hub' | 'project' | 'user' | 'plugin' | 'system' | 'admin' }>
             error?: string
         }
+    }
+
+    async reconcileManagedSkill(machineId: string, payload: unknown): Promise<unknown> {
+        return await this.machineRpc(machineId, RPC_METHODS.ManagedSkillReconcile, payload, 30_000)
+    }
+
+    async removeManagedSkill(machineId: string, id: string): Promise<unknown> {
+        return await this.machineRpc(machineId, RPC_METHODS.ManagedSkillRemove, { id }, 30_000)
     }
 
     async listCodexModelsForSession(sessionId: string): Promise<RpcListCodexModelsResponse> {
         return await this.sessionRpc(sessionId, RPC_METHODS.ListCodexModels, {}, MODEL_LIST_RPC_TIMEOUT_MS) as RpcListCodexModelsResponse
     }
 
-    async getCodexSubscriptionLimitsForSession(sessionId: string, model?: string | null): Promise<RpcGetCodexSubscriptionLimitsResponse> {
-        const request: GetCodexSubscriptionLimitsRequest = { model: model ?? null }
+    async getCodexSubscriptionLimitsForSession(sessionId: string, model?: string | null, cwd?: string | null, provider?: string | null): Promise<RpcGetCodexSubscriptionLimitsResponse> {
+        const request: GetCodexSubscriptionLimitsRequest = { model: model ?? null, cwd, provider }
         return await this.sessionRpc(
             sessionId,
             RPC_METHODS.GetCodexSubscriptionLimits,
@@ -652,8 +843,8 @@ export class RpcGateway {
         return await this.machineRpc(machineId, RPC_METHODS.ListCodexModels, {}, MODEL_LIST_RPC_TIMEOUT_MS) as RpcListCodexModelsResponse
     }
 
-    async getCodexSubscriptionLimitsForMachine(machineId: string, model?: string | null): Promise<RpcGetCodexSubscriptionLimitsResponse> {
-        const request: GetCodexSubscriptionLimitsRequest = { model: model ?? null }
+    async getCodexSubscriptionLimitsForMachine(machineId: string, model?: string | null, cwd?: string | null, provider?: string | null): Promise<RpcGetCodexSubscriptionLimitsResponse> {
+        const request: GetCodexSubscriptionLimitsRequest = { model: model ?? null, cwd, provider }
         return await this.machineRpc(
             machineId,
             RPC_METHODS.GetCodexSubscriptionLimits,
@@ -682,6 +873,14 @@ export class RpcGateway {
         return await this.machineRpc(machineId, RPC_METHODS.LocalPreviewCheck, request) as RpcLocalPreviewProbeResponse
     }
 
+    async openLocalServiceTunnel(machineId: string, request: LocalServiceTunnelRequest, namespace: string): Promise<LocalServiceTunnel> {
+        const method = `${machineId}:${LOCAL_SERVICE_RPC}`
+        const socketId = this.rpcRegistry.getSocketIdForMethod(method)
+        const socket = socketId ? this.io.of('/cli').sockets.get(socketId) : undefined
+        if (!socket) throw new RpcTargetMissingError(method, 'socket-disconnected')
+        return await openLocalServiceSocketTunnel(socket, machineId, namespace, request)
+    }
+
     async proxyLocalPreviewRequest(machineId: string, request: LocalPreviewHttpRequest): Promise<RpcLocalPreviewHttpResponse> {
         return await this.machineRpc(machineId, RPC_METHODS.LocalPreviewHttpRequest, request) as RpcLocalPreviewHttpResponse
     }
@@ -696,6 +895,18 @@ export class RpcGateway {
 
     async readOpenVikingContext(machineId: string, request: OpenVikingContextReadRequest): Promise<RpcOpenVikingContextReadResponse> {
         return await this.machineRpc(machineId, RPC_METHODS.OpenVikingReadContext, request) as RpcOpenVikingContextReadResponse
+    }
+
+    async getOpenVikingMetrics(machineId: string): Promise<RpcOpenVikingMetricsResponse> {
+        return await this.machineRpc(machineId, RPC_METHODS.OpenVikingMetrics, {}) as RpcOpenVikingMetricsResponse
+    }
+
+    async searchOpenViking(machineId: string, request: OpenVikingSearchRequest): Promise<RpcOpenVikingSearchResponse> {
+        return await this.machineRpc(machineId, RPC_METHODS.OpenVikingSearch, request) as RpcOpenVikingSearchResponse
+    }
+
+    async getOpenVikingQuality(machineId: string): Promise<RpcOpenVikingQualityResponse> {
+        return await this.machineRpc(machineId, RPC_METHODS.OpenVikingQuality, {}, 45_000) as RpcOpenVikingQualityResponse
     }
 
     /** Generic Pi RPC call — routes all Pi-specific session RPCs through

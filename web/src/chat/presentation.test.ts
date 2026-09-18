@@ -14,6 +14,14 @@ describe('getEventPresentation — agent errors', () => {
 })
 
 describe('getEventPresentation — task-status', () => {
+    it.each(['http_forbidden', 'unknown', 'network_error'] as const)('recognizes HTTP 403 with code %s', (code) => {
+        expect(getEventPresentation({
+            type: 'task-status', status: 'failed', source: 'codex', code,
+            message: 'stream disconnected before completion: unexpected status 403 Forbidden: <html>private response</html>',
+            recoverable: false
+        })).toEqual({ icon: '⚠️', text: 'Request denied (HTTP 403)' })
+    })
+
     it('formats retrying task status with attempt counts', () => {
         const result = getEventPresentation({
             type: 'task-status',
@@ -44,6 +52,38 @@ describe('getEventPresentation — task-status', () => {
 
         expect(result.icon).toBe('⚠️')
         expect(result.text).toBe('Codex usage limit reached · try again at 9:43 AM')
+    })
+
+    it('formats authentication failures without exposing provider details', () => {
+        expect(getEventPresentation({
+            type: 'task-status',
+            status: 'failed',
+            source: 'codex',
+            code: 'authentication',
+            message: 'HTTP 401 Unauthorized: private provider response',
+            recoverable: false
+        })).toEqual({ icon: '⚠️', text: 'Codex sign-in required' })
+    })
+
+    it('formats classified and older unclassified network failures without the generic task-failed label', () => {
+        const result = getEventPresentation({
+            type: 'task-status',
+            status: 'failed',
+            source: 'codex',
+            code: 'network_error',
+            message: 'Network error: request timed out',
+            recoverable: false
+        })
+
+        expect(result).toEqual({ icon: '⚠️', text: 'Network connection issue' })
+        expect(getEventPresentation({
+            type: 'task-status',
+            status: 'failed',
+            source: 'codex',
+            code: 'unknown',
+            message: 'stream disconnected before completion: error sending request',
+            recoverable: false
+        })).toEqual({ icon: '⚠️', text: 'Network connection issue' })
     })
 })
 

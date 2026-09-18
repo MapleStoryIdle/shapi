@@ -17,6 +17,40 @@ describe('AppServerEventConverter', () => {
         expect(events).toEqual([{ type: 'thread_started', thread_id: 'thread-2' }]);
     });
 
+    it('preserves child thread configuration from thread and turn contexts', () => {
+        const converter = new AppServerEventConverter();
+
+        expect(converter.handleNotification('thread/started', {
+            thread: {
+                id: 'child-thread',
+                model: 'gpt-5.6',
+                config: { model_reasoning_effort: 'high' }
+            }
+        })).toEqual([{
+            type: 'thread_started',
+            thread_id: 'child-thread',
+            model: 'gpt-5.6',
+            reasoning_effort: 'high'
+        }]);
+
+        expect(converter.handleNotification('turn/started', {
+            turn: {
+                id: 'child-turn',
+                threadId: 'child-thread',
+                configuration: {
+                    model: 'gpt-5.6-mini',
+                    reasoningEffort: 'medium'
+                }
+            }
+        })).toEqual([{
+            type: 'task_started',
+            thread_id: 'child-thread',
+            turn_id: 'child-turn',
+            model: 'gpt-5.6-mini',
+            reasoning_effort: 'medium'
+        }]);
+    });
+
     it('maps thread goal updates and clears', () => {
         const converter = new AppServerEventConverter();
         const goal = {
@@ -73,6 +107,19 @@ describe('AppServerEventConverter', () => {
 
         const failed = converter.handleNotification('turn/completed', { turn: { id: 'turn-1' }, status: 'Failed', message: 'boom' });
         expect(failed).toEqual([{ type: 'task_failed', turn_id: 'turn-1', error: 'boom' }]);
+
+        const nestedFailure = converter.handleNotification('turn/completed', {
+            turn: {
+                id: 'turn-2',
+                status: 'Failed',
+                error: { detail: { message: 'Selected model is at capacity.' } }
+            }
+        });
+        expect(nestedFailure).toEqual([{
+            type: 'task_failed',
+            turn_id: 'turn-2',
+            error: 'Selected model is at capacity.'
+        }]);
     });
 
     it('accumulates agent message deltas', () => {
@@ -191,6 +238,38 @@ describe('AppServerEventConverter', () => {
             output: 'ok',
             exit_code: 0
         }]);
+    });
+
+    it('reconstructs a command call when recovery only reports its completion', () => {
+        const converter = new AppServerEventConverter();
+
+        const completed = converter.handleNotification('item/completed', {
+            item: {
+                id: 'cmd-recovered',
+                type: 'commandExecution',
+                command: ['/bin/zsh', '-lc', 'find . -type f'],
+                cwd: 'file:///workspace',
+                status: 'completed',
+                exitCode: 0
+            }
+        });
+
+        expect(completed).toEqual([
+            {
+                type: 'exec_command_begin',
+                call_id: 'cmd-recovered',
+                command: '/bin/zsh -lc find . -type f',
+                cwd: 'file:///workspace'
+            },
+            {
+                type: 'exec_command_end',
+                call_id: 'cmd-recovered',
+                command: '/bin/zsh -lc find . -type f',
+                cwd: 'file:///workspace',
+                exit_code: 0,
+                status: 'completed'
+            }
+        ]);
     });
 
     it('normalizes file change arrays by file path and preserves their diffs', () => {

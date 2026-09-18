@@ -279,6 +279,10 @@ export class SSEManager {
             return true
         }
 
+        if (event.type === 'session-groups-updated' || event.type === 'session-labels-updated' || event.type === 'session-pins-updated' || event.type === 'kanban-order-updated') {
+            return true
+        }
+
         if (connection.all) {
             return true
         }

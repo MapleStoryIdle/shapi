@@ -245,6 +245,33 @@ export function getMessagesByPosition(
     return rows.reverse().map(toStoredMessage)
 }
 
+/** Paginate messages strictly newer than a composite display-position cursor.
+ *  Results are returned in ascending display order, so the first result is
+ *  adjacent to the supplied cursor. */
+export function getMessagesAfterPosition(
+    db: Database,
+    sessionId: string,
+    limit: number,
+    after: { at: number; seq: number }
+): StoredMessage[] {
+    const safeLimit = Number.isFinite(limit) ? Math.max(1, Math.min(200, limit)) : 200
+    const rows = db.prepare(`
+        SELECT *, COALESCE(invoked_at, created_at) AS position_at
+        FROM messages
+        WHERE session_id = @sessionId
+          AND (COALESCE(invoked_at, created_at) > @afterAt OR (COALESCE(invoked_at, created_at) = @afterAt AND seq > @afterSeq))
+        ORDER BY position_at ASC, seq ASC
+        LIMIT @limit
+    `).all({
+        sessionId,
+        afterAt: after.at,
+        afterSeq: after.seq,
+        limit: safeLimit
+    }) as DbMessageRow[]
+
+    return rows.map(toStoredMessage)
+}
+
 /** Returns user messages that have a localId but no invoked_at.
  *  Includes future scheduled messages — used to surface all queued messages
  *  (including scheduled) for the Web floating bar on refresh / secondary clients. */
@@ -268,34 +295,6 @@ export function getMatureScheduledMessages(
     const rows = db.prepare(
         'SELECT * FROM messages WHERE scheduled_at IS NOT NULL AND scheduled_at <= ? AND invoked_at IS NULL ORDER BY scheduled_at ASC'
     ).all(beforeTime) as DbMessageRow[]
-    return rows.map(toStoredMessage)
-}
-
-/** Returns immediate-queued local messages for a session — i.e. rows that have
- *  no scheduled_at (scheduled_at IS NULL).  Used by the session-end sweep
- *  (sweepImmediateQueuedOnSessionEnd): these are messages the user posted to a
- *  CLI session that ended before the runner consumed them, so they cannot ever
- *  be delivered and must be force-invoked to clear the floating bar.
- *
- *  Scheduled rows (scheduled_at IS NOT NULL) are *deliberately excluded*, mature
- *  or not.  The mature-scan path (releaseMatureScheduledMessages) is the sole
- *  emit channel for scheduled rows and it does not write invoked_at — the CLI
- *  ack does.  If the session-end sweep stamped a mature scheduled row as
- *  invoked, a subsequent CLI re-attach would never see the row in the
- *  mature-scan results (it filters on invoked_at IS NULL), and the user's
- *  scheduled prompt would be silently dropped.  See HAPI Bot R4 finding. */
-export function getImmediateQueuedLocalMessages(
-    db: Database,
-    sessionId: string
-): StoredMessage[] {
-    const rows = db.prepare(`
-        SELECT * FROM messages
-        WHERE session_id = ?
-          AND invoked_at IS NULL
-          AND local_id IS NOT NULL
-          AND scheduled_at IS NULL
-        ORDER BY seq ASC
-    `).all(sessionId) as DbMessageRow[]
     return rows.map(toStoredMessage)
 }
 

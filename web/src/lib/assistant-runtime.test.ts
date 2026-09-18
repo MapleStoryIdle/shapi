@@ -4,9 +4,10 @@ import {
     aggregateResponseGroups,
     assignThreadMessageIds,
     assignThreadMessageIdsWithStableWrappers,
+    getResponseGroupScrollAnchors,
     toThreadMessageLike
 } from './assistant-runtime'
-import type { AgentEventBlock, AgentTextBlock, CliOutputBlock, ToolCallBlock, UserTextBlock } from '@/chat/types'
+import type { AgentEventBlock, AgentTextBlock, CliOutputBlock, CodexReviewBlock, ToolCallBlock, UserTextBlock } from '@/chat/types'
 import type { ToolGroupBlock, VisibleChatBlock } from '@/chat/toolGroups'
 import type { QuestionAnswerBlock } from '@/chat/questionAnswers'
 
@@ -78,6 +79,29 @@ function cliOutput(id: string, source: CliOutputBlock['source'], overrides: Part
     }
 }
 
+function codexReview(id: string): CodexReviewBlock {
+    return {
+        kind: 'codex-review',
+        id,
+        localId: null,
+        createdAt: 0,
+        review: {
+            overallCorrectness: null,
+            overallExplanation: null,
+            overallConfidenceScore: null,
+            findings: [{
+                title: '[P1] 骑手设备权限未限制任务类型',
+                body: '权限范围过宽。',
+                priority: 1,
+                confidenceScore: null,
+                filePath: '/repo/CabinetThirdAccountHelp.java',
+                lineStart: 85,
+                lineEnd: 117
+            }]
+        }
+    }
+}
+
 function questionAnswer(id: string, overrides: Partial<QuestionAnswerBlock> = {}): QuestionAnswerBlock {
     return {
         kind: 'question-answer',
@@ -145,7 +169,94 @@ describe('assignThreadMessageIds', () => {
     })
 })
 
+describe('Codex review messages', () => {
+    it('does not repeat the priority and keeps the file range together', () => {
+        const message = toThreadMessageLike(codexReview('review'), 'codex-review:review')
+        const content = message.content[0]
+
+        expect(content).toMatchObject({ type: 'text' })
+        if (typeof content === 'string' || content.type !== 'text') throw new Error('Expected text content')
+        expect(content.text).toContain('[P1] 骑手设备权限未限制任务类型')
+        expect(content.text).not.toContain('[P1] [P1]')
+        expect(content.text).toContain('/repo/CabinetThirdAccountHelp.java:85-117')
+    })
+})
+
+describe('getResponseGroupScrollAnchors', () => {
+    it('keeps the same trailing source anchor when older assistant details are prepended', () => {
+        const current = [toolCall('tool-current'), agentText('answer-current')]
+        const before = getResponseGroupScrollAnchors(current)
+        const after = getResponseGroupScrollAnchors([toolCall('tool-older'), ...current])
+
+        expect(before.get('tool-current')).toBe('agent-text:answer-current')
+        expect(after.get('tool-older')).toBe('agent-text:answer-current')
+    })
+
+    it('anchors a derived tool group to its last source detail', () => {
+        const first = toolCall('tool-first')
+        const last = toolCall('tool-last')
+        const group = toolGroup('derived-group', [first, last], { detailBlocks: [first, last] })
+
+        expect(getResponseGroupScrollAnchors([group]).get(group.id)).toBe('tool-call:tool-last')
+    })
+})
+
 describe('answered question messages', () => {
+    const nativeReply = `<send_user_message_question_reply>${JSON.stringify([{
+        questionItemId: '["request_user_input_async","call-example",0]',
+        question: '选择哪种方案？',
+        answer: '轻量方案'
+    }])}</send_user_message_question_reply>`
+
+    it('adapts stored native replies without changing message identity, delivery metadata, or raw history', () => {
+        const block = userText('native-answer', {
+            text: nativeReply,
+            createdAt: 1_600,
+            invokedAt: 1_700,
+            localId: 'local-answer',
+            status: 'sent',
+            attachments: [{ id: 'file-1', filename: 'notes.md', mimeType: 'text/markdown', size: 10, path: '/tmp/notes.md' }]
+        })
+        const message = toThreadMessageLike(block, 'user-text:native-answer')
+
+        expect(message).toMatchObject({
+            role: 'user',
+            id: 'user-text:native-answer',
+            createdAt: new Date(1_600),
+            content: [{ type: 'text', text: '选择哪种方案？\n• 轻量方案' }],
+            metadata: { custom: {
+                kind: 'user',
+                localId: 'local-answer',
+                status: 'sent',
+                invokedAt: 1_700,
+                originalText: nativeReply,
+                attachments: block.attachments,
+                questionAnswer: { items: [{
+                    questionItemId: '["request_user_input_async","call-example",0]',
+                    question: '选择哪种方案？',
+                    answers: ['轻量方案']
+                }] }
+            } }
+        })
+        expect(block.text).toBe(nativeReply)
+        expect(toThreadMessageLike(block, 'user-text:native-answer')).toEqual(message)
+    })
+
+    it('keeps invalid replies as the exact original text', () => {
+        const text = '<send_user_message_question_reply>[invalid</send_user_message_question_reply>'
+        const message = toThreadMessageLike(userText('invalid', { text }), 'user-text:invalid')
+
+        expect(message.content).toEqual([{ type: 'text', text }])
+        expect(message.metadata?.custom?.questionAnswer).toBeUndefined()
+    })
+
+    it('does not reinterpret an assistant message as a user answer', () => {
+        const message = toThreadMessageLike(agentText('example', { text: nativeReply }), 'agent-text:example')
+        expect(message.role).toBe('assistant')
+        expect(message.content).toEqual([{ type: 'text', text: nativeReply }])
+        expect(message.metadata?.custom?.questionAnswer).toBeUndefined()
+    })
+
     it('maps selected answers to a user-role message', () => {
         const answer = questionAnswer('qa-1', { createdAt: 1_600 })
         const message = toThreadMessageLike(answer, 'question-answer:qa-1')

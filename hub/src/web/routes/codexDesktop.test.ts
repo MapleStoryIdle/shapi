@@ -153,6 +153,8 @@ function createMachine(id: string, workspaceRoots: string[], namespace = 'defaul
 
 function createRunnerLocalSessionData(sessionId: string, cwd = '/runner/workspace/project') {
     return {
+        tokenUsage: { input: 100, output: 20, cachedInput: 80, reasoningOutput: 10, total: 120, scope: 'session' as const, updatedAt: 1 },
+        modelProvider: 'openai',
         session: {
             id: sessionId,
             title: 'Runner-local Codex task',
@@ -560,7 +562,7 @@ describe('Codex Desktop import routes', () => {
         }
     })
 
-    it('rejects Codex transcript endpoints outside the default namespace', async () => {
+    it('rejects hub-local Codex transcripts outside the default namespace', async () => {
         const app = createRoutesApp('team-a')
         const response = await app.request('/api/codex/sessions')
 
@@ -569,6 +571,90 @@ describe('Codex Desktop import routes', () => {
             success: false,
             error: 'Codex transcript import is not available outside the default namespace'
         })
+    })
+
+    it('lists runner-owned Codex transcripts inside a non-default workspace', async () => {
+        const store = new Store(':memory:')
+        const machine = createMachine('team-runner', ['/runner/workspace'], 'team-a', '/runner/.codex')
+        const engine = {
+            ...createImportSyncEngine(store, [machine]),
+            listCodexLocalSessions: async () => ({
+                success: true,
+                sessions: [createRunnerLocalSessionData('native-thread').session]
+            })
+        } as unknown as SyncEngine
+
+        try {
+            const response = await createRoutesAppWithEngine('team-a', store, engine)
+                .request('/api/codex/sessions?machineId=team-runner')
+
+            expect(response.status).toBe(200)
+            expect(await response.json()).toMatchObject({
+                success: true,
+                sessions: [{ id: 'native-thread' }]
+            })
+        } finally {
+            store.close()
+        }
+    })
+
+    it('maps a native transcript to its exact managed SHAPI session and machine', async () => {
+        const store = new Store(':memory:')
+        const machine = createMachine('team-runner', ['/runner/workspace'], 'team-a', '/runner/.codex')
+        const managedSession = {
+            id: 'managed-session-newest',
+            namespace: 'team-a',
+            active: true,
+            updatedAt: 200,
+            metadata: {
+                flavor: 'codex',
+                machineId: 'team-runner',
+                codexSessionId: 'native-thread'
+            }
+        }
+        const olderManagedSession = {
+            ...managedSession,
+            id: 'managed-session-older',
+            updatedAt: 100
+        }
+        const inactiveManagedSession = {
+            ...managedSession,
+            id: 'managed-session-inactive',
+            active: false,
+            updatedAt: 300
+        }
+        const engine = {
+            ...createImportSyncEngine(store, [machine]),
+            getSessionsByNamespace: () => [inactiveManagedSession, olderManagedSession, managedSession],
+            listCodexLocalSessions: async () => ({
+                success: true,
+                sessions: [createRunnerLocalSessionData('native-thread').session]
+            })
+        } as unknown as SyncEngine
+        const app = createRoutesAppWithEngine('team-a', store, engine)
+
+        try {
+            const listResponse = await app.request('/api/codex/sessions?machineId=team-runner')
+            expect(listResponse.status).toBe(200)
+            expect(await listResponse.json()).toMatchObject({
+                success: true,
+                sessions: [{ id: 'native-thread', managedSessionId: 'managed-session-newest' }]
+            })
+
+            const targetResponse = await app.request(
+                '/api/codex/sessions/native-thread/managed-session?machineId=team-runner'
+            )
+            expect(targetResponse.status).toBe(200)
+            expect(await targetResponse.json()).toEqual({ success: true, sessionId: 'managed-session-newest' })
+
+            const wrongMachineResponse = await app.request(
+                '/api/codex/sessions/native-thread/managed-session?machineId=other-runner'
+            )
+            expect(wrongMachineResponse.status).toBe(200)
+            expect(await wrongMachineResponse.json()).toEqual({ success: true, sessionId: null })
+        } finally {
+            store.close()
+        }
     })
 
     it('allows Codex transcript endpoints in the default namespace', async () => {
@@ -891,6 +977,32 @@ describe('Codex Desktop import routes', () => {
         }
     })
 
+    it('scopes native file browsing to the transcript cwd and owning namespace', async () => {
+        const store = new Store(':memory:')
+        const sessionId = '15151515-1515-4515-8515-151515151515'
+        const machine = createMachine('mac-runner', ['/runner/workspace'], 'default', '/runner/.codex')
+        const calls: unknown[][] = []
+        const engine = {
+            ...createImportSyncEngine(store, [machine]),
+            readCodexLocalSession: async () => ({ success: true, data: createRunnerLocalSessionData(sessionId) }),
+            browseSessionFiles: async (...args: unknown[]) => { calls.push(args); return { success: true, entries: [] } }
+        } as unknown as SyncEngine
+        const app = createRoutesAppWithEngine('default', store, engine)
+        const request = (body: unknown) => app.request(`/api/codex/sessions/${sessionId}/files?machineId=mac-runner`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+        })
+        try {
+            expect((await request({ action: 'directory', path: 'src' })).status).toBe(200)
+            expect(calls).toEqual([['mac-runner', '/runner/workspace/project', { action: 'directory', path: 'src' }]])
+            expect((await request({ action: 'directory', cwd: '/private' })).status).toBe(400)
+            const other = createRoutesAppWithEngine('other', store, engine)
+            expect((await other.request(`/api/codex/sessions/${sessionId}/files?machineId=mac-runner`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'directory' })
+            })).status).not.toBe(200)
+            expect(calls).toHaveLength(1)
+        } finally { store.close() }
+    })
+
     it('reads a native transcript file through its owning runner', async () => {
         const store = new Store(':memory:')
         const sessionId = '15151515-1515-4515-8515-151515151515'
@@ -928,7 +1040,21 @@ describe('Codex Desktop import routes', () => {
     it('returns context and lifecycle from one selected-runner snapshot RPC', async () => {
         const store = new Store(':memory:')
         const sessionId = '13131313-1313-4313-8313-131313131313'
-        const data = createRunnerLocalSessionData(sessionId)
+        const data = {
+            ...createRunnerLocalSessionData(sessionId),
+            subagents: [{
+                id: 'native-child-1',
+                parentSessionId: sessionId,
+                name: 'Ada',
+                model: 'gpt-5.6-terra',
+                modelReasoningEffort: 'high',
+                status: 'running' as const,
+                statusText: 'Working',
+                startedAt: 100,
+                updatedAt: 101,
+                traceMessages: []
+            }]
+        }
         const machine = createMachine('mac-runner', ['/runner/workspace'], 'default', '/runner/.codex')
         const snapshotCalls: unknown[][] = []
         const engine = {
@@ -993,6 +1119,8 @@ describe('Codex Desktop import routes', () => {
                 version: { runnerEpoch: 'runner-a', revision: 7 },
                 revision: 7,
                 timing: { cache: 'hit', durationMs: 3 },
+                tokenUsage: { input: 100, output: 20, cachedInput: 80, total: 120 },
+                modelProvider: 'openai',
                 status: {
                     success: true,
                     status: 'processing',
@@ -1005,6 +1133,13 @@ describe('Codex Desktop import routes', () => {
                     steps: [{ text: 'Render the native plan', status: 'in_progress' }]
                 },
                 session: { id: sessionId },
+                subagents: [{
+                    id: 'native-child-1',
+                    name: 'Ada',
+                    status: 'running',
+                    model: 'gpt-5.6-terra',
+                    modelReasoningEffort: 'high'
+                }],
                 messages: [
                     { id: `codex-local:${sessionId}:0`, content: data.importedMessages[0] },
                     { id: `codex-local:${sessionId}:1`, content: data.importedMessages[1] }
@@ -1026,7 +1161,8 @@ describe('Codex Desktop import routes', () => {
                     id: sessionId,
                     title: 'Renamed native task',
                     cwd: '/runner/workspace/project',
-                    modifiedAt: 123
+                    modifiedAt: 123,
+                    controlledByCodexSsh: false
                 },
                 status: {
                     success: true,
@@ -1110,6 +1246,291 @@ describe('Codex Desktop import routes', () => {
         }
     })
 
+    it('stages a native attachment on its selected Runner and forwards only its opaque id', async () => {
+        const store = new Store(':memory:')
+        const sessionId = '56565656-5656-4656-8656-565656565657'
+        const machine = createMachine('mac-runner', ['/runner/workspace'], 'default', '/runner/.codex')
+        const stageCalls: unknown[][] = []
+        const sendCalls: unknown[][] = []
+        const attachmentId = 'a'.repeat(32)
+        const engine = {
+            ...createImportSyncEngine(store, [machine]),
+            stageNativeCodexAttachment: async (...args: unknown[]) => {
+                stageCalls.push(args)
+                return {
+                    success: true as const,
+                    attachment: {
+                        id: attachmentId,
+                        filename: 'notes.md',
+                        mimeType: 'text/markdown',
+                        size: 5,
+                        kind: 'file' as const
+                    }
+                }
+            },
+            sendCodexLocalSessionMessage: async (...args: unknown[]) => {
+                sendCalls.push(args)
+                return { success: true as const, status: 'processing' as const }
+            }
+        } as unknown as SyncEngine
+        const app = createRoutesAppWithEngine('default', store, engine)
+
+        try {
+            const form = new FormData()
+            form.set('machineId', 'mac-runner')
+            form.set('file', new Blob(['hello'], { type: 'text/markdown' }), 'notes.md')
+            const upload = await app.request(`/api/codex/sessions/${sessionId}/uploads`, {
+                method: 'POST', body: form
+            })
+            expect(upload.status).toBe(201)
+            expect(await upload.json()).toEqual({
+                success: true,
+                attachment: {
+                    id: attachmentId,
+                    filename: 'notes.md',
+                    mimeType: 'text/markdown',
+                    size: 5,
+                    kind: 'file'
+                }
+            })
+            expect(stageCalls).toHaveLength(1)
+            expect(stageCalls[0]?.[0]).toBe('mac-runner')
+            expect(stageCalls[0]?.[1]).toMatchObject({
+                codexSessionId: sessionId,
+                filename: 'notes.md',
+                mimeType: 'text/markdown',
+                size: 5
+            })
+
+            const send = await app.request(`/api/codex/sessions/${sessionId}/messages`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ machineId: 'mac-runner', message: '', attachmentIds: [attachmentId] })
+            })
+            expect(send.status).toBe(202)
+            expect(sendCalls).toEqual([[
+                'mac-runner',
+                sessionId,
+                'Please review the attached file.',
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                [attachmentId]
+            ]])
+        } finally {
+            store.close()
+        }
+    })
+
+    it('routes validated native control actions only to their owning runner', async () => {
+        const store = new Store(':memory:')
+        const machine = createMachine('mac-runner', ['/runner/workspace'], 'default', '/runner/.codex')
+        const calls: unknown[][] = []
+        const controls = { canStop: false, canConfigure: true, queuePaused: true, configuration: {} }
+        const engine = {
+            ...createImportSyncEngine(store, [machine]),
+            controlCodexLocalSession: async (...args: unknown[]) => {
+                calls.push(args)
+                return { success: true, controls }
+            }
+        } as unknown as SyncEngine
+        const app = createRoutesAppWithEngine('default', store, engine)
+        try {
+            for (const action of [
+                { action: 'stop', expectedTurnId: 'active-turn' },
+                { action: 'answerUserInput', expectedTurnId: 'active-turn', requestId: 'question-1', answers: { choice: { answers: ['Continue'] } } },
+                { action: 'configure', configuration: { model: 'gpt-5.6-terra', modelReasoningEffort: 'high', serviceTier: 'fast' } },
+                { action: 'resumeQueue' }
+            ]) {
+                const response = await app.request('/api/codex/sessions/native-thread/control', {
+                    method: 'POST', headers: { 'content-type': 'application/json' },
+                    body: JSON.stringify({ machineId: 'mac-runner', ...action })
+                })
+                expect(response.status).toBe(200)
+                expect(await response.json()).toEqual({ success: true, controls })
+                expect(calls.at(-1)).toEqual(['mac-runner', 'native-thread', action])
+            }
+            const before = calls.length
+            for (const body of [null, { machineId: 'mac-runner', action: 'stop' },
+                { machineId: 'mac-runner', action: 'stop', expectedTurnId: 'a', kill: true },
+                { machineId: 'mac-runner', action: 'configure', configuration: { cwd: '/' } },
+                { machineId: 'mac-runner', action: 'configure', configuration: { serviceTier: 'turbo' } }]) {
+                const response = await app.request('/api/codex/sessions/native-thread/control', {
+                    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body)
+                })
+                expect(response.status).toBe(400)
+            }
+            expect(calls.length).toBe(before)
+        } finally { store.close() }
+    })
+
+    it('does not let an inactive historical wrapper block native control recovery', async () => {
+        const store = new Store(':memory:')
+        const machine = createMachine('mac-runner', ['/runner/workspace'], 'default', '/runner/.codex')
+        const calls: unknown[][] = []
+        const engine = {
+            ...createImportSyncEngine(store, [machine]),
+            getSessionsByNamespace: () => [{
+                id: 'historical-wrapper', namespace: 'default', active: false,
+                metadata: { flavor: 'codex', machineId: 'mac-runner', codexSessionId: 'native-thread' }
+            }],
+            recoverCodexLocalSessionControl: async (...args: unknown[]) => {
+                calls.push(args)
+                return { success: true as const, status: 'pending' as const, recoveryRequestId: 'request-1' }
+            }
+        } as unknown as SyncEngine
+        try {
+            const response = await createRoutesAppWithEngine('default', store, engine).request('/api/codex/sessions/native-thread/recover-control', {
+                method: 'POST', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ machineId: 'mac-runner', recoveryRequestId: 'request-1', expectedVersion: { runnerEpoch: 'runner-a', revision: 1 } })
+            })
+            expect(response.status).toBe(202)
+            expect(calls).toEqual([['mac-runner', {
+                sessionId: 'native-thread', recoveryRequestId: 'request-1', expectedVersion: { runnerEpoch: 'runner-a', revision: 1 }
+            }]])
+        } finally { store.close() }
+    })
+
+    it('maps a ready recovery only to the exact active managed session returned by the runner', async () => {
+        const store = new Store(':memory:')
+        const machine = createMachine('mac-runner', ['/runner/workspace'], 'default', '/runner/.codex')
+        const stale = {
+            id: 'stale-wrapper', namespace: 'default', active: false,
+            metadata: { flavor: 'codex', machineId: 'mac-runner', codexSessionId: 'native-thread' }
+        }
+        const exact = {
+            id: 'managed-exact', namespace: 'default', active: true,
+            metadata: { flavor: 'codex', machineId: 'mac-runner', codexSessionId: 'native-thread' }
+        }
+        const engine = {
+            ...createImportSyncEngine(store, [machine]),
+            getSessionsByNamespace: () => [stale, exact],
+            getSession: (sessionId: string) => sessionId === exact.id ? exact : sessionId === stale.id ? stale : undefined,
+            getCodexLocalSessionRecovery: async () => ({
+                success: true as const,
+                status: 'ready' as const,
+                recoveryRequestId: 'request-1',
+                sessionId: exact.id
+            })
+        } as unknown as SyncEngine
+        try {
+            const response = await createRoutesAppWithEngine('default', store, engine).request('/api/codex/sessions/native-thread/recover-control?machineId=mac-runner')
+            expect(response.status).toBe(200)
+            expect(await response.json()).toMatchObject({ success: true, status: 'ready', sessionId: exact.id })
+        } finally { store.close() }
+    })
+
+    it('refuses native control across namespaces and for a managed wrapper', async () => {
+        const store = new Store(':memory:')
+        const machine = createMachine('mac-runner', ['/runner/workspace'], 'default', '/runner/.codex')
+        let calls = 0
+        const engine = {
+            ...createImportSyncEngine(store, [machine]),
+            getSessionsByNamespace: () => [{ id: 'wrapper', namespace: 'default', active: true, metadata: {
+                machineId: 'mac-runner', codexSessionId: 'native-thread', flavor: 'codex'
+            } }],
+            controlCodexLocalSession: async () => { calls++; return { success: true } }
+        } as unknown as SyncEngine
+        try {
+            for (const namespace of ['default', 'other']) {
+                const response = await createRoutesAppWithEngine(namespace, store, engine).request('/api/codex/sessions/native-thread/control', {
+                    method: 'POST', headers: { 'content-type': 'application/json' },
+                    body: JSON.stringify({ machineId: 'mac-runner', action: 'stop', expectedTurnId: 'active-turn' })
+                })
+                expect(response.status).toBe(409)
+            }
+            expect(calls).toBe(0)
+        } finally { store.close() }
+    })
+
+    it('does not turn an ambiguous control RPC into a successful stop or retry it', async () => {
+        const store = new Store(':memory:')
+        const machine = createMachine('mac-runner', ['/runner/workspace'], 'default', '/runner/.codex')
+        let calls = 0
+        const engine = {
+            ...createImportSyncEngine(store, [machine]),
+            controlCodexLocalSession: async () => { calls++; throw new Error('socket disconnected') }
+        } as unknown as SyncEngine
+        try {
+            const response = await createRoutesAppWithEngine('default', store, engine).request('/api/codex/sessions/native-thread/control', {
+                method: 'POST', headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ machineId: 'mac-runner', action: 'stop', expectedTurnId: 'active-turn' })
+            })
+            expect(response.status).toBe(502)
+            expect(await response.json()).toMatchObject({ success: false, code: 'control_unconfirmed' })
+            expect(calls).toBe(1)
+        } finally { store.close() }
+    })
+
+    it('renames on the selected authorized runner and rejects invalid names and inaccessible runners', async () => {
+        const store = new Store(':memory:')
+        const machine = createMachine('mac-runner', ['/runner/workspace'], 'default', '/runner/.codex')
+        const calls: unknown[][] = []
+        const engine = {
+            ...createImportSyncEngine(store, [machine]),
+            renameCodexLocalSession: async (...args: unknown[]) => {
+                calls.push(args)
+                return { success: true, name: args[2] }
+            }
+        } as unknown as SyncEngine
+        const app = createRoutesAppWithEngine('default', store, engine)
+        const rename = (name: unknown, machineId = 'mac-runner') => app.request('/api/codex/sessions/native-thread', {
+            method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ machineId, name })
+        })
+        try {
+            for (const name of ['', '  ', 'x'.repeat(256), 42, null]) expect((await rename(name)).status).toBe(400)
+            expect((await rename('Name', 'unknown-runner')).status).toBe(409)
+            expect(calls).toEqual([])
+            const result = await rename('  新任务名称  ')
+            expect(result.status).toBe(200)
+            expect(await result.json()).toEqual({ success: true, name: '新任务名称' })
+            expect(calls).toEqual([['mac-runner', 'native-thread', '新任务名称']])
+        } finally { store.close() }
+    })
+
+    it('refuses native rename across namespaces and for a managed wrapper', async () => {
+        const store = new Store(':memory:')
+        const machine = createMachine('mac-runner', ['/runner/workspace'], 'default', '/runner/.codex')
+        let calls = 0
+        const engine = {
+            ...createImportSyncEngine(store, [machine]),
+            getSessionsByNamespace: () => [{ id: 'wrapper', namespace: 'default', active: true, metadata: {
+                machineId: 'mac-runner', codexSessionId: 'native-thread', flavor: 'codex'
+            } }],
+            renameCodexLocalSession: async () => { calls++; return { success: true, name: 'New name' } }
+        } as unknown as SyncEngine
+        try {
+            for (const namespace of ['default', 'other']) {
+                const response = await createRoutesAppWithEngine(namespace, store, engine).request('/api/codex/sessions/native-thread', {
+                    method: 'PATCH', headers: { 'content-type': 'application/json' },
+                    body: JSON.stringify({ machineId: 'mac-runner', name: 'New name' })
+                })
+                expect(response.status).toBe(409)
+            }
+            expect(calls).toBe(0)
+        } finally { store.close() }
+    })
+
+    it('maps native rename failures without reporting success', async () => {
+        const store = new Store(':memory:')
+        const machine = createMachine('mac-runner', ['/runner/workspace'], 'default', '/runner/.codex')
+        try {
+            for (const [code, status] of [['session_not_found', 404], ['rename_unsupported', 501], ['rename_failed', 502]] as const) {
+                const engine = {
+                    ...createImportSyncEngine(store, [machine]),
+                    renameCodexLocalSession: async () => ({ success: false, code, error: code })
+                } as unknown as SyncEngine
+                const response = await createRoutesAppWithEngine('default', store, engine).request('/api/codex/sessions/native-thread', {
+                    method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ machineId: machine.id, name: 'New name' })
+                })
+                expect(response.status).toBe(status)
+                expect(await response.json()).toMatchObject({ success: false, code })
+            }
+        } finally { store.close() }
+    })
+
     it('archives a native Codex thread on its owning runner', async () => {
         const store = new Store(':memory:')
         const sessionId = '56565656-5656-4656-8656-565656565657'
@@ -1187,6 +1608,7 @@ describe('Codex Desktop import routes', () => {
             { code: 'session_busy', status: 409 },
             { code: 'session_status_unknown', status: 409 },
             { code: 'session_queued', status: 409 },
+            { code: 'external_writer_active', status: 409 },
             { code: 'archive_unsupported', status: 501 },
             { code: 'archive_failed', status: 502 },
             { code: 'session_not_found', status: 404 }
@@ -1220,6 +1642,7 @@ describe('Codex Desktop import routes', () => {
 
     it('returns native composer custom prompts and Skills from the selected runner', async () => {
         const store = new Store(':memory:')
+        store.pluginSettings.setEnabled('default', 'managed-skill:public-share', true)
         const sessionId = '56565656-5656-4656-8656-565656565657'
         const machine = createMachine('mac-runner', ['/runner/workspace'], 'default', '/runner/.codex')
         const capabilityCalls: unknown[][] = []
@@ -1244,7 +1667,15 @@ describe('Codex Desktop import routes', () => {
             expect(await response.json()).toEqual({
                 success: true,
                 commands: [{ name: 'review', source: 'project', content: 'Review the requested code.' }],
-                skills: [{ name: 'repo-rules', description: 'Repository rules', scope: 'project' }]
+                skills: [
+                    { name: 'repo-rules', description: 'Repository rules', scope: 'project' },
+                    {
+                        name: 'public-share',
+                        description: 'Create or revoke an expiring SHAPI public link, including feedback-enabled Kanban tasks.',
+                        descriptions: { 'zh-CN': '通过限时链接分享文件或收集反馈。' },
+                        scope: 'hub'
+                    }
+                ]
             })
             expect(capabilityCalls).toEqual([['mac-runner', sessionId]])
         } finally {
@@ -1447,6 +1878,7 @@ describe('Codex Desktop import routes', () => {
             id: 'hapi-managed-session',
             active: true,
             metadata: {
+                flavor: 'codex',
                 machineId: 'mac-runner',
                 codexSessionId: sessionId
             }
@@ -1468,15 +1900,177 @@ describe('Codex Desktop import routes', () => {
             const response = await app.request(`/api/codex/sessions/${sessionId}/messages`, {
                 method: 'POST',
                 headers: { 'content-type': 'application/json' },
-                body: JSON.stringify({ machineId: 'mac-runner', message: 'Use the connected SHAPI session' })
+                body: JSON.stringify({
+                    machineId: 'mac-runner',
+                    message: 'Use the connected SHAPI session',
+                    clientMessageId: 'native:handoff-active'
+                })
+            })
+            expect(response.status).toBe(202)
+            expect(await response.json()).toMatchObject({
+                success: true,
+                status: 'processing',
+                managedSessionId: 'hapi-managed-session'
+            })
+            expect(normalSendCalls).toEqual([[
+                'hapi-managed-session',
+                { text: 'Use the connected SHAPI session', localId: 'native:handoff-active', sentFrom: 'webapp' }
+            ]])
+            expect(nativeSendCalls).toEqual([])
+        } finally {
+            store.close()
+        }
+    })
+
+    it('reopens an inactive managed Codex session before routing the message', async () => {
+        const store = new Store(':memory:')
+        const nativeSessionId = '59575757-5757-4757-8757-575656565657'
+        const machine = createMachine('mac-runner', ['/runner/workspace'], 'default', '/runner/.codex')
+        const normalSendCalls: unknown[][] = []
+        const reopenCalls: unknown[][] = []
+        const engine = {
+            ...createImportSyncEngine(store, [machine]),
+            getSessionsByNamespace: () => [{
+                id: 'inactive-managed-session',
+                active: false,
+                metadata: { flavor: 'codex', machineId: 'mac-runner', codexSessionId: nativeSessionId }
+            }],
+            reopenSession: async (...args: unknown[]) => {
+                reopenCalls.push(args)
+                return { type: 'success' as const, sessionId: 'resumed-managed-session', resumed: true }
+            },
+            sendMessage: async (...args: unknown[]) => {
+                normalSendCalls.push(args)
+            },
+            sendCodexLocalSessionMessage: async () => {
+                throw new Error('native transport must not be used')
+            }
+        } as unknown as SyncEngine
+        const app = createRoutesAppWithEngine('default', store, engine)
+
+        try {
+            const response = await app.request(`/api/codex/sessions/${nativeSessionId}/messages`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({
+                    machineId: 'mac-runner',
+                    message: 'Resume and continue',
+                    clientMessageId: 'native:handoff-1'
+                })
+            })
+
+            expect(response.status).toBe(202)
+            expect(await response.json()).toMatchObject({
+                success: true,
+                status: 'processing',
+                managedSessionId: 'resumed-managed-session'
+            })
+            expect(reopenCalls).toEqual([['inactive-managed-session', 'default']])
+            expect(normalSendCalls).toEqual([[
+                'resumed-managed-session',
+                { text: 'Resume and continue', localId: 'native:handoff-1', sentFrom: 'webapp' }
+            ]])
+        } finally {
+            store.close()
+        }
+    })
+
+    it('coalesces concurrent sends while an inactive managed Codex session reopens', async () => {
+        const store = new Store(':memory:')
+        const nativeSessionId = '59575757-5757-4757-8757-575656565658'
+        const machine = createMachine('mac-runner', ['/runner/workspace'], 'default', '/runner/.codex')
+        let resolveReopen!: (result: { type: 'success'; sessionId: string; resumed: true }) => void
+        const reopenPromise = new Promise<{ type: 'success'; sessionId: string; resumed: true }>((resolve) => {
+            resolveReopen = resolve
+        })
+        let reopenCount = 0
+        const normalSendCalls: unknown[][] = []
+        const engine = {
+            ...createImportSyncEngine(store, [machine]),
+            getSessionsByNamespace: () => [{
+                id: 'inactive-managed-session',
+                active: false,
+                metadata: { flavor: 'codex', machineId: 'mac-runner', codexSessionId: nativeSessionId }
+            }],
+            reopenSession: async () => {
+                reopenCount += 1
+                return await reopenPromise
+            },
+            sendMessage: async (...args: unknown[]) => {
+                normalSendCalls.push(args)
+            }
+        } as unknown as SyncEngine
+        const app = createRoutesAppWithEngine('default', store, engine)
+        const send = (message: string, clientMessageId: string) => app.request(`/api/codex/sessions/${nativeSessionId}/messages`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ machineId: 'mac-runner', message, clientMessageId })
+        })
+
+        try {
+            const first = send('First queued handoff', 'native:handoff-concurrent-1')
+            const second = send('Second queued handoff', 'native:handoff-concurrent-2')
+            await Bun.sleep(0)
+            expect(reopenCount).toBe(1)
+
+            resolveReopen({ type: 'success', sessionId: 'one-resumed-session', resumed: true })
+            const responses = await Promise.all([first, second])
+            expect(responses.map((response) => response.status)).toEqual([202, 202])
+            expect(reopenCount).toBe(1)
+            expect(normalSendCalls).toEqual([
+                ['one-resumed-session', { text: 'First queued handoff', localId: 'native:handoff-concurrent-1', sentFrom: 'webapp' }],
+                ['one-resumed-session', { text: 'Second queued handoff', localId: 'native:handoff-concurrent-2', sentFrom: 'webapp' }]
+            ])
+        } finally {
+            store.close()
+        }
+    })
+
+    it('sends a released SHAPI thread through the native transport', async () => {
+        const store = new Store(':memory:')
+        const sessionId = '59675757-5757-4757-8757-575656565656'
+        const machine = createMachine('mac-runner', ['/runner/workspace'], 'default', '/runner/.codex')
+        const nativeSendCalls: unknown[][] = []
+        const engine = {
+            ...createImportSyncEngine(store, [machine]),
+            getSessionsByNamespace: () => [{
+                id: 'released-hapi-session',
+                active: false,
+                metadata: {
+                    machineId: 'mac-runner',
+                    flavor: 'codex',
+                    codexSessionId: sessionId,
+                    controlOwner: 'external',
+                    lifecycleState: 'archived'
+                }
+            }],
+            sendCodexLocalSessionMessage: async (...args: unknown[]) => {
+                nativeSendCalls.push(args)
+                return { success: true as const, status: 'processing' as const }
+            }
+        } as unknown as SyncEngine
+        const app = createRoutesAppWithEngine('default', store, engine)
+
+        try {
+            const response = await app.request(`/api/codex/sessions/${sessionId}/messages`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ machineId: 'mac-runner', message: 'Continue natively' })
             })
             expect(response.status).toBe(202)
             expect(await response.json()).toMatchObject({ success: true, status: 'processing' })
-            expect(normalSendCalls).toEqual([[
-                'hapi-managed-session',
-                { text: 'Use the connected SHAPI session', sentFrom: 'webapp' }
+            expect(nativeSendCalls).toEqual([[
+                'mac-runner',
+                sessionId,
+                'Continue natively',
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                true
             ]])
-            expect(nativeSendCalls).toEqual([])
         } finally {
             store.close()
         }
@@ -1505,7 +2099,7 @@ describe('Codex Desktop import routes', () => {
             ...createImportSyncEngine(store, [machine]),
             getSessionsByNamespace: () => [{
                 id: 'legacy-hapi-thread',
-                metadata: { machineId: 'mac-runner' }
+                metadata: { flavor: 'codex', machineId: 'mac-runner' }
             }],
             listCodexLocalSessions: async (...args: unknown[]) => {
                 listCalls.push(args)

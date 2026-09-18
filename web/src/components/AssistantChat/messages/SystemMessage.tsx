@@ -1,11 +1,15 @@
 import { MessagePrimitive, useAssistantState } from '@assistant-ui/react'
-import { Activity, AlertTriangle, Archive, Clock, ExternalLink, Layers2, RefreshCw, type LucideIcon } from 'lucide-react'
-import { getEventPresentation, isUsageLimitEvent } from '@/chat/presentation'
+import { Activity, AlertTriangle, Archive, Clock, Layers2, LogIn, RefreshCw, WifiOff, type LucideIcon } from 'lucide-react'
+import { MESSAGE_LINK_CLASS, MessageLinkIcon } from '@/components/MessageLink'
+import { useLocalServiceLink } from '@/lib/local-service-links'
+import { getEventPresentation, isAuthenticationTaskStatus, isForbiddenTaskStatus, isNetworkTaskStatus, isUsageLimitEvent } from '@/chat/presentation'
 import type { AgentEvent } from '@/chat/types'
 import type { HappyChatMessageMetadata } from '@/lib/assistant-runtime'
 import { useTranslation } from '@/lib/use-translation'
 import { getConversationMessageAnchorId } from '@/chat/outline'
 import { MessageTimestamp } from '@/components/AssistantChat/messages/MessageTimestamp'
+import { previewableWebUrl, useChatPreview } from '@/components/ChatPreviewContext'
+import { isGenericCodexFailureMessage } from '@hapi/protocol'
 
 type TaskStatusEvent = Extract<AgentEvent, { type: 'task-status' }>
 type AutomationHeartbeatEvent = Extract<AgentEvent, { type: 'automation-heartbeat' }>
@@ -71,6 +75,26 @@ function taskStatusVisual(event: TaskStatusEvent): {
         }
     }
 
+    if (isForbiddenTaskStatus(event)) {
+        return {
+            Icon: AlertTriangle,
+            titleKey: 'taskStatus.forbidden.title',
+            bodyKey: 'taskStatus.forbidden.body',
+            toneClassName: 'border-[color-mix(in_srgb,#EF4444_42%,var(--app-border))] [background:color-mix(in_srgb,var(--app-bg)_91%,#EF4444)]',
+            iconClassName: 'text-red-600',
+        }
+    }
+
+    if (isAuthenticationTaskStatus(event)) {
+        return {
+            Icon: LogIn,
+            titleKey: 'taskStatus.authentication.title',
+            bodyKey: 'taskStatus.authentication.body',
+            toneClassName: 'border-[color-mix(in_srgb,#F59E0B_42%,var(--app-border))] [background:color-mix(in_srgb,var(--app-bg)_90%,#F59E0B)]',
+            iconClassName: 'text-amber-600',
+        }
+    }
+
     if (event.code === 'usage_limit') {
         return {
             Icon: Clock,
@@ -88,6 +112,16 @@ function taskStatusVisual(event: TaskStatusEvent): {
             Icon: AlertTriangle,
             titleKey: 'taskStatus.modelCapacity.title',
             bodyKey: 'taskStatus.modelCapacity.body',
+            toneClassName: 'border-[color-mix(in_srgb,#F59E0B_42%,var(--app-border))] [background:color-mix(in_srgb,var(--app-bg)_90%,#F59E0B)]',
+            iconClassName: 'text-amber-600',
+        }
+    }
+
+    if (isNetworkTaskStatus(event)) {
+        return {
+            Icon: WifiOff,
+            titleKey: 'taskStatus.network.title',
+            bodyKey: 'taskStatus.network.body',
             toneClassName: 'border-[color-mix(in_srgb,#F59E0B_42%,var(--app-border))] [background:color-mix(in_srgb,var(--app-bg)_90%,#F59E0B)]',
             iconClassName: 'text-amber-600',
         }
@@ -151,8 +185,16 @@ function AutomationHeartbeatCard(props: { event: AutomationHeartbeatEvent; messa
 
 function TaskStatusCard(props: { event: TaskStatusEvent; messageId: string }) {
     const { t } = useTranslation()
+    const localServiceLink = useLocalServiceLink(props.event.actionUrl)
+    const preview = useChatPreview()
     const visual = taskStatusVisual(props.event)
     const Icon = visual.Icon
+    const originalFailure = props.event.status === 'failed'
+        && !isAuthenticationTaskStatus(props.event)
+        && !isForbiddenTaskStatus(props.event)
+        && !isGenericCodexFailureMessage(props.event.message)
+        ? props.event.message
+        : null
 
     return (
         <MessagePrimitive.Root id={getConversationMessageAnchorId(props.messageId)} className="scroll-mt-4 py-1">
@@ -169,18 +211,25 @@ function TaskStatusCard(props: { event: TaskStatusEvent; messageId: string }) {
                                 </div>
                                 <MessageTimestamp className="shrink-0 text-[10px] text-[var(--app-hint)]" />
                             </div>
-                            <p className="mt-0.5 text-xs leading-5 text-[var(--app-hint)]">
-                                {t(visual.bodyKey, visual.bodyParams)}
+                            <p className="mt-0.5 whitespace-pre-wrap break-words text-xs leading-5 text-[var(--app-hint)]">
+                                {originalFailure ?? t(visual.bodyKey, visual.bodyParams)}
                             </p>
                             {visual.actionKey && props.event.actionUrl ? (
                                 <a
-                                    href={props.event.actionUrl}
+                                    href={localServiceLink?.href ?? props.event.actionUrl}
+                                    onClick={(event) => {
+                                        localServiceLink?.onClick(event)
+                                        if (event.defaultPrevented || localServiceLink || event.button !== 0
+                                            || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return
+                                        const destination = previewableWebUrl(props.event.actionUrl!)
+                                        if (destination && preview?.({ type: 'url', url: destination })) event.preventDefault()
+                                    }}
                                     target="_blank"
-                                    rel="noreferrer"
-                                    className="mt-2 inline-flex items-center gap-1 text-xs font-medium text-[var(--app-link)] hover:underline"
+                                    rel="noopener noreferrer"
+                                    className={`${MESSAGE_LINK_CLASS} mt-2`}
                                 >
-                                    {t(visual.actionKey)}
-                                    <ExternalLink className="h-3 w-3" aria-hidden="true" />
+                                    <MessageLinkIcon href={props.event.actionUrl} external />
+                                    <span className="message-content-link-label">{t(visual.actionKey)}</span>
                                 </a>
                             ) : null}
                         </div>
